@@ -1,0 +1,228 @@
+== CORDIC
+
+Here's an alternative way get a sine wave. Instead of storing it in a
+lookup-table, we can calculate it with the CORDIC #footnote[CORDIC
+stands for COordinate Rotation DIgital Computer. See also
+https://zipcpu.com/dsp/2017/08/30/cordic.html (10 Jun 2024).] algorithm
+with two good ideas:
+
+- Multiplication and division by 2 is cheap in hardware: it is just a bit shift.
+- Rotate a vector $(0,1)$ through some angle and the rotated vector's
+  coordinates are the sine and cosine of that angle.
+
+Thus, we want a power-of-2 rotation matrix $R$:
+$
+R = 1/sqrt(1+2^(-2n))
+mat(
+  1, -2^(-n);
+  2^(-n), 1
+);
+$
+here $n$ is an integer and the fraction up front normalizes the matrix so it
+does not change the length of our input vector.
+
+There appear to be two issues: (1) the normalization needs multiplication or
+division, and (2) the rotation angle $alpha$ is fixed by the integers $n$ as
+$tan(alpha)=2^(-n)$. We can tabulate these angles as follows:
+
+<<Lookup table of CORDIC angles>>=
+wire [PHASE_WIDTH-1:0] cordic_angle [SINE_WIDTH];
+assign cordic_angle[ 0] = 28'h2000000; // 45.000000 deg
+assign cordic_angle[ 1] = 28'h12e4051; // 26.565050 deg
+assign cordic_angle[ 2] = 28'h09fb385; // 14.036243 deg
+assign cordic_angle[ 3] = 28'h051111d; //  7.125016 deg
+assign cordic_angle[ 4] = 28'h028b0d4; //  3.576334 deg
+assign cordic_angle[ 5] = 28'h0145d7e; //  1.789910 deg
+assign cordic_angle[ 6] = 28'h00a2f61; //  0.895173 deg
+assign cordic_angle[ 7] = 28'h00517c5; //  0.447614 deg
+assign cordic_angle[ 8] = 28'h0028be5; //  0.223810 deg
+assign cordic_angle[ 9] = 28'h00145f2; //  0.111904 deg
+assign cordic_angle[10] = 28'h000a2f9; //  0.055952 deg
+assign cordic_angle[11] = 28'h000517c; //  0.027975 deg
+assign cordic_angle[12] = 28'h00028be; //  0.013988 deg
+assign cordic_angle[13] = 28'h000145f; //  0.006994 deg
+assign cordic_angle[14] = 28'h0000a2f; //  0.003496 deg
+assign cordic_angle[15] = 28'h0000517; //  0.001747 deg
+assign cordic_angle[16] = 28'h000028b; //  0.000873 deg
+assign cordic_angle[17] = 28'h0000145; //  0.000436 deg
+@
+
+As it turns out, any angle can be reached by successively applying either
+positive or negative rotations of these angles. To change the sign of the
+rotation, just change the sign of the matrix elements. Spelling out the matrix
+multiplication, the algorithm will repeatedly rotate either one way or the
+other, depending on whether the previous rotation was too large or too small:
+
+<<Do coordinate transforms>>=
+begin
+   // for negative phase angle
+   if (phase[PHASE_WIDTH-1]) begin
+      cos_out <= cos_out + (sin_out >>> (i-1));
+      sin_out <= sin_out - (cos_out >>> (i-1));
+      phase <= phase + cordic_angle[i-1];
+   end
+
+   // for positive phase angle
+   else begin
+      cos_out <= cos_out - (sin_out >>> (i-1));
+      sin_out <= sin_out + (cos_out >>> (i-1));
+      phase <= phase - cordic_angle[i-1];
+   end
+end
+@
+
+To get out of the normalization issue mentioned above, we need to be clever
+about the initialization of the registers. The normalization factor depends on
+the integer $n$, but we always multiply by the same sequence of matrices, so we
+only need to calculate the normalization once. We might not even care that our
+sine wave output has the amplitude of approximately 1.646 rather than 1, since
+it can be normalized elsewhere, say in a post-processing DSP stage.
+
+In fact, by loading a different initial value we can achieve not only
+normalization, but a more general result: a quadrature mixer, which multiplies
+the given input value with a sine and a cosine! However, in this example we will
+just load a (scaled) value of 1 for simplicity:
+
+<<CORDIC scale factor>>=
+localparam [SINE_WIDTH-1:0]  ampl_in = 1 << (SINE_WIDTH - 2);
+@
+
+The rest of the code is entirely mechanical. We instantiate a module that cranks
+the handle executing the matrix multiplications one after the other, and then
+outputs the final result:
+
+<<cordic.v>>=
+module cordic #(parameter DW=16, SINE_WIDTH=18, PHASE_WIDTH=28)
+   (
+      input clk_in,
+      input reset,
+      input [PHASE_WIDTH-1:0] ftw,
+      output reg signed [DW-1:0] wave_out
+   );
+
+   <<CORDIC registers>>
+   always @(posedge(clk_in)) begin
+      if (!reset)
+         <<Check for CORDIC reset condition>>
+      else begin
+         i <= i + 1;
+         if (i == SINE_WIDTH-1)
+            <<Initialize CORDIC engine>>
+         else
+            <<Do coordinate transforms>>
+      end
+   end
+   <<Lookup table of CORDIC angles>>
+endmodule
+@
+
+If the reset is asserted, hold all relevant registers as zero:
+
+<<Check for CORDIC reset condition>>=
+begin
+   i <= 0;
+   phase <= 0;
+   sin_out <= 0;
+   cos_out <= 0;
+end
+@
+
+When it goes out of reset, we alternate between the coordinate transforms
+explained above, and setting up the engine for the next calculation:
+
+<<Initialize CORDIC engine>>=
+begin
+   i <= 0;
+   sin_out <= 0;
+   phase_acc <= phase_acc + ftw;
+   phase <= {phase_acc[PHASE_WIDTH-2], phase_acc[PHASE_WIDTH-2:0]};
+   wave_out <= sin_out[SINE_WIDTH-1:SINE_WIDTH-DW];
+
+   if ((quadrant == 1) || (quadrant == 2))
+      cos_out <= -ampl_in;
+   else
+      cos_out <= ampl_in;
+end
+@
+
+Finally, the registers are declared as shown here, but we could also rearrange
+things somewhat in case the application would benefit from having _both_ the
+sine and the cosine values, e.g. the quadrature mixer mentioned above.
+
+<<CORDIC registers>>=
+<<CORDIC scale factor>>
+reg [$clog2(SINE_WIDTH-1):0] i;
+reg signed [PHASE_WIDTH-1:0] phase;
+reg signed [SINE_WIDTH-1:0]  sin_out;
+reg signed [SINE_WIDTH-1:0]  cos_out;
+
+// phase accumulator
+reg signed [PHASE_WIDTH-1:0] phase_acc;
+wire [1:0] quadrant = phase_acc[PHASE_WIDTH-1:PHASE_WIDTH-2];
+@
+
+=== Test bench
+
+<<tb_cordic.sv>>=
+`timescale 1ns/1ps
+
+module tb_cordic;
+
+   // parameters
+   localparam DW  = 16;
+   localparam SINE_WIDTH  = 18;
+   localparam PHASE_WIDTH = 28;
+
+   // signals
+   reg clk_in;
+   reg reset;
+   reg [PHASE_WIDTH-1:0] ftw;
+   wire signed [DW-1:0] wave_out;
+
+   // instantiate DUT
+   cordic #(
+      .DW(DW),
+      .SINE_WIDTH(SINE_WIDTH),
+      .PHASE_WIDTH(PHASE_WIDTH)
+   ) dut (
+      .clk_in(clk_in),
+      .reset(reset),
+      .ftw(ftw),
+      .wave_out(wave_out)
+   );
+
+   // clock generation: 10ns period
+   initial clk_in = 0;
+   always #5 clk_in = ~clk_in;
+
+   // simulation stimulus
+   initial begin
+      reset = 0;
+      ftw   = 0;
+
+      // hold reset for a few cycles
+      #20;
+      reset = 1;
+
+      // test different FTWs
+      ftw = 28'h1000000; // slow increment
+      repeat (20) @(posedge clk_in);
+
+      ftw = 28'h2000000; // faster increment
+      repeat (20) @(posedge clk_in);
+
+      ftw = 28'h4000000; // even faster
+      repeat (20) @(posedge clk_in);
+
+      // finish simulation
+      #50;
+      $finish;
+   end
+
+   // monitor output
+   always @(posedge clk_in) begin
+      $display("%0t\t%h\t%d", $time, ftw, wave_out);
+   end
+
+endmodule
+@

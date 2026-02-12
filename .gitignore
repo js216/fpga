@@ -1,7 +1,8 @@
-desktop.ini
-*.cache
-*.hw
-*.runs
-*.sim
-*.xml
-*.ip_user_files
+*.swp
+*.typ
+*.v
+*.sv
+*.pdf
+*.mk
+
+obj_dir
