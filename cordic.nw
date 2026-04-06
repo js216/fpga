@@ -1,14 +1,14 @@
 == CORDIC
 
-Here's an alternative way get a sine wave. Instead of storing it in a
+Here's an alternative way to get a sine wave. Instead of storing it in a
 lookup-table, we can calculate it with the CORDIC #footnote[CORDIC
 stands for COordinate Rotation DIgital Computer. See also
 https://zipcpu.com/dsp/2017/08/30/cordic.html (10 Jun 2024).] algorithm
 with two good ideas:
 
 - Multiplication and division by 2 is cheap in hardware: it is just a bit shift.
-- Rotate a vector $(0,1)$ through some angle and the rotated vector's
-  coordinates are the sine and cosine of that angle.
+- Rotate a vector $(1,0)$ through some angle and the rotated vector's
+  coordinates are the cosine and sine of that angle.
 
 Thus, we want a power-of-2 rotation matrix $R$:
 $
@@ -18,7 +18,7 @@ mat(
   2^(-n), 1
 );
 $
-here $n$ is an integer and the fraction up front normalizes the matrix so it
+Here $n$ is an integer and the fraction up front normalizes the matrix so it
 does not change the length of our input vector.
 
 There appear to be two issues: (1) the normalization needs multiplication or
@@ -26,7 +26,7 @@ division, and (2) the rotation angle $alpha$ is fixed by the integers $n$ as
 $tan(alpha)=2^(-n)$. We can tabulate these angles as follows:
 
 <<Lookup table of CORDIC angles>>=
-wire [PHASE_WIDTH-1:0] cordic_angle [SINE_WIDTH];
+wire [PHASE_WIDTH-1:0] cordic_angle [N_ITER];
 assign cordic_angle[ 0] = 28'h2000000; // 45.000000 deg
 assign cordic_angle[ 1] = 28'h12e4051; // 26.565050 deg
 assign cordic_angle[ 2] = 28'h09fb385; // 14.036243 deg
@@ -75,7 +75,7 @@ To get out of the normalization issue mentioned above, we need to be clever
 about the initialization of the registers. The normalization factor depends on
 the integer $n$, but we always multiply by the same sequence of matrices, so we
 only need to calculate the normalization once. We might not even care that our
-sine wave output has the amplitude of approximately 1.646 rather than 1, since
+sine wave output has the amplitude of approximately 1.6468 rather than 1, since
 it can be normalized elsewhere, say in a post-processing DSP stage.
 
 In fact, by loading a different initial value we can achieve not only
@@ -84,15 +84,57 @@ the given input value with a sine and a cosine! However, in this example we will
 just load a (scaled) value of 1 for simplicity:
 
 <<CORDIC scale factor>>=
-localparam [SINE_WIDTH-1:0]  ampl_in = 1 << (SINE_WIDTH - 2);
+localparam [INTERNAL_WIDTH-1:0] ampl_in
+   = 1 << (INTERNAL_WIDTH - 2);
 @
+
+=== Interface
+
+#table(
+  columns: (auto, auto, auto, auto),
+  [*Port*], [*Dir*], [*Width*], [*Description*],
+  [`clk_in`], [in], [1], [Clock],
+  [`reset`], [in], [1], [Synchronous reset (active high)],
+  [`ftw`], [in], [`PHASE_WIDTH`], [Frequency tuning word],
+  [`wave_out`], [out], [`DW`], [Sine output (signed, uncompensated)],
+)
+
+=== Timing
+
+After reset is released, the first valid `wave_out` appears after
+`3 * N_ITER` clock cycles (three computation cycles: one garbage, one
+for phase zero, and one for the loaded FTW). Thereafter, a new output
+sample is produced every `N_ITER` clock cycles. The output amplitude
+is scaled by the CORDIC gain ($K approx 1.6468$) and the initial
+amplitude `ampl_in = 2^(INTERNAL_WIDTH - 2)`, giving a full-scale
+output of approximately `K * 2^(INTERNAL_WIDTH - 2) >> (INTERNAL_WIDTH - DW)`.
+
+=== Parameters
+
+The module has four independent parameters:
+
+- `DW`: the output data width in bits.
+- `N_ITER`: the number of CORDIC rotation iterations. More iterations
+  yield a more accurate result, but each iteration takes one clock cycle.
+  The actual number of rotations performed is `N_ITER - 2`, because
+  the cycle at `i == 0` is a garbage rotation (shift wraps) and the
+  cycle at `i == N_ITER - 1` is used for reinitialization.
+- `INTERNAL_WIDTH`: the internal precision of the sine and cosine
+  accumulators in bits. Typically equal to or greater than `N_ITER` to
+  avoid losing precision from the shift operations.
+- `PHASE_WIDTH`: the width of the phase accumulator, controlling frequency
+  resolution.
 
 The rest of the code is entirely mechanical. We instantiate a module that cranks
 the handle executing the matrix multiplications one after the other, and then
 outputs the final result:
 
 <<cordic.v>>=
-module cordic #(parameter DW=16, SINE_WIDTH=18, PHASE_WIDTH=28)
+module cordic #(
+   parameter DW=16,
+   N_ITER=18,
+   INTERNAL_WIDTH=18,
+   PHASE_WIDTH=28)
    (
       input clk_in,
       input reset,
@@ -102,21 +144,22 @@ module cordic #(parameter DW=16, SINE_WIDTH=18, PHASE_WIDTH=28)
 
    <<CORDIC registers>>
    always @(posedge(clk_in)) begin
-      if (!reset)
+      if (reset)
          <<Check for CORDIC reset condition>>
       else begin
          i <= i + 1;
-         if (i == SINE_WIDTH-1)
+         if (i == N_ITER-1)
             <<Initialize CORDIC engine>>
          else
             <<Do coordinate transforms>>
       end
    end
    <<Lookup table of CORDIC angles>>
+   <<CORDIC formal properties>>
 endmodule
 @
 
-If the reset is asserted, hold all relevant registers as zero:
+Reset is active-high: when asserted, all relevant registers are held at zero:
 
 <<Check for CORDIC reset condition>>=
 begin
@@ -124,10 +167,11 @@ begin
    phase <= 0;
    sin_out <= 0;
    cos_out <= 0;
+   phase_acc <= 0;
 end
 @
 
-When it goes out of reset, we alternate between the coordinate transforms
+When reset is released, we alternate between the coordinate transforms
 explained above, and setting up the engine for the next calculation:
 
 <<Initialize CORDIC engine>>=
@@ -136,7 +180,7 @@ begin
    sin_out <= 0;
    phase_acc <= phase_acc + ftw;
    phase <= {phase_acc[PHASE_WIDTH-2], phase_acc[PHASE_WIDTH-2:0]};
-   wave_out <= sin_out[SINE_WIDTH-1:SINE_WIDTH-DW];
+   wave_out <= sin_out[INTERNAL_WIDTH-1:INTERNAL_WIDTH-DW];
 
    if ((quadrant == 1) || (quadrant == 2))
       cos_out <= -ampl_in;
@@ -151,10 +195,10 @@ sine and the cosine values, e.g. the quadrature mixer mentioned above.
 
 <<CORDIC registers>>=
 <<CORDIC scale factor>>
-reg [$clog2(SINE_WIDTH-1):0] i;
+reg [$clog2(N_ITER-1):0] i;
 reg signed [PHASE_WIDTH-1:0] phase;
-reg signed [SINE_WIDTH-1:0]  sin_out;
-reg signed [SINE_WIDTH-1:0]  cos_out;
+reg signed [INTERNAL_WIDTH-1:0]  sin_out;
+reg signed [INTERNAL_WIDTH-1:0]  cos_out;
 
 // phase accumulator
 reg signed [PHASE_WIDTH-1:0] phase_acc;
@@ -163,6 +207,16 @@ wire [1:0] quadrant = phase_acc[PHASE_WIDTH-1:PHASE_WIDTH-2];
 
 === Test bench
 
+The test bench is self-checking: it compares the module output against a
+golden model that produces expected values in a hex file. The golden model
+is a Python script that performs the same CORDIC algorithm in
+floating-point arithmetic, then quantizes the result to match the
+hardware. The CORDIC gain ($K approx 1.6468$) is _not_ compensated in
+the hardware; instead, the golden model applies the same gain so its
+output matches the hardware's uncompensated output. The comparison
+requires explicit sign extension from `DW` to 32 bits because Verilator
+treats implicit width promotion as an error under `-Wall`.
+
 <<tb_cordic.sv>>=
 `timescale 1ns/1ps
 
@@ -170,8 +224,12 @@ module tb_cordic;
 
    // parameters
    localparam DW  = 16;
-   localparam SINE_WIDTH  = 18;
+   localparam N_ITER  = 18;
+   localparam INTERNAL_WIDTH = 18;
    localparam PHASE_WIDTH = 28;
+
+   // test configuration
+   localparam N_TEST_FTWS = 258;  // 256 sweep + 2 unique corners
 
    // signals
    reg clk_in;
@@ -179,10 +237,15 @@ module tb_cordic;
    reg [PHASE_WIDTH-1:0] ftw;
    wire signed [DW-1:0] wave_out;
 
+   // golden model expected values
+   reg signed [DW-1:0] expected [0:N_TEST_FTWS-1];
+   reg [PHASE_WIDTH-1:0] test_ftws [0:N_TEST_FTWS-1];
+
    // instantiate DUT
    cordic #(
       .DW(DW),
-      .SINE_WIDTH(SINE_WIDTH),
+      .N_ITER(N_ITER),
+      .INTERNAL_WIDTH(INTERNAL_WIDTH),
       .PHASE_WIDTH(PHASE_WIDTH)
    ) dut (
       .clk_in(clk_in),
@@ -191,38 +254,249 @@ module tb_cordic;
       .wave_out(wave_out)
    );
 
-   // clock generation: 10ns period
+   // clock generation: 10ns period (non-blocking to avoid BLKSEQ)
    initial clk_in = 0;
-   always #5 clk_in = ~clk_in;
+   always #5 clk_in <= ~clk_in;
 
-   // simulation stimulus
+   // load golden model data
    initial begin
-      reset = 0;
-      ftw   = 0;
+      $readmemh("expected_cordic.hex", expected);
+      $readmemh("test_ftws.hex", test_ftws);
+   end
 
-      // hold reset for a few cycles
-      #20;
-      reset = 1;
+   // test state
+   integer test_idx;
+   integer max_error;
+   integer error;
+   integer pass_count;
+   integer got, exp;
 
-      // test different FTWs
-      ftw = 28'h1000000; // slow increment
-      repeat (20) @(posedge clk_in);
+   initial begin
+      max_error = 0;
+      pass_count = 0;
 
-      ftw = 28'h2000000; // faster increment
-      repeat (20) @(posedge clk_in);
+      // for each test FTW: reset, load FTW, wait for valid output,
+      // then compare
+      for (test_idx = 0; test_idx < N_TEST_FTWS;
+           test_idx = test_idx + 1) begin
+         // assert reset
+         reset = 1;
+         ftw = test_ftws[test_idx];
+         repeat (3) @(posedge clk_in);
+         reset = 0;
 
-      ftw = 28'h4000000; // even faster
-      repeat (20) @(posedge clk_in);
+         // after reset: 3 computation cycles until valid output.
+         // cycle 1: garbage (reset state, phase_acc=0)
+         // cycle 2: wave_out=sin(0), phase loads ftw
+         // cycle 3: wave_out=sin(ftw) -- what we want
+         repeat (3 * N_ITER) @(posedge clk_in);
 
-      // finish simulation
-      #50;
+         // the output is now valid; sign-extend to 32 bits and compare
+         got = {{(32-DW){wave_out[DW-1]}}, wave_out};
+         exp = {{(32-DW){expected[test_idx][DW-1]}},
+                expected[test_idx]};
+         error = got - exp;
+         if (error < 0) error = -error;
+         if (error > max_error) max_error = error;
+
+         if (error > 1) begin
+            $display("FAIL: FTW=%h expected=%d got=%d error=%d",
+                     test_ftws[test_idx], expected[test_idx],
+                     wave_out, error);
+            $fatal(1, "Output mismatch exceeds 1 LSB");
+         end
+         pass_count = pass_count + 1;
+      end
+
+      $display("PASS: %0d vectors, max err = %0d LSB",
+               pass_count, max_error);
       $finish;
    end
 
-   // monitor output
+endmodule
+@
+
+=== Golden model
+
+The Python golden model computes the CORDIC algorithm in floating-point
+and writes hex files for the test bench. It applies the same gain factor
+as the hardware (no compensation), uses the same number of rotations
+as the hardware (`N_ITER - 2`, since `i = 0` is a garbage cycle and
+`i = N_ITER - 1` is reinitialization), and quantizes to the output
+bit width.
+
+<<golden_cordic.py>>=
+#!/usr/bin/env python3
+"""Golden model for CORDIC sine generator.
+
+Produces two hex files:
+  test_ftws.hex     -- FTW test vectors
+  expected_cordic.hex -- expected wave_out values
+"""
+
+import math
+
+# parameters (must match tb_cordic.sv)
+DW = 16
+N_ITER = 18
+INTERNAL_WIDTH = 18
+PHASE_WIDTH = 28
+
+# CORDIC angle table: atan(2^-i) scaled to
+# full circle = 2^PHASE_WIDTH
+def cordic_angle(i):
+    return int(math.atan(2**(-i))
+               / (2 * math.pi)
+               * (1 << PHASE_WIDTH))
+
+# generate test FTW values: 256 sweep + 2 unique corners
+ftws = []
+step = 1 << (PHASE_WIDTH - 8)  # 256 evenly spaced points
+for k in range(256):
+    ftws.append(k * step)
+# corner cases
+for v in [0, 1, (1 << (PHASE_WIDTH - 1)), (1 << PHASE_WIDTH) - 1]:
+    if v not in ftws:
+        ftws.append(v)
+
+def cordic_sine(phase_acc_val):
+    """Compute one CORDIC output for a given
+    phase accumulator value."""
+    # quadrant folding
+    # (matches <<Initialize CORDIC engine>>)
+    quadrant = (phase_acc_val >> (PHASE_WIDTH - 2)) & 0x3
+
+    # sign-extend bit PHASE_WIDTH-2 into MSB
+    # (matches <<Initialize CORDIC engine>>)
+    lower = phase_acc_val & ((1 << (PHASE_WIDTH - 1)) - 1)
+    sign_bit = (phase_acc_val >> (PHASE_WIDTH - 2)) & 1
+    if sign_bit:
+        phase = lower - (1 << (PHASE_WIDTH - 1))
+    else:
+        phase = lower
+
+    # initial values
+    ampl_in = 1 << (INTERNAL_WIDTH - 2)
+    sin_out = 0
+    if quadrant in (1, 2):
+        cos_out = -ampl_in
+    else:
+        cos_out = ampl_in
+
+    # perform N_ITER - 2 rotations (i goes from 1 to N_ITER-2 in hardware;
+    # i=0 is a garbage rotation and i=N_ITER-1 is reinitialization)
+    for i in range(1, N_ITER - 1):
+        shift = i - 1
+        angle = cordic_angle(shift)
+        if phase < 0:
+            cos_out_new = cos_out + (sin_out >> shift)
+            sin_out_new = sin_out - (cos_out >> shift)
+            phase += angle
+        else:
+            cos_out_new = cos_out - (sin_out >> shift)
+            sin_out_new = sin_out + (cos_out >> shift)
+            phase -= angle
+        # truncate to INTERNAL_WIDTH bits (signed)
+        mask = (1 << INTERNAL_WIDTH) - 1
+        half = 1 << (INTERNAL_WIDTH - 1)
+        cos_out = ((cos_out_new + half) & mask) - half
+        sin_out = ((sin_out_new + half) & mask) - half
+
+    # extract output: sin_out[INTERNAL_WIDTH-1 : INTERNAL_WIDTH-DW]
+    # this is an arithmetic right shift
+    wave_out = sin_out >> (INTERNAL_WIDTH - DW)
+    return wave_out
+
+# run golden model for each FTW
+# note: the hardware accumulates phase_acc += ftw each cycle;
+# on the very first output, phase_acc has been incremented once
+expected = []
+for f in ftws:
+    phase_acc = f  # first output uses phase_acc = ftw
+    val = cordic_sine(phase_acc)
+    expected.append(val)
+
+# write hex files
+def to_hex(val, bits):
+    if val < 0:
+        val = val + (1 << bits)
+    return format(val & ((1 << bits) - 1), '0' + str((bits + 3) // 4) + 'x')
+
+with open("test_ftws.hex", "w") as f:
+    for v in ftws:
+        f.write(to_hex(v, PHASE_WIDTH) + "\n")
+
+with open("expected_cordic.hex", "w") as f:
+    for v in expected:
+        f.write(to_hex(v, DW) + "\n")
+
+print(f"Generated {len(ftws)} test vectors")
+@
+
+=== Formal properties
+
+The SymbiYosys configuration and formal properties verify invariants
+that simulation alone cannot exhaustively check. The properties are
+placed inside the module itself using `ifdef FORMAL`, which is the
+standard approach for SymbiYosys.
+
+<<cordic.sby>>=
+[tasks]
+bmc
+
+[options]
+bmc: mode bmc
+bmc: depth 46
+timeout 300
+
+[engines]
+smtbmc z3
+
+[script]
+read -formal cordic.v
+prep -top cordic
+
+[files]
+cordic.v
+@
+
+The formal properties are embedded directly in the module. They check:
+
+- After reset, all registers are zero.
+- Quadrant folding correctness: the sign of `cos_out` after
+  initialization matches what the quadrant bits demand.
+
+<<CORDIC formal properties>>=
+`ifdef FORMAL
+   // assume reset is asserted at the start
+   initial assume(reset);
+
+   // P1: one cycle after reset, registers are zero
+   reg f_past_valid;
+   initial f_past_valid = 0;
+   always @(posedge clk_in) f_past_valid <= 1;
+
    always @(posedge clk_in) begin
-      $display("%0t\t%h\t%d", $time, ftw, wave_out);
+      if (f_past_valid && $past(reset)) begin
+         assert(i == 0);
+         assert(phase == 0);
+         assert(sin_out == 0);
+         assert(cos_out == 0);
+      end
    end
 
-endmodule
+   // P2: quadrant folding: after initialization, cos_out sign
+   //     matches quadrant demand
+   always @(posedge clk_in) begin
+      // first cycle of a new computation, not during/after reset
+      if (f_past_valid && !reset && !$past(reset)
+          && i == 0) begin
+         // cos_out was set based on quadrant BEFORE phase_acc += ftw
+         if ($past(quadrant) == 2'd1 || $past(quadrant) == 2'd2)
+            assert(cos_out < 0);
+         else
+            assert(cos_out > 0);
+      end
+   end
+`endif
 @

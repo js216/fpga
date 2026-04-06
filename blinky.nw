@@ -1,0 +1,184 @@
+== Blinky
+
+The simplest useful FPGA module: a parameterized LED blinker. This module
+serves as the hardware bring-up test. If the LED blinks at the right rate, the
+clock is running, the reset works, and the bitstream was loaded correctly.
+
+<<blinky.v>>=
+module blinky #(
+   parameter PERIOD = 25_000_000,
+   parameter WIDTH  = $clog2(PERIOD))
+   (
+      input  clk,
+      input  reset,
+      output reg led
+   );
+
+   reg [WIDTH-1:0] counter;
+
+   always @(posedge clk) begin
+      if (reset) begin
+         counter <= 0;
+         led <= 0;
+      end else if (counter == PERIOD - 1) begin
+         counter <= 0;
+         led <= ~led;
+      end else begin
+         counter <= counter + 1;
+      end
+   end
+
+   <<Blinky formal properties>>
+endmodule
+@
+
+#table(
+  columns: (auto, auto, auto, auto),
+  [*Port*], [*Dir*], [*Width*], [*Description*],
+  [`clk`], [in], [1], [Clock],
+  [`reset`], [in], [1], [Synchronous reset (active high)],
+  [`led`], [out], [1], [LED output, toggles every `PERIOD` cycles],
+)
+
+When overriding `PERIOD`, leave `WIDTH` at its default; it is computed
+automatically from `PERIOD` via `$clog2`.
+
+The default period of 25 million cycles gives a 1 Hz blink rate (one
+full on-off cycle per second) with a 50 MHz clock. For simulation, we
+use a much smaller value.
+
+=== Test bench
+
+The test bench checks that the LED toggles at the correct period and
+that exactly five toggles occur over five full periods (no external
+golden model needed).
+
+<<tb_blinky.sv>>=
+`timescale 1ns/1ps
+
+module tb_blinky;
+
+   localparam PERIOD = 10;
+
+   reg  clk;
+   reg  reset;
+   wire led;
+
+   blinky #(
+      .PERIOD(PERIOD)
+   ) dut (
+      .clk(clk),
+      .reset(reset),
+      .led(led)
+   );
+
+   // clock: 10ns period (non-blocking to avoid BLKSEQ)
+   initial clk = 0;
+   always #5 clk <= ~clk;
+
+   integer toggle_count;
+   integer cycle_count;
+   reg prev_led;
+
+   initial begin
+      toggle_count = 0;
+      cycle_count = 0;
+      reset = 1;
+      repeat (3) @(posedge clk);
+      reset = 0;
+      prev_led = led;
+
+      // run for 5 full periods (expect 5 toggles)
+      repeat (5 * PERIOD + 1) begin
+         @(posedge clk);
+         cycle_count = cycle_count + 1;
+         if (led !== prev_led) begin
+            toggle_count = toggle_count + 1;
+            if (cycle_count != PERIOD) begin
+               $display(
+                  "FAIL: cycle %0d, exp %0d",
+                  cycle_count, PERIOD);
+               $fatal(1, "Incorrect toggle period");
+            end
+            cycle_count = 0;
+         end
+         prev_led = led;
+      end
+
+      if (toggle_count != 5) begin
+         $display("FAIL: exp 5 toggles, got %0d",
+               toggle_count);
+         $fatal(1, "Wrong number of toggles");
+      end
+
+      $display("PASS: %0d toggles, period %0d",
+               toggle_count, PERIOD);
+      $finish;
+   end
+endmodule
+@
+
+=== Formal properties
+
+The SymbiYosys configuration uses bounded model checking to depth 30,
+which covers roughly three counter periods at `PERIOD = 10`,
+including the initial reset cycle. The properties
+verify reset behavior, counter range, and counter increment/wrap logic.
+
+<<blinky.sby>>=
+[tasks]
+bmc
+
+[options]
+bmc: mode bmc
+bmc: depth 30
+timeout 120
+
+[engines]
+smtbmc z3
+
+[script]
+read -formal blinky.v
+chparam -set PERIOD 10 blinky
+prep -top blinky
+
+[files]
+blinky.v
+@
+
+The formal properties are embedded inside the module using `ifdef FORMAL`:
+
+<<Blinky formal properties>>=
+`ifdef FORMAL
+   // assume reset is asserted at the start
+   reg f_past_valid;
+   initial f_past_valid = 0;
+   always @(posedge clk) f_past_valid <= 1;
+   initial assume(reset);
+
+   // P1: one cycle after reset, counter and led are zero
+   always @(posedge clk) begin
+      if (f_past_valid && $past(reset)) begin
+         assert(counter == 0);
+         assert(led == 0);
+      end
+   end
+
+   // P2: counter stays in valid range
+   //     (after reset has taken effect)
+   always @(posedge clk) begin
+      if (f_past_valid && !reset && !$past(reset))
+         assert(counter < PERIOD);
+   end
+
+   // P3: counter increments or wraps
+   always @(posedge clk) begin
+      if (f_past_valid && !reset && !$past(reset)) begin
+         if ($past(counter) == PERIOD - 1)
+            assert(counter == 0);
+         else
+            assert(counter == $past(counter) + 1);
+      end
+   end
+`endif
+@

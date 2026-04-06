@@ -2,7 +2,11 @@
 *.typ
 *.v
 *.sv
+*.py
+*.sby
 *.pdf
+*.hex
 *.mk
 
 obj_dir
+*_bmc
