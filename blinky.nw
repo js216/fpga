@@ -28,102 +28,126 @@ module blinky #(
       end
    end
 
+`ifdef FORMAL
    <<Blinky formal properties>>
+`endif
 endmodule
 @
-
-#table(
-  columns: (auto, auto, auto, auto),
-  [*Port*], [*Dir*], [*Width*], [*Description*],
-  [`clk`], [in], [1], [Clock],
-  [`reset`], [in], [1], [Synchronous reset (active high)],
-  [`led`], [out], [1], [LED output, toggles every `PERIOD` cycles],
-)
 
 When overriding `PERIOD`, leave `WIDTH` at its default; it is computed
 automatically from `PERIOD` via `$clog2`.
 
 The default period of 25 million cycles gives a 1 Hz blink rate (one
-full on-off cycle per second) with a 50 MHz clock. For simulation, we
-use a much smaller value.
+full on-off cycle per second) with a 50 MHz clock. The test bench
+overrides this to `PERIOD = 10` for fast simulation.
 
 === Test bench
 
 The test bench checks that the LED toggles at the correct period and
-that exactly five toggles occur over five full periods (no external
-golden model needed).
+that exactly five toggles occur over five full periods.
 
 <<tb_blinky.sv>>=
 `timescale 1ns/1ps
 
 module tb_blinky;
-
-   localparam PERIOD = 10;
-
-   reg  clk;
-   reg  reset;
-   wire led;
-
-   blinky #(
-      .PERIOD(PERIOD)
-   ) dut (
-      .clk(clk),
-      .reset(reset),
-      .led(led)
-   );
-
-   // clock: 10ns period (non-blocking to avoid BLKSEQ)
-   initial clk = 0;
-   always #5 clk <= ~clk;
-
-   integer toggle_count;
-   integer cycle_count;
-   reg prev_led;
-
-   initial begin
-      toggle_count = 0;
-      cycle_count = 0;
-      reset = 1;
-      repeat (3) @(posedge clk);
-      reset = 0;
-      prev_led = led;
-
-      // run for 5 full periods (expect 5 toggles)
-      repeat (5 * PERIOD + 1) begin
-         @(posedge clk);
-         cycle_count = cycle_count + 1;
-         if (led !== prev_led) begin
-            toggle_count = toggle_count + 1;
-            if (cycle_count != PERIOD) begin
-               $display(
-                  "FAIL: cycle %0d, exp %0d",
-                  cycle_count, PERIOD);
-               $fatal(1, "Incorrect toggle period");
-            end
-            cycle_count = 0;
-         end
-         prev_led = led;
-      end
-
-      if (toggle_count != 5) begin
-         $display("FAIL: exp 5 toggles, got %0d",
-               toggle_count);
-         $fatal(1, "Wrong number of toggles");
-      end
-
-      $display("PASS: %0d toggles, period %0d",
-               toggle_count, PERIOD);
-      $finish;
-   end
+   <<Blinky test setup>>
+   <<Blinky test stimulus>>
 endmodule
+@
+
+We instantiate the DUT with `PERIOD = 10` and generate a 100 MHz clock:
+
+<<Blinky test setup>>=
+localparam PERIOD = 10;
+
+reg  clk;
+reg  reset;
+wire led;
+
+blinky #(.PERIOD(PERIOD)) dut (
+   .clk(clk), .reset(reset), .led(led)
+);
+
+// clock: 10ns period
+initial clk = 0;
+always #5 clk <= ~clk;
+
+integer toggle_count;
+integer cycle_count;
+reg prev_led;
+@
+
+The stimulus resets the module, then watches for five toggle events. Each
+toggle must occur exactly `PERIOD` cycles after the previous one:
+
+<<Blinky test stimulus>>=
+initial begin
+   toggle_count = 0;
+   cycle_count = 0;
+   reset = 1;
+   repeat (3) @(posedge clk);
+   reset = 0;
+   prev_led = led;
+
+   repeat (5 * PERIOD + 1) begin
+      @(posedge clk);
+      cycle_count = cycle_count + 1;
+      if (led !== prev_led) begin
+         <<Check toggle period>>
+      end
+      prev_led = led;
+   end
+
+   <<Check toggle count>>
+   $display("PASS: %0d toggles, period %0d",
+            toggle_count, PERIOD);
+   $finish;
+end
+@
+
+<<Check toggle period>>=
+toggle_count = toggle_count + 1;
+if (cycle_count != PERIOD) begin
+   $display(
+      "FAIL: cycle %0d, exp %0d",
+      cycle_count, PERIOD);
+   $fatal(1, "Incorrect toggle period");
+end
+cycle_count = 0;
+@
+
+<<Check toggle count>>=
+if (toggle_count != 5) begin
+   $display("FAIL: exp 5 toggles, got %0d",
+            toggle_count);
+   $fatal(1, "Wrong number of toggles");
+end
 @
 
 === Formal properties
 
-The SymbiYosys configuration uses bounded model checking to depth 30,
-which covers roughly three counter periods at `PERIOD = 10`,
-including the initial reset cycle. The properties
-verify reset behavior, counter range, and counter increment/wrap logic.
+The test bench above is a simulation: it checks one specific scenario
+(five toggles at `PERIOD = 10`) and either passes or fails. Formal
+verification is different. Instead of running the circuit with chosen
+inputs, the solver reasons about _every possible_ input sequence
+simultaneously and either proves that no sequence can violate an
+assertion, or produces a counterexample that does.
+
+Bounded model checking (BMC) is the simplest form of formal
+verification: the solver checks all input sequences up to a given
+number of clock cycles (the depth). If no violation is found at
+depth $N$, the assertions are proven correct for all runs of length
+$N$ or less.
+
+The engine `smtbmc` translates the circuit and its assertions into a
+satisfiability problem, which the Z3 solver then attempts to solve.
+If Z3 finds an input sequence that violates an assertion, the proof
+fails and a counterexample trace is produced.
+
+The configuration below uses depth 30, which covers roughly three
+counter periods at `PERIOD = 10`, including the initial reset cycle.
+The properties verify reset behavior, counter range, and counter
+increment/wrap logic.
 
 <<blinky.sby>>=
 [tasks]
@@ -146,39 +170,66 @@ prep -top blinky
 blinky.v
 @
 
-The formal properties are embedded inside the module using `ifdef FORMAL`:
+The `[script]` section tells Yosys to read the Verilog source with
+formal-verification extensions enabled (`read -formal`), override
+`PERIOD` to 10 for tractable proof depth (`chparam`), and elaborate
+the design with `blinky` as the top module (`prep -top`).
+
+The formal properties are embedded inside the module using `ifdef
+FORMAL`. We assume that reset is asserted on the first cycle so the
+solver starts from a known state:
 
 <<Blinky formal properties>>=
-`ifdef FORMAL
-   // assume reset is asserted at the start
-   reg f_past_valid;
-   initial f_past_valid = 0;
-   always @(posedge clk) f_past_valid <= 1;
-   initial assume(reset);
-
-   // P1: one cycle after reset, counter and led are zero
-   always @(posedge clk) begin
-      if (f_past_valid && $past(reset)) begin
-         assert(counter == 0);
-         assert(led == 0);
-      end
-   end
-
-   // P2: counter stays in valid range
-   //     (after reset has taken effect)
-   always @(posedge clk) begin
-      if (f_past_valid && !reset && !$past(reset))
-         assert(counter < PERIOD);
-   end
-
-   // P3: counter increments or wraps
-   always @(posedge clk) begin
-      if (f_past_valid && !reset && !$past(reset)) begin
-         if ($past(counter) == PERIOD - 1)
-            assert(counter == 0);
-         else
-            assert(counter == $past(counter) + 1);
-      end
-   end
-`endif
+reg f_past_valid;
+initial f_past_valid = 0;
+always @(posedge clk) f_past_valid <= 1;
+initial assume(reset);
+<<Blinky P1: reset zeroes registers>>
+<<Blinky P2: counter range>>
+<<Blinky P3: counter increments or wraps>>
 @
+
+One cycle after reset, both `counter` and `led` must be zero:
+
+<<Blinky P1: reset zeroes registers>>=
+always @(posedge clk) begin
+   if (f_past_valid && $past(reset)) begin
+      assert(counter == 0);
+      assert(led == 0);
+   end
+end
+@
+
+Outside of reset, the counter must stay below `PERIOD`:
+
+<<Blinky P2: counter range>>=
+always @(posedge clk) begin
+   if (f_past_valid && !reset && !$past(reset))
+      assert(counter < PERIOD);
+end
+@
+
+Each cycle, the counter either increments by one or wraps to zero:
+
+<<Blinky P3: counter increments or wraps>>=
+always @(posedge clk) begin
+   if (f_past_valid && !reset && !$past(reset)) begin
+      if ($past(counter) == PERIOD - 1)
+         assert(counter == 0);
+      else
+         assert(counter == $past(counter) + 1);
+   end
+end
+@
+
+=== Summary
+
+This module was verified in two stages. First, a self-checking test
+bench instantiated the design with `PERIOD = 10` and confirmed that
+the LED toggles exactly five times at the correct period. Second,
+SymbiYosys proved via bounded model checking that for all possible
+input sequences up to 30 cycles: (1) reset zeroes both `counter` and
+`led`, (2) the counter stays below `PERIOD`, and (3) the counter
+increments by one each cycle or wraps to zero. Together, simulation
+and formal proof cover both the specific behavior and the general
+correctness of the design.
