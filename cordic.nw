@@ -49,7 +49,7 @@ assign cordic_angle[17] = 28'h0000145; //  0.000436 deg
 
 As it turns out, any angle can be reached by successively applying either
 positive or negative rotations of these angles. To change the sign of the
-rotation, just change the sign of the matrix elements. Spelling out the matrix
+rotation, just negate the off-diagonal terms. Spelling out the matrix
 multiplication, the algorithm will repeatedly rotate either one way or the
 other, depending on whether the previous rotation was too large or too small:
 
@@ -81,6 +81,7 @@ $N$ rotations the cumulative gain is
 $
 K = product_(n=0)^(N-1) sqrt(1+2^(-2n)) approx 1.6468
 $
+where $N = "N_ITER" - 2$ is the number of effective rotations.
 In practice we do not care that $K eq.not 1$, since it can be
 normalized elsewhere, say in a post-processing DSP stage or by
 adjusting the initial amplitude.
@@ -103,7 +104,7 @@ for phase zero, and one for the loaded FTW). Thereafter, a new output
 sample is produced every `N_ITER` clock cycles. The output amplitude
 is scaled by the CORDIC gain ($K approx 1.6468$) and the initial
 amplitude `ampl_in = 2^(INTERNAL_WIDTH - 2)`, giving a full-scale
-output of approximately `K * 2^(INTERNAL_WIDTH - 2) >> (INTERNAL_WIDTH - DW)`.
+output of approximately $K dot 2^("INTERNAL_WIDTH" - 2) slash 2^("INTERNAL_WIDTH" - "DW")$.
 
 === Parameters
 
@@ -113,7 +114,8 @@ The module has four independent parameters:
 - `N_ITER`: the number of CORDIC rotation iterations. More iterations
   yield a more accurate result, but each iteration takes one clock cycle.
   The actual number of rotations performed is `N_ITER - 2`, because
-  the cycle at `i == 0` is a garbage rotation (shift wraps) and the
+  the cycle at `i == 0` computes a garbage rotation (the shift amount
+  `i-1` wraps to a large unsigned value, producing a zero shift result) and the
   cycle at `i == N_ITER - 1` is used for reinitialization.
 - `INTERNAL_WIDTH`: the internal precision of the sine and cosine
   accumulators in bits. Typically equal to or greater than `N_ITER` to
@@ -121,9 +123,11 @@ The module has four independent parameters:
 - `PHASE_WIDTH`: the width of the phase accumulator, controlling frequency
   resolution.
 
-The rest of the code is entirely mechanical. We instantiate a module that cranks
-the handle executing the matrix multiplications one after the other, and then
-outputs the final result:
+=== Module implementation
+
+The rest of the code is entirely mechanical. We instantiate a module
+that cranks the handle executing the matrix multiplications one after
+the other, and then outputs the final result:
 
 <<cordic.v>>=
 module cordic #(
@@ -170,7 +174,14 @@ end
 @
 
 When reset is released, we alternate between the coordinate transforms
-explained above, and setting up the engine for the next calculation:
+explained above, and setting up the engine for the next calculation.
+The CORDIC rotation converges only for angles in the range
+$[-99.9 degree, +99.9 degree]$, so the full circle must be folded.
+The top two bits of `phase_acc` encode the quadrant. The `phase`
+register is loaded with the lower bits sign-extended from bit
+`PHASE_WIDTH-2`, mapping the angle into $[-pi slash 2, +pi slash 2)$.
+For quadrants 1 and 2, where cosine is negative, `cos_out` is
+initialized to `-ampl_in` to account for the 180-degree flip:
 
 <<Initialize CORDIC engine>>=
 begin
@@ -205,33 +216,52 @@ wire [1:0] quadrant = phase_acc[PHASE_WIDTH-1:PHASE_WIDTH-2];
 
 === Test bench
 
-The test bench verifies that the CORDIC module computes correct sines
-by comparing against the IEEE 754 `$sin()` function built into
-SystemVerilog. For each of 258 test FTW values (256 evenly spaced
-plus two corner cases), the test bench resets the module, waits for
-a valid output, and compares against `$sin()` scaled by $K$ and the
-initial amplitude.
+The test bench combines directed and constrained-random verification.
+Directed vectors exercise known corner cases (quadrant boundaries,
+near-Nyquist operation, phase-accumulator wrap). Constrained-random
+trials draw FTW values from specified ranges and verify properties
+that directed tests alone cannot exhaustively cover: sample-by-sample
+streaming accuracy, long-run drift, seamless FTW transitions, and
+monotonicity. All tests share a common set of helper tasks and
+functions. The random seed is controlled by Verilator's
+`+verilator+seed+N` command-line flag for reproducibility.
 
 <<tb_cordic.sv>>=
 `timescale 1ns/1ps
 
 module tb_cordic;
-   <<CORDIC test setup>>
-   <<CORDIC test stimulus>>
+   <<CORDIC test parameters>>
+   <<CORDIC test helpers>>
+   <<CORDIC test T0 directed pointwise>>
+   <<CORDIC test T1 directed streaming>>
+   <<CORDIC test T2 random streaming>>
+   <<CORDIC test T3 random drift>>
+   <<CORDIC test T4 random wraparound>>
+   <<CORDIC test T5 random ftw change>>
+   <<CORDIC test T6 random monotonicity>>
+   <<CORDIC test runner>>
 endmodule
 @
 
-We instantiate the DUT with default parameters and compute the CORDIC
-gain $K$ from the parameters at initialization:
+We instantiate the DUT with default parameters:
 
-<<CORDIC test setup>>=
+<<CORDIC test parameters>>=
+<<TB localparams>>
+<<TB DUT instance>>
+<<TB clock>>
+<<TB CORDIC gain and tolerance variables>>
+<<TB shared test counters>>
+@
+
+<<TB localparams>>=
 localparam DW  = 16;
 localparam N_ITER  = 18;
 localparam INTERNAL_WIDTH = 18;
 localparam PHASE_WIDTH = 28;
-localparam N_FTWS = 258;
 localparam real PI = 3.14159265358979323846;
+@
 
+<<TB DUT instance>>=
 reg clk_in;
 reg reset;
 reg [PHASE_WIDTH-1:0] ftw;
@@ -246,32 +276,186 @@ cordic #(
    .clk_in(clk_in), .reset(reset),
    .ftw(ftw), .wave_out(wave_out)
 );
-
-// clock: 10ns period
-initial clk_in = 0;
-always #5 clk_in <= ~clk_in;
-
-// CORDIC gain (computed, not a magic constant)
-real K;
-real phase_real, expected_real;
-integer expected_int, tolerance;
-integer test_idx, max_error, error, pass_count;
-integer got;
 @
 
-For each test vector, the stimulus resets the module, loads a FTW,
-and waits three full computation cycles for the output to become
-valid. The first cycle computes garbage (from the reset state), the
-second produces `sin(0)`, and the third produces `sin(ftw)`:
+<<TB clock>>=
+initial clk_in = 0;
+always #5 clk_in <= ~clk_in;
+@
 
-<<CORDIC test stimulus>>=
-initial begin
-   <<Compute CORDIC gain and tolerance>>
+The CORDIC gain $K$ and the error tolerance are not constants ---
+they are computed at runtime from the parameters by the
+`<<Compute CORDIC gain and tolerance>>` chunk in the test runner's
+`initial` block. Every helper that compares against the golden model
+reads these two variables:
 
-   max_error = 0;
-   pass_count = 0;
+<<TB CORDIC gain and tolerance variables>>=
+real K;
+integer tolerance;
+@
 
-   for (test_idx = 0; test_idx < N_FTWS;
+Every test task resets `g_max_err` and `g_pass_cnt` before its run.
+`check_sample` updates them on each comparison so that the test
+task can report totals at the end:
+
+<<TB shared test counters>>=
+integer g_max_err, g_pass_cnt;
+@
+
+==== Helpers
+
+The helpers factor out the reset sequence, sample timing,
+comparison logic, and the streaming pattern that every test reuses.
+
+<<CORDIC test helpers>>=
+<<TB do_reset>>
+<<TB wait_sample>>
+<<TB compute_expected>>
+<<TB sign_extend_wave>>
+<<TB compute_error>>
+<<TB check_sample>>
+<<TB run_streaming>>
+@
+
+Every test begins by resetting the DUT. The CORDIC engine needs
+three full computation cycles after reset before producing valid
+output (one garbage cycle, one for phase zero, and one for the loaded
+FTW), so `do_reset` encapsulates both the reset pulse and the
+startup wait:
+
+<<TB do_reset>>=
+task automatic do_reset();
+   reset = 1;
+   repeat (3) @(posedge clk_in);
+   reset = 0;
+   repeat (3 * N_ITER) @(posedge clk_in);
+endtask
+@
+
+After the first valid output, subsequent samples appear every
+`N_ITER` clock cycles. `wait_sample` advances the simulation by
+exactly one sample period:
+
+<<TB wait_sample>>=
+task automatic wait_sample();
+   repeat (N_ITER) @(posedge clk_in);
+endtask
+@
+
+The golden-model reference for every test is the IEEE 754
+`$sin()` function, scaled by the CORDIC gain $K$ and the initial
+amplitude, then truncated to the output width --- exactly mirroring
+what the hardware does. Without this function, every test would
+duplicate the same awkward chain of `$sin`, `$pow`, `$rtoi`, and
+`>>>`:
+
+<<TB compute_expected>>=
+function automatic int compute_expected(
+   input [PHASE_WIDTH-1:0] acc_phase
+);
+   real phase_r, expected_r;
+   phase_r = acc_phase * 2.0 * PI / $pow(2.0, PHASE_WIDTH);
+   expected_r = $sin(phase_r)
+      * K * $pow(2.0, INTERNAL_WIDTH - 2);
+   return $rtoi(expected_r) >>> (INTERNAL_WIDTH - DW);
+endfunction
+@
+
+The DUT output `wave_out` is a `DW`-bit signed wire, but the
+comparison arithmetic needs a full 32-bit signed integer.
+`sign_extend_wave` performs the sign extension in one place so that
+callers cannot get it wrong:
+
+<<TB sign_extend_wave>>=
+function automatic int sign_extend_wave();
+   return {{(32-DW){wave_out[DW-1]}}, wave_out};
+endfunction
+@
+
+`compute_error` returns the unsigned magnitude of the difference
+between expected and actual values. It is separate from
+`check_sample` so that tests like T3 (drift) can inspect the error
+without triggering the tolerance gate:
+
+<<TB compute_error>>=
+function automatic int compute_error(
+   input int exp_val, input int got_val
+);
+   int e;
+   e = got_val - exp_val;
+   if (e < 0) e = -e;
+   return e;
+endfunction
+@
+
+`check_sample` is the single point of comparison for all tests. It
+updates the running maximum error, increments the pass counter, and
+calls `$fatal` immediately when the tolerance is exceeded. Routing
+every check through one task guarantees uniform reporting and
+prevents silent failures:
+
+<<TB check_sample>>=
+task automatic check_sample(
+   input string tag,
+   input int exp_val,
+   input int got_val
+);
+   int err;
+   err = got_val - exp_val;
+   if (err < 0) err = -err;
+   if (err > g_max_err) g_max_err = err;
+   if (err > tolerance) begin
+      $display("FAIL [%s]: exp=%0d got=%0d err=%0d",
+               tag, exp_val, got_val, err);
+      $fatal(1, "Error exceeds tolerance");
+   end
+   g_pass_cnt = g_pass_cnt + 1;
+endtask
+@
+
+Most tests need the same pattern: reset the DUT, free-run at a
+given FTW, and check every consecutive sample against the golden
+model. `run_streaming` captures this pattern so that tests like T1
+(directed streaming) and T2 (random streaming) reduce to a single
+call per FTW:
+
+<<TB run_streaming>>=
+task automatic run_streaming(
+   input reg [PHASE_WIDTH-1:0] test_ftw,
+   input int n_samples,
+   input string tag
+);
+   int s;
+   reg [PHASE_WIDTH-1:0] acc_phase;
+   ftw = test_ftw;
+   do_reset();
+   acc_phase = test_ftw;
+   for (s = 0; s < n_samples; s = s + 1) begin
+      check_sample(tag, compute_expected(acc_phase),
+                   sign_extend_wave());
+      if (s < n_samples - 1) begin
+         wait_sample();
+         acc_phase = acc_phase + test_ftw;
+      end
+   end
+endtask
+@
+
+==== T0: directed pointwise
+
+The original point-by-point test: for each of 258 FTW values (256
+evenly spaced plus two corner cases), reset the module, wait for one
+valid output, and compare against `$sin()`. The first valid output
+after reset corresponds to `phase_acc = ftw` (one accumulator
+increment during startup):
+
+<<CORDIC test T0 directed pointwise>>=
+task automatic test_directed_pointwise();
+   integer test_idx;
+   g_max_err = 0;
+   g_pass_cnt = 0;
+   $display("  T0: directed pointwise");
+   for (test_idx = 0; test_idx < 258;
         test_idx = test_idx + 1) begin
       <<Select test FTW>>
 
@@ -280,11 +464,322 @@ initial begin
       reset = 0;
       repeat (3 * N_ITER) @(posedge clk_in);
 
-      <<CORDIC compare output>>
+      check_sample("T0",
+         compute_expected(ftw),
+         sign_extend_wave());
    end
+   $display("       PASS %0d vectors, max err = %0d / %0d LSB",
+            g_pass_cnt, g_max_err, tolerance);
+endtask
+@
 
-   $display("PASS: %0d vectors, max err = %0d / %0d LSB",
-            pass_count, max_error, tolerance);
+The test vectors are 256 evenly spaced FTW values plus two corner
+cases (`ftw = 1` and `ftw = 2^PHASE_WIDTH - 1`):
+
+<<Select test FTW>>=
+if (test_idx < 256)
+   ftw = test_idx[PHASE_WIDTH-1:0]
+       << (PHASE_WIDTH - 8);
+else if (test_idx == 256)
+   ftw = 1;
+else
+   ftw = {PHASE_WIDTH{1'b1}};
+@
+
+==== T1: directed streaming
+
+Free-run with hand-picked FTWs that stress specific edge cases.
+Every consecutive output is compared against the `$sin()` reference:
+
+<<CORDIC test T1 directed streaming>>=
+task automatic test_directed_streaming();
+   g_max_err = 0;
+   g_pass_cnt = 0;
+   $display("  T1: directed streaming");
+   run_streaming(28'h0000001,  64, "T1"); // min FTW
+   run_streaming(28'hFFFFFFF,  64, "T1"); // max FTW (near-Nyquist)
+   run_streaming(28'h4000000,  32, "T1"); // 4 samples/cycle
+   run_streaming(28'h8000000,  32, "T1"); // 2 samples/cycle
+   run_streaming(28'h2000000,  64, "T1"); // 8 samples/cycle
+   run_streaming(28'h5555555,  30, "T1"); // wrap every ~3 samples
+   run_streaming(28'hAAAAAAA,  30, "T1"); // wrap every ~1.5 samples
+   $display("       PASS %0d checks, max err = %0d / %0d LSB",
+            g_pass_cnt, g_max_err, tolerance);
+endtask
+@
+
+==== T2: constrained-random streaming
+
+Same check as T1, but with random FTW values drawn uniformly from
+the full range:
+
+<<CORDIC test T2 random streaming>>=
+task automatic test_random_streaming();
+   int trial;
+   reg [PHASE_WIDTH-1:0] test_ftw;
+   g_max_err = 0;
+   g_pass_cnt = 0;
+   $display("  T2: random streaming (10 x 64)");
+   for (trial = 0; trial < 10; trial = trial + 1) begin
+      test_ftw = $urandom_range((1 << PHASE_WIDTH) - 1, 1)[PHASE_WIDTH-1:0];
+      run_streaming(test_ftw, 64, "T2");
+   end
+   $display("       PASS %0d checks, max err = %0d / %0d LSB",
+            g_pass_cnt, g_max_err, tolerance);
+endtask
+@
+
+==== T3: long-run drift
+
+Run for 1024 consecutive samples and verify that the maximum error
+does not grow over time. The CORDIC engine reinitializes every
+`N_ITER` cycles, so errors should not accumulate. A margin of 1 LSB
+is allowed to accommodate quantization noise at the measurement
+boundary:
+
+<<CORDIC test T3 random drift>>=
+task automatic test_random_drift();
+   int trial, s, early_max, total_max, err;
+   int exp_val, got_val;
+   reg [PHASE_WIDTH-1:0] test_ftw;
+   reg [PHASE_WIDTH-1:0] acc_phase;
+   g_max_err = 0;
+   g_pass_cnt = 0;
+   $display("  T3: random drift (3 x 1024)");
+   for (trial = 0; trial < 3; trial = trial + 1) begin
+      test_ftw = $urandom_range((1 << PHASE_WIDTH) - 1, 1)[PHASE_WIDTH-1:0];
+      ftw = test_ftw;
+      do_reset();
+      early_max = 0;
+      total_max = 0;
+      acc_phase = test_ftw;
+      <<T3 collect 1024 samples and track error>>
+      if (total_max > early_max + 1) begin
+         $display("FAIL [T3]: drift: early=%0d total=%0d",
+                  early_max, total_max);
+         $fatal(1, "Error drift detected");
+      end
+   end
+   $display("       PASS %0d checks, max err = %0d / %0d LSB",
+            g_pass_cnt, g_max_err, tolerance);
+endtask
+@
+
+The inner loop checks every sample against the golden model (via
+`check_sample`, which enforces the absolute tolerance) and
+simultaneously tracks the maximum error in two windows: the first
+100 samples (`early_max`) and the full run (`total_max`). After the
+loop, the outer task compares the two: if the late-run error exceeds
+the early-run error by more than 1 LSB, the CORDIC engine is
+drifting:
+
+<<T3 collect 1024 samples and track error>>=
+for (s = 0; s < 1024; s = s + 1) begin
+   exp_val = compute_expected(acc_phase);
+   got_val = sign_extend_wave();
+   check_sample("T3", exp_val, got_val);
+   err = compute_error(exp_val, got_val);
+   if (err > total_max) total_max = err;
+   if (s < 100 && err > early_max)
+      early_max = err;
+   if (s < 1023) begin
+      wait_sample();
+      acc_phase = acc_phase + test_ftw;
+   end
+end
+@
+
+==== T4: phase accumulator wraparound
+
+Verify correct behavior when the 28-bit phase accumulator wraps.
+Two directed FTW values force frequent wraps; random trials draw
+FTW from `[2^20, 2^24]` so the wrap occurs after roughly 16 to 256
+samples:
+
+<<CORDIC test T4 random wraparound>>=
+task automatic test_random_wraparound();
+   int trial, n_samples, wrap_at;
+   reg [PHASE_WIDTH-1:0] test_ftw;
+   g_max_err = 0;
+   g_pass_cnt = 0;
+   $display("  T4: wraparound (2 directed + 8 random)");
+   run_streaming(28'h5555555, 30, "T4");
+   run_streaming(28'hFFFFFFF, 30, "T4");
+   for (trial = 0; trial < 8; trial = trial + 1) begin
+      test_ftw = $urandom_range(1 << 24, 1 << 20)[PHASE_WIDTH-1:0];
+      wrap_at = (1 << PHASE_WIDTH) / {4'b0, test_ftw};
+      n_samples = wrap_at + 32;
+      run_streaming(test_ftw, n_samples, "T4");
+   end
+   $display("       PASS %0d checks, max err = %0d / %0d LSB",
+            g_pass_cnt, g_max_err, tolerance);
+endtask
+@
+
+==== T5: FTW change without reset
+
+Change the frequency tuning word mid-stream and verify that the
+output tracks the new frequency after the two-sample pipeline delay.
+When FTW changes between output samples, the computation already in
+progress completes with the old phase, and the phase accumulator
+increment at the next initialization uses the new FTW. The output
+therefore reflects the new frequency starting two samples after the
+change. The delay is two samples because (1) the computation cycle in
+progress when FTW changes still uses the old phase loaded at the
+previous initialization, and (2) the next initialization increments
+`phase_acc` by the new FTW, but that computation's output is only
+latched at the following initialization:
+
+<<CORDIC test T5 random ftw change>>=
+task automatic test_random_ftw_change();
+   int trial, s;
+   reg [PHASE_WIDTH-1:0] ftw1, ftw2;
+   reg [PHASE_WIDTH-1:0] acc_phase;
+   g_max_err = 0;
+   g_pass_cnt = 0;
+   $display("  T5: random FTW change (10 trials)");
+   for (trial = 0; trial < 10; trial = trial + 1) begin
+      ftw1 = $urandom_range((1 << PHASE_WIDTH) - 1, 1)[PHASE_WIDTH-1:0];
+      ftw2 = $urandom_range((1 << PHASE_WIDTH) - 1, 1)[PHASE_WIDTH-1:0];
+      ftw = ftw1;
+      do_reset();
+      <<T5 steady state at ftw1>>
+      <<T5 change FTW>>
+      <<T5 pipeline drain>>
+      <<T5 verify new frequency>>
+   end
+   $display("       PASS %0d checks, max err = %0d / %0d LSB",
+            g_pass_cnt, g_max_err, tolerance);
+endtask
+@
+
+First, establish a steady-state baseline by running 16 samples at
+the original frequency. This confirms the module is producing
+correct output before the transition:
+
+<<T5 steady state at ftw1>>=
+acc_phase = ftw1;
+for (s = 0; s < 16; s = s + 1) begin
+   check_sample("T5a",
+      compute_expected(acc_phase),
+      sign_extend_wave());
+   if (s < 15) begin
+      wait_sample();
+      acc_phase = acc_phase + ftw1;
+   end
+end
+@
+
+The FTW input is changed between output samples, with no reset.
+The DUT's `phase_acc` will pick up the new value at the next
+initialization cycle:
+
+<<T5 change FTW>>=
+ftw = ftw2;
+@
+
+Two samples are already in the pipeline when the FTW changes. The
+computation in progress was loaded with the old phase, and the next
+initialization incremented `phase_acc` by the old FTW (because the
+non-blocking assignment captured `ftw` before our change took
+effect on the next posedge). These two samples must still match the
+old-frequency trajectory:
+
+<<T5 pipeline drain>>=
+for (s = 0; s < 2; s = s + 1) begin
+   wait_sample();
+   acc_phase = acc_phase + ftw1;
+   check_sample("T5p",
+      compute_expected(acc_phase),
+      sign_extend_wave());
+end
+@
+
+After the pipeline drains, the phase accumulator increments by
+`ftw2` on every subsequent initialization. The accumulated phase
+continues seamlessly from where it was --- no discontinuity, just a
+different step size:
+
+<<T5 verify new frequency>>=
+for (s = 0; s < 32; s = s + 1) begin
+   wait_sample();
+   acc_phase = acc_phase + ftw2;
+   check_sample("T5b",
+      compute_expected(acc_phase),
+      sign_extend_wave());
+end
+@
+
+==== T6: monotonicity
+
+For slow FTW values the output must be non-decreasing in the first
+quarter-period (phase 0 to $pi slash 2$). We check only up to 80
+percent of the quarter to avoid the region near the peak where the
+derivative of sine approaches zero and quantization noise can cause
+apparent reversals:
+
+<<CORDIC test T6 random monotonicity>>=
+task automatic test_random_monotonicity();
+   int trial, s, n_quarter, n_check;
+   int prev_val, cur_val;
+   reg [PHASE_WIDTH-1:0] test_ftw;
+   g_max_err = 0;
+   g_pass_cnt = 0;
+   $display("  T6: random monotonicity (8 trials)");
+   for (trial = 0; trial < 8; trial = trial + 1) begin
+      test_ftw = $urandom_range(1 << 21, 1 << 18)[PHASE_WIDTH-1:0];
+      ftw = test_ftw;
+      do_reset();
+      n_quarter = (1 << (PHASE_WIDTH - 2)) / {4'b0, test_ftw};
+      n_check = (n_quarter * 4) / 5;
+      if (n_check < 2) n_check = 2;
+      <<T6 assert non-decreasing output>>
+   end
+   $display("       PASS %0d checks", g_pass_cnt);
+endtask
+@
+
+Walk through the first 80 percent of the quarter-period and assert
+that every sample is greater than or equal to its predecessor. The
+FTW constraint (`[2^18, 2^21]`) guarantees at least 32 samples per
+quarter, so the per-sample phase step is small enough that the
+sine's slope dominates the quantization noise throughout the
+checked region:
+
+<<T6 assert non-decreasing output>>=
+prev_val = sign_extend_wave();
+g_pass_cnt = g_pass_cnt + 1;
+for (s = 1; s < n_check; s = s + 1) begin
+   wait_sample();
+   cur_val = sign_extend_wave();
+   if (cur_val < prev_val) begin
+      $display(
+         "FAIL [T6]: s=%0d prev=%0d cur=%0d FTW=%h",
+         s, prev_val, cur_val, test_ftw);
+      $fatal(1, "Monotonicity violation");
+   end
+   prev_val = cur_val;
+   g_pass_cnt = g_pass_cnt + 1;
+end
+@
+
+==== Test runner
+
+The runner computes the CORDIC gain and tolerance, then calls each
+test in sequence:
+
+<<CORDIC test runner>>=
+initial begin
+   <<Compute CORDIC gain and tolerance>>
+   $display("=== CORDIC testbench ===");
+   test_directed_pointwise();
+   test_directed_streaming();
+   test_random_streaming();
+   test_random_drift();
+   test_random_wraparound();
+   test_random_ftw_change();
+   test_random_monotonicity();
+   $display("ALL TESTS PASSED");
    $finish;
 end
 @
@@ -308,44 +803,11 @@ tolerance = $rtoi($ceil(
 $display("K = %f, tolerance = %0d LSB", K, tolerance);
 @
 
-The test vectors are 256 evenly spaced FTW values plus two corner
-cases (`ftw = 1` and `ftw = 2^PHASE_WIDTH - 1`):
-
-<<Select test FTW>>=
-if (test_idx < 256)
-   ftw = test_idx[PHASE_WIDTH-1:0]
-       << (PHASE_WIDTH - 8);
-else if (test_idx == 256)
-   ftw = 1;
-else
-   ftw = {PHASE_WIDTH{1'b1}};
-@
-
-The comparison computes the expected output from `$sin()` scaled by
-$K$ and the initial amplitude, then checks the absolute error against
-the tolerance:
-
-<<CORDIC compare output>>=
-phase_real = ftw * 2.0 * PI
-             / $pow(2.0, PHASE_WIDTH);
-expected_real = $sin(phase_real)
-   * K * $pow(2.0, INTERNAL_WIDTH - 2);
-expected_int = $rtoi(expected_real)
-   >>> (INTERNAL_WIDTH - DW);
-got = {{(32-DW){wave_out[DW-1]}}, wave_out};
-error = got - expected_int;
-if (error < 0) error = -error;
-if (error > max_error) max_error = error;
-
-if (error > tolerance) begin
-   $display("FAIL: FTW=%h exp=%0d got=%0d err=%0d",
-            ftw, expected_int, got, error);
-   $fatal(1, "Output error exceeds tolerance");
-end
-pass_count = pass_count + 1;
-@
-
 === Error analysis
+
+Let $N = "N_ITER" - 2$ denote the number of effective rotations
+(excluding the garbage cycle at $i = 0$ and the reinitialization
+cycle at $i = "N_ITER" - 1$).
 
 The CORDIC algorithm is an approximation. Three sources of error
 contribute to the difference between the hardware output and an
@@ -387,7 +849,10 @@ bound from the parameters and uses it as the tolerance.
 The SymbiYosys configuration and formal properties verify invariants
 that simulation alone cannot exhaustively check. The properties are
 placed inside the module itself using `ifdef FORMAL`, which is the
-standard approach for SymbiYosys.
+standard approach for SymbiYosys. The BMC depth of 46 covers at
+least two full computation cycles ($2 times "N_ITER" = 36$) plus
+margin, enough to check the reset property and one post-reset
+initialization.
 
 <<cordic.sby>>=
 [tasks]
@@ -430,6 +895,7 @@ always @(posedge clk_in) begin
       assert(phase == 0);
       assert(sin_out == 0);
       assert(cos_out == 0);
+      assert(phase_acc == 0);
    end
 end
 @
