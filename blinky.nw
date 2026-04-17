@@ -1,8 +1,13 @@
 == Blinky
 
 The simplest useful FPGA module: a parameterized LED blinker. This module
-serves as the hardware bring-up test. If the LED blinks at the right rate, the
-clock is running, the reset works, and the bitstream was loaded correctly.
+serves as the hardware bring-up test. If the LED blinks at the right rate,
+the clock is running, the bitstream was loaded correctly, and the power-on
+initial state took effect.
+
+There is no external reset. iCE40 SRAM-based configuration lets us rely on
+`initial` blocks to establish the power-on state of every register, which
+keeps the top-level interface to just `clk` and `led`.
 
 <<blinky.v>>=
 module blinky #(
@@ -10,17 +15,18 @@ module blinky #(
    parameter WIDTH  = $clog2(PERIOD))
    (
       input  clk,
-      input  reset,
       output reg led
    );
 
    reg [WIDTH-1:0] counter;
 
+   initial begin
+      counter = 0;
+      led     = 0;
+   end
+
    always @(posedge clk) begin
-      if (reset) begin
-         counter <= 0;
-         led <= 0;
-      end else if (counter == PERIOD - 1) begin
+      if (counter == PERIOD - 1) begin
          counter <= 0;
          led <= ~led;
       end else begin
@@ -37,14 +43,17 @@ endmodule
 When overriding `PERIOD`, leave `WIDTH` at its default; it is computed
 automatically from `PERIOD` via `$clog2`.
 
-The default period of 25 million cycles gives a 1 Hz blink rate (one
-full on-off cycle per second) with a 50 MHz clock. The test bench
-overrides this to `PERIOD = 10` for fast simulation.
+The default period of 25 million cycles gives a 1 Hz blink rate (one full
+on-off cycle per second) with a 50 MHz clock. On the iCEstick (12 MHz) the
+bitstream build overrides this so the blink rate remains visible; see the
+Makefile. The test bench overrides to `PERIOD = 10` for fast simulation.
 
 === Test bench
 
-The test bench checks that the LED toggles at the correct period and
-that exactly five toggles occur over five full periods.
+The test bench checks that the LED toggles at the correct period and that
+exactly five toggles occur over five full periods. With no reset input, we
+rely on the `initial` blocks inside `blinky` to establish a known starting
+state.
 
 <<tb_blinky.sv>>=
 `timescale 1ns/1ps
@@ -61,11 +70,10 @@ We instantiate the DUT with `PERIOD = 10` and generate a 100 MHz clock:
 localparam PERIOD = 10;
 
 reg  clk;
-reg  reset;
 wire led;
 
 blinky #(.PERIOD(PERIOD)) dut (
-   .clk(clk), .reset(reset), .led(led)
+   .clk(clk), .led(led)
 );
 
 // clock: 10ns period
@@ -77,20 +85,21 @@ integer cycle_count;
 reg prev_led;
 @
 
-The stimulus resets the module, then watches for five toggle events. Each
-toggle must occur exactly `PERIOD` cycles after the previous one:
+The stimulus watches for five toggle events. Each toggle must occur exactly
+`PERIOD` cycles after the previous one. We sample on `negedge clk` so the
+non-blocking updates from the rising edge have fully settled before we read
+`led`; sampling on `posedge clk` races the DUT's own `@(posedge clk)` block
+and reads pre-edge values at $t = 0$. The first toggle is measured from the
+initial state (led = 0 from the DUT's `initial` block):
 
 <<Blinky test stimulus>>=
 initial begin
    toggle_count = 0;
    cycle_count = 0;
-   reset = 1;
-   repeat (3) @(posedge clk);
-   reset = 0;
    prev_led = led;
 
-   repeat (5 * PERIOD + 1) begin
-      @(posedge clk);
+   repeat (5 * PERIOD) begin
+      @(negedge clk);
       cycle_count = cycle_count + 1;
       if (led !== prev_led) begin
          <<Check toggle period>>
@@ -145,8 +154,10 @@ If Z3 finds an input sequence that violates an assertion, the proof
 fails and a counterexample trace is produced.
 
 The configuration below uses depth 30, which covers roughly three
-counter periods at `PERIOD = 10`, including the initial reset cycle.
-The properties verify reset behavior, counter range, and counter
+counter periods at `PERIOD = 10`. With no reset input, the proof
+starts from the state established by `initial`, which is also the
+only non-deterministic choice the solver has about the registers.
+The properties verify initial state, counter range, and counter
 increment/wrap logic.
 
 <<blinky.sby>>=
@@ -176,36 +187,34 @@ formal-verification extensions enabled (`read -formal`), override
 the design with `blinky` as the top module (`prep -top`).
 
 The formal properties are embedded inside the module using `ifdef
-FORMAL`. We assume that reset is asserted on the first cycle so the
-solver starts from a known state:
+FORMAL`:
 
 <<Blinky formal properties>>=
 reg f_past_valid;
 initial f_past_valid = 0;
 always @(posedge clk) f_past_valid <= 1;
-initial assume(reset);
-<<Blinky P1: reset zeroes registers>>
+<<Blinky P1: initial state is zero>>
 <<Blinky P2: counter range>>
 <<Blinky P3: counter increments or wraps>>
 @
 
-One cycle after reset, both `counter` and `led` must be zero:
+At time zero, both `counter` and `led` must be zero. This property
+is established by the `initial` blocks in the design; asserting it
+here pins down the contract so that a future change to the reset
+convention cannot silently break the starting state:
 
-<<Blinky P1: reset zeroes registers>>=
-always @(posedge clk) begin
-   if (f_past_valid && $past(reset)) begin
-      assert(counter == 0);
-      assert(led == 0);
-   end
+<<Blinky P1: initial state is zero>>=
+initial begin
+   assert(counter == 0);
+   assert(led == 0);
 end
 @
 
-Outside of reset, the counter must stay below `PERIOD`:
+On every cycle, the counter must stay below `PERIOD`:
 
 <<Blinky P2: counter range>>=
 always @(posedge clk) begin
-   if (f_past_valid && !reset && !$past(reset))
-      assert(counter < PERIOD);
+   assert(counter < PERIOD);
 end
 @
 
@@ -213,7 +222,7 @@ Each cycle, the counter either increments by one or wraps to zero:
 
 <<Blinky P3: counter increments or wraps>>=
 always @(posedge clk) begin
-   if (f_past_valid && !reset && !$past(reset)) begin
+   if (f_past_valid) begin
       if ($past(counter) == PERIOD - 1)
          assert(counter == 0);
       else
@@ -222,14 +231,25 @@ always @(posedge clk) begin
 end
 @
 
+=== iCEstick pin mapping
+
+The iCEstick evaluation board houses a Lattice iCE40-HX1K in the TQ144
+package. The 12 MHz Discera MEMS oscillator drives FPGA pin 21, and LED D1
+(red, Bank 1, PIO1\_14) is on pin 99. Those are the only two pins the
+blinky top-level needs.
+
+<<blinky.pcf>>=
+set_io clk 21
+set_io led 99
+@
+
 === Summary
 
-This module was verified in two stages. First, a self-checking test
-bench instantiated the design with `PERIOD = 10` and confirmed that
-the LED toggles exactly five times at the correct period. Second,
-SymbiYosys proved via bounded model checking that for all possible
-input sequences up to 30 cycles: (1) reset zeroes both `counter` and
-`led`, (2) the counter stays below `PERIOD`, and (3) the counter
-increments by one each cycle or wraps to zero. Together, simulation
-and formal proof cover both the specific behavior and the general
-correctness of the design.
+This module was verified in two stages. First, a self-checking test bench
+instantiated the design with `PERIOD = 10` and confirmed that the LED
+toggles exactly five times at the correct period. Second, SymbiYosys proved
+via bounded model checking that for all possible input sequences up to 30
+cycles: (1) the initial state is zero, (2) the counter stays below
+`PERIOD`, and (3) the counter increments by one each cycle or wraps to
+zero. Together, simulation and formal proof cover both the specific
+behavior and the general correctness of the design.

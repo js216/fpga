@@ -40,6 +40,9 @@ $(B)/tb_%.sv: %.nw | $(B)
 $(B)/%.sby: %.nw | $(B)
 	cd $(B) && tangle $*.sby < ../$<
 
+$(B)/%.pcf: %.nw | $(B)
+	cd $(B) && tangle $*.pcf < ../$<
+
 # ---- documentation ----
 
 $(B)/%.pdf: %.nw style.txt | $(B)
@@ -68,6 +71,26 @@ synth: $(addprefix $(B)/,$(addsuffix .v,$(MODS)))
 		yosys -p "read_verilog $(B)/$$v.v; synth_ice40 -top $$v" -q 2>&1 | tail -20; \
 		echo; \
 	done
+
+# ---- bitstream (iCEstick: iCE40-HX1K, TQ144, 12 MHz clock) ----
+#
+# PERIOD is overridden to 6_000_000 so the LED toggles at 1 Hz on the
+# 12 MHz board clock (one full on/off cycle every 1 s).
+
+bitstream: $(B)/blinky.bin
+
+$(B)/blinky.json: $(B)/blinky.v
+	cd $(B) && yosys -q -p "read_verilog blinky.v; \
+		chparam -set PERIOD 6000000 blinky; \
+		synth_ice40 -top blinky -json blinky.json"
+
+$(B)/blinky.asc: $(B)/blinky.json $(B)/blinky.pcf
+	cd $(B) && nextpnr-ice40 --hx1k --package tq144 \
+		--json blinky.json --pcf blinky.pcf --asc blinky.asc \
+		--freq 12 -q
+
+$(B)/blinky.bin: $(B)/blinky.asc
+	cd $(B) && icepack blinky.asc blinky.bin
 
 # ---- clean ----
 
