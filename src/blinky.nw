@@ -11,7 +11,7 @@ keeps the top-level interface to just `clk` and `led`.
 
 <<blinky.v>>=
 module blinky #(
-   parameter PERIOD = 25_000_000,
+   parameter PERIOD = 6_000_000,
    parameter WIDTH  = $clog2(PERIOD))
    (
       input  clk,
@@ -43,10 +43,9 @@ endmodule
 When overriding `PERIOD`, leave `WIDTH` at its default; it is computed
 automatically from `PERIOD` via `$clog2`.
 
-The default period of 25 million cycles gives a 1 Hz blink rate (one full
-on-off cycle per second) with a 50 MHz clock. On the iCEstick (12 MHz) the
-bitstream build overrides this so the blink rate remains visible; see the
-Makefile. The test bench overrides to `PERIOD = 10` for fast simulation.
+The default period of 6 million cycles gives a 1 Hz blink rate (one full
+on-off cycle per second) with the iCEstick's 12 MHz clock. The test bench
+overrides to `PERIOD = 10` for fast simulation.
 
 === Test bench
 
@@ -178,7 +177,7 @@ chparam -set PERIOD 10 blinky
 prep -top blinky
 
 [files]
-blinky.v
+../verilog/blinky.v
 @
 
 The `[script]` section tells Yosys to read the Verilog source with
@@ -241,6 +240,16 @@ blinky top-level needs.
 <<blinky.pcf>>=
 set_io clk 21
 set_io led 99
+@
+
+=== Build fragment
+
+Blinky's generic rules cover everything except declaring itself as a
+bitstream target. The top Makefile's `bitstream` phony collects
+prereqs from each module's `.mk` fragment.
+
+<<blinky.mk>>=
+bitstream: build/blinky.bin
 @
 
 === Summary

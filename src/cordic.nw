@@ -383,7 +383,8 @@ function automatic int compute_error(
 );
    int e;
    e = got_val - exp_val;
-   if (e < 0) e = -e;
+   if (e < 0)
+      e = -e;
    return e;
 endfunction
 @
@@ -402,8 +403,10 @@ task automatic check_sample(
 );
    int err;
    err = got_val - exp_val;
-   if (err < 0) err = -err;
-   if (err > g_max_err) g_max_err = err;
+   if (err < 0)
+      err = -err;
+   if (err > g_max_err)
+      g_max_err = err;
    if (err > tolerance) begin
       $display("FAIL [%s]: exp=%0d got=%0d err=%0d",
                tag, exp_val, got_val, err);
@@ -579,7 +582,8 @@ for (s = 0; s < 1024; s = s + 1) begin
    got_val = sign_extend_wave();
    check_sample("T3", exp_val, got_val);
    err = compute_error(exp_val, got_val);
-   if (err > total_max) total_max = err;
+   if (err > total_max)
+      total_max = err;
    if (s < 100 && err > early_max)
       early_max = err;
    if (s < 1023) begin
@@ -732,7 +736,8 @@ task automatic test_random_monotonicity();
       do_reset();
       n_quarter = (1 << (PHASE_WIDTH - 2)) / {4'b0, test_ftw};
       n_check = (n_quarter * 4) / 5;
-      if (n_check < 2) n_check = 2;
+      if (n_check < 2)
+         n_check = 2;
       <<T6 assert non-decreasing output>>
    end
    $display("       PASS %0d checks", g_pass_cnt);
@@ -871,7 +876,7 @@ read -formal cordic.v
 prep -top cordic
 
 [files]
-cordic.v
+../verilog/cordic.v
 @
 
 The formal properties are embedded directly in the module. We assume

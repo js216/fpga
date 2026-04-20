@@ -1,98 +1,83 @@
-# FPGA module library: literate source -> HDL + tests + docs
-#
-# All build artifacts go under build/ to keep the source
-# directory clean. Stamp files (sim_*, formal_*) prevent
-# re-running passing tests unless sources change.
+CHAPTERS := $(notdir $(basename $(wildcard src/*.nw)))
 
-B := build
-NW   := $(wildcard *.nw)
-MODS := $(NW:.nw=)
+# iCEstick defaults; override on command line.
+DEVICE  ?= hx1k
+PACKAGE ?= tq144
 
-# ---- top-level targets ----
+.PHONY: all doc sim formal bitstream clean
 
-all: doc sim
+all: doc sim formal bitstream
 
-test: doc sim formal
-	@echo "==== ALL TESTS PASSED ===="
+doc:    $(addprefix doc/,$(addsuffix .pdf,$(CHAPTERS)))
+sim:    $(addprefix build/sim_,$(CHAPTERS))
+formal: $(addprefix build/formal_,$(CHAPTERS))
+bitstream:  # per-chapter .mk fragments append prereqs
 
-doc: $(addprefix $(B)/,$(addsuffix .pdf,$(MODS)))
+.NOTINTERMEDIATE:
 
-sim: $(addprefix $(B)/sim_,$(MODS))
+build verilog tb:
+	mkdir -p $@
 
-formal: $(addprefix $(B)/formal_,$(MODS))
+# ---- tangle ----
 
-# prevent Make from deleting tangled files as intermediaries
-.SECONDARY:
+verilog/%.v: src/%.nw | verilog
+	cd verilog && tangle $*.v < ../$<
 
-# ---- directory ----
+verilog/%.pcf: src/%.nw | verilog
+	cd verilog && tangle $*.pcf < ../$<
 
-$(B):
-	mkdir -p $(B)
+tb/tb_%.sv: src/%.nw | tb
+	cd tb && tangle tb_$*.sv < ../$<
 
-# ---- tangle rules ----
+build/%.sby: src/%.nw | build
+	cd build && tangle $*.sby < ../$<
 
-$(B)/%.v: %.nw | $(B)
-	cd $(B) && tangle $*.v < ../$<
-
-$(B)/tb_%.sv: %.nw | $(B)
-	cd $(B) && tangle tb_$*.sv < ../$<
-
-$(B)/%.sby: %.nw | $(B)
-	cd $(B) && tangle $*.sby < ../$<
-
-$(B)/%.pcf: %.nw | $(B)
-	cd $(B) && tangle $*.pcf < ../$<
-
-# ---- documentation ----
-
-$(B)/%.pdf: %.nw style.txt | $(B)
-	cp style.txt $(B)/$*.typ
-	weave < $< >> $(B)/$*.typ
-	typst compile $(B)/$*.typ
-
-# ---- simulation ----
-
-$(B)/sim_%: $(B)/tb_%.sv $(B)/%.v
-	cd $(B) && verilator -Wall --binary tb_$*.sv $*.v
-	cd $(B) && obj_dir/Vtb_$*
+# Makefile fragment: optional, empty if chapter has no <<%.mk>> chunk.
+build/%.mk: src/%.nw | build
+	@cd build && tangle $*.mk < ../$< 2>/dev/null
 	@touch $@
 
-# ---- formal verification ----
+# ---- doc ----
 
-$(B)/formal_%: $(B)/%.sby $(B)/%.v
-	cd $(B) && sby -f $*.sby
+doc/%.pdf: src/%.nw style.typ | build
+	@mkdir -p doc
+	cp style.typ build/$*.typ
+	weave < $< >> build/$*.typ
+	typst compile build/$*.typ doc/$*.pdf
+
+# ---- sim ----
+
+build/sim_%: tb/tb_%.sv verilog/%.v | build
+	cd build && verilator -Wall --binary --top-module tb_$* \
+		../tb/tb_$*.sv ../verilog/$*.v
+	cd build && obj_dir/Vtb_$*
 	@touch $@
 
-# ---- synthesis estimation (informational) ----
+# ---- formal ----
 
-synth: $(addprefix $(B)/,$(addsuffix .v,$(MODS)))
-	@for v in $(MODS); do \
-		echo "==== $$v ===="; \
-		yosys -p "read_verilog $(B)/$$v.v; synth_ice40 -top $$v" -q 2>&1 | tail -20; \
-		echo; \
-	done
+build/formal_%: build/%.sby verilog/%.v
+	cd build && sby -f $*.sby
+	@touch $@
 
-# ---- bitstream (iCEstick: iCE40-HX1K, TQ144, 12 MHz clock) ----
-#
-# PERIOD is overridden to 6_000_000 so the LED toggles at 1 Hz on the
-# 12 MHz board clock (one full on/off cycle every 1 s).
+# ---- bitstream ----
 
-bitstream: $(B)/blinky.bin
+build/%.json: verilog/%.v | build
+	cd build && yosys -q -p "read_verilog ../verilog/$*.v; \
+		synth_ice40 -top $* -json $*.json"
 
-$(B)/blinky.json: $(B)/blinky.v
-	cd $(B) && yosys -q -p "read_verilog blinky.v; \
-		chparam -set PERIOD 6000000 blinky; \
-		synth_ice40 -top blinky -json blinky.json"
-
-$(B)/blinky.asc: $(B)/blinky.json $(B)/blinky.pcf
-	cd $(B) && nextpnr-ice40 --hx1k --package tq144 \
-		--json blinky.json --pcf blinky.pcf --asc blinky.asc \
+build/%.asc: build/%.json verilog/%.pcf
+	cd build && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) \
+		--json $*.json --pcf ../verilog/$*.pcf --asc $*.asc \
 		--freq 12 -q
 
-$(B)/blinky.bin: $(B)/blinky.asc
-	cd $(B) && icepack blinky.asc blinky.bin
+build/%.bin: build/%.asc
+	cd build && icepack $*.asc $*.bin
 
 # ---- clean ----
 
 clean:
-	rm -rf $(B)
+	rm -rf build doc
+
+# ---- per-chapter fragments ----
+
+-include $(addprefix build/,$(addsuffix .mk,$(CHAPTERS)))

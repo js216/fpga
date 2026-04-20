@@ -1,0 +1,1105 @@
+== Serial
+
+A small UART library for iCE40 bring-up and `printf`-style debugging.
+Four Verilog modules tangle from this chapter, each into its own
+matching-name `.v` file so Verilator's `DECLFILENAME` lint accepts every
+source:
+
+- `uart_rx.v`: 8N1 receiver, parameterised by clock cycles per bit;
+- `uart_tx.v`: matching transmitter;
+- `uart_hello.v`: a heartbeat byte source emitting "Hello from iCEstick"
+  every `PERIOD_CYCLES` ticks --- not standalone; it feeds a caller-owned
+  transmitter through a valid/ready handshake;
+- `uart.v`: the iCEstick demo top --- instantiates one of each and
+  arbitrates the single `uart_tx` between the hello heartbeat and an
+  echo loopback on the receiver.
+
+The baud rate is a ratio between the input clock and the `CLKS_PER_BIT`
+parameter. For the iCEstick's 12 MHz oscillator the default of 104 lands
+on 115200 baud with a 0.16% error, well inside UART tolerance.
+
+== Receiver
+
+The receiver decodes one start bit, eight data bits (LSB first), and one
+stop bit. It runs at the system clock and counts out `CLKS_PER_BIT` cycles
+between bit centres; the start bit is detected on the rx line going low
+from idle, and the first data-bit sample is taken half a bit time later so
+every subsequent sample sits in the middle of its bit.
+
+The module has no external reset. All state registers come up zero from
+the iCE40 power-on configuration, which matches the `S_IDLE` starting
+state. This keeps the interface to just `clk` in and `ready`/`data` out.
+
+<<uart_rx.v>>=
+module uart_rx #(
+      parameter CLKS_PER_BIT = 104
+   )(
+      input            clk,
+      input            rx,
+      output reg       ready,
+      output reg [7:0] data
+   );
+   <<RX state encoding>>
+   <<RX state registers>>
+   <<RX initial state>>
+   <<RX main FSM>>
+`ifdef FORMAL
+   <<RX formal properties>>
+`endif
+endmodule
+@
+
+Five states drive the frame decode: idle waiting for a line transition,
+start-bit confirmation, data-bit sampling, stop-bit waiting, and a final
+one-cycle `ready` pulse in `S_DONE`. A separate `S_DONE` instead of
+asserting `ready` from `S_STOP` keeps the `ready` strobe exactly one
+cycle wide regardless of how the rest of the FSM is timed.
+
+<<RX state encoding>>=
+localparam S_IDLE  = 3'd0;
+localparam S_START = 3'd1;
+localparam S_DATA  = 3'd2;
+localparam S_STOP  = 3'd3;
+localparam S_DONE  = 3'd4;
+@
+
+Three state registers: the FSM state itself, a cycle counter within each
+bit period, and an index selecting which of the eight data bits we are
+currently on. The counter width follows `CLKS_PER_BIT` via `$clog2`, so
+the same module synthesizes at any baud rate without manually resizing.
+
+<<RX state registers>>=
+reg  [2:0] state;
+reg  [$clog2(CLKS_PER_BIT)-1:0] count;
+reg  [2:0] bit_idx;
+@
+
+Explicit `initial` values give the iCE40 configuration SRAM known
+start-up contents and, more importantly, define the simulation
+starting state. Without them, Verilog's default `X` would poison the
+RX FSM on cycle zero and the formal assertions would trip before the
+first real input arrived.
+
+<<RX initial state>>=
+initial begin
+   state   = S_IDLE;
+   ready   = 0;
+   data    = 0;
+   count   = 0;
+   bit_idx = 0;
+end
+@
+
+The main FSM is one big `case` statement, with each arm broken out as its
+own chunk so the structure of the receive sequence reads like a list.
+
+<<RX main FSM>>=
+always @(posedge clk) begin
+   case (state)
+      <<RX: idle state>>
+      <<RX: start-bit confirmation>>
+      <<RX: data-bit sampling>>
+      <<RX: stop-bit check>>
+      <<RX: ready pulse>>
+      default: state <= S_IDLE;
+   endcase
+end
+@
+
+Idle waits for `rx` to go low, which is the leading edge of the start bit,
+and clears all counters so the next frame starts fresh.
+
+<<RX: idle state>>=
+S_IDLE: begin
+   ready   <= 0;
+   count   <= 0;
+   bit_idx <= 0;
+   if (rx == 1'b0)
+      state <= S_START;
+end
+@
+
+After half a bit time we should be at the centre of the start bit. If
+`rx` is still low we have a genuine start; otherwise it was a glitch and
+we fall back to idle. Both paths reset `count` so the "idle implies
+counter zero" invariant holds at the very next cycle.
+
+<<RX: start-bit confirmation>>=
+S_START: begin
+   if (count == CLKS_PER_BIT/2 - 1) begin
+      count <= 0;
+      if (rx == 1'b0)
+         state <= S_DATA;
+      else
+         state <= S_IDLE;
+   end else begin
+      count <= count + 1;
+   end
+end
+@
+
+One data bit per `CLKS_PER_BIT` cycles, LSB first, sampled at the bit
+centre. After the eighth sample we move on to check the stop bit.
+
+<<RX: data-bit sampling>>=
+S_DATA: begin
+   if (count == CLKS_PER_BIT - 1) begin
+      count           <= 0;
+      data[bit_idx]   <= rx;
+      if (bit_idx == 3'd7) begin
+         bit_idx <= 0;
+         state   <= S_STOP;
+      end else begin
+         bit_idx <= bit_idx + 1;
+      end
+   end else begin
+      count <= count + 1;
+   end
+end
+@
+
+We wait out the stop bit without insisting it be high --- a framing-error
+check would go here but we accept any stop for simplicity.
+
+<<RX: stop-bit check>>=
+S_STOP: begin
+   if (count == CLKS_PER_BIT - 1) begin
+      ready <= 1'b1;
+      count <= 0;
+      state <= S_DONE;
+   end else begin
+      count <= count + 1;
+   end
+end
+@
+
+`ready` is a one-cycle strobe in `S_DONE`, after which we return to idle.
+
+<<RX: ready pulse>>=
+S_DONE: begin
+   ready <= 0;
+   state <= S_IDLE;
+end
+@
+
+=== Formal properties
+
+The receiver's safety properties cover state hygiene, bounded counters,
+ready-strobe semantics, and the handshake from idle. Together they pin
+down that the FSM never visits garbage states, counters never wrap
+silently, and `ready` is exactly one cycle wide per frame.
+
+<<RX formal properties>>=
+<<RX: valid state>>
+<<RX: counter bounds>>
+<<RX: bit index bound>>
+<<RX: idle register state>>
+<<RX: ready only in S_DONE>>
+<<RX: ready is one cycle wide>>
+@
+
+State is always one of the five defined enum values.
+
+<<RX: valid state>>=
+always @(posedge clk) assert(state <= S_DONE);
+@
+
+Counter bounds are tighter in `S_START` (we only need half a bit time
+to sample the centre of the start bit) than in the full-bit states.
+
+<<RX: counter bounds>>=
+always @(posedge clk) begin
+   if (state == S_START)
+      assert(count < CLKS_PER_BIT/2);
+   if (state == S_DATA || state == S_STOP)
+      assert(count < CLKS_PER_BIT);
+end
+@
+
+Only eight data bits per frame, so `bit_idx` never exceeds 7.
+
+<<RX: bit index bound>>=
+always @(posedge clk) assert(bit_idx <= 3'd7);
+@
+
+When idle, there is no in-flight frame, so counter and bit index must
+be zero. A stale value here would mean a bug that failed to reset
+state after a previous frame.
+
+<<RX: idle register state>>=
+always @(posedge clk) begin
+   if (state == S_IDLE) begin
+      assert(count == 0);
+      assert(bit_idx == 0);
+   end
+end
+@
+
+The `ready` strobe may only be high in `S_DONE`. This closes the
+contract with the consumer: `ready` cannot sneak a pulse from any
+other state.
+
+<<RX: ready only in S_DONE>>=
+always @(posedge clk) begin
+   if (ready)
+      assert(state == S_DONE);
+end
+@
+
+`ready` is a one-cycle strobe: once asserted, the next cycle must drop
+it (the `S_DONE` to `S_IDLE` transition is unconditional). `f_past_valid`
+avoids false alarms in the very first cycle of BMC, where `$past` is
+not defined.
+
+<<RX: ready is one cycle wide>>=
+reg f_past_valid;
+initial f_past_valid = 0;
+always @(posedge clk) f_past_valid <= 1;
+
+always @(posedge clk) begin
+   if (f_past_valid && $past(ready))
+      assert(!ready);
+end
+@
+
+== Transmitter
+
+The transmitter is the mirror of the receiver. On a `start` pulse with
+`data` valid on the same cycle, the FSM latches the byte and drives a
+framed 8N1 sequence: one start bit low, eight data bits LSB-first, one
+stop bit high. `busy` is asserted in every non-idle state so upstream logic
+can gate its next start.
+
+<<uart_tx.v>>=
+module uart_tx #(
+      parameter CLKS_PER_BIT = 104
+   )(
+      input            clk,
+      input            start,
+      input      [7:0] data,
+      output reg       tx,
+      output           busy
+   );
+   <<TX state encoding>>
+   <<TX state registers>>
+   <<TX initial state>>
+   <<TX busy wiring>>
+   <<TX main FSM>>
+`ifdef FORMAL
+   <<TX formal properties>>
+`endif
+endmodule
+@
+
+Four states cover the UART frame: idle holding the line high, start bit
+low, eight data bits, then a high stop bit. No `S_DONE` here because the
+transmitter has no ready pulse to emit --- `busy` falling is itself the
+indication that a new byte may be started.
+
+<<TX state encoding>>=
+localparam S_IDLE  = 2'd0;
+localparam S_START = 2'd1;
+localparam S_DATA  = 2'd2;
+localparam S_STOP  = 2'd3;
+@
+
+Four registers: the FSM state, the cycle counter within a bit, a bit
+index across the eight data bits, and a shift register holding the byte
+being transmitted. Latching the input `data` into `shift` at the start
+of a frame means the caller is free to change `data` as soon as `busy`
+rises.
+
+<<TX state registers>>=
+reg  [1:0] state;
+reg  [$clog2(CLKS_PER_BIT)-1:0] count;
+reg  [2:0] bit_idx;
+reg  [7:0] shift;
+@
+
+Power-on values place the FSM in idle with the line held high --- the
+normal UART idle condition --- so the first byte transmitted after
+configuration is well framed.
+
+<<TX initial state>>=
+initial begin
+   state   = S_IDLE;
+   tx      = 1'b1;
+   count   = 0;
+   bit_idx = 0;
+   shift   = 0;
+end
+@
+
+`busy` is a pure combinational function of `state`, giving the upstream
+arbiter a no-latency signal it can AND with its own start pulse without
+introducing a cycle of delay on byte handoff.
+
+<<TX busy wiring>>=
+assign busy = (state != S_IDLE);
+@
+
+The FSM is one `case` over `state`; each arm is its own chunk so the
+frame structure reads top-to-bottom as idle, start bit, data bits, stop
+bit.
+
+<<TX main FSM>>=
+always @(posedge clk) begin
+   case (state)
+      <<TX: idle state>>
+      <<TX: start bit>>
+      <<TX: data bits>>
+      <<TX: stop bit>>
+      default: state <= S_IDLE;
+   endcase
+end
+@
+
+In idle the line is held high and counters are kept at zero. A rising
+edge of `start` latches `data` into `shift` and moves to the start-bit
+state; because `shift` is an explicit register, the caller may change
+`data` on the next cycle without corrupting the in-flight byte.
+
+<<TX: idle state>>=
+S_IDLE: begin
+   tx      <= 1'b1;
+   count   <= 0;
+   bit_idx <= 0;
+   if (start) begin
+      shift <= data;
+      state <= S_START;
+   end
+end
+@
+
+Start bit: drive the line low for one bit time, then advance to data.
+
+<<TX: start bit>>=
+S_START: begin
+   tx <= 1'b0;
+   if (count == CLKS_PER_BIT - 1) begin
+      count <= 0;
+      state <= S_DATA;
+   end else begin
+      count <= count + 1;
+   end
+end
+@
+
+Data bits: drive `tx` with `shift[bit_idx]` for a full bit time, then
+advance the index. Transmitting LSB first matches the standard UART
+convention and lets us use `shift[bit_idx]` as a plain lookup without
+reversing the byte.
+
+<<TX: data bits>>=
+S_DATA: begin
+   tx <= shift[bit_idx];
+   if (count == CLKS_PER_BIT - 1) begin
+      count <= 0;
+      if (bit_idx == 3'd7) begin
+         bit_idx <= 0;
+         state   <= S_STOP;
+      end else begin
+         bit_idx <= bit_idx + 1;
+      end
+   end else begin
+      count <= count + 1;
+   end
+end
+@
+
+Stop bit: hold the line high for one bit time, then return to idle. The
+idle state itself also drives `tx` high, so there is no glitch at the
+handoff.
+
+<<TX: stop bit>>=
+S_STOP: begin
+   tx <= 1'b1;
+   if (count == CLKS_PER_BIT - 1) begin
+      count <= 0;
+      state <= S_IDLE;
+   end else begin
+      count <= count + 1;
+   end
+end
+@
+
+=== Formal properties
+
+The transmitter's safety properties mirror the receiver's style: valid
+state encoding, bounded counters, idle register hygiene, and line-level
+invariants tying `tx` to the current frame phase.
+
+<<TX formal properties>>=
+<<TX: valid state>>
+<<TX: counter bounds>>
+<<TX: bit index bound>>
+<<TX: idle register state>>
+<<TX: line level per state>>
+<<TX: busy matches state>>
+@
+
+State is one of the four defined enum values. With a 2-bit state reg
+this is only non-trivial because the `default` arm assigns `S_IDLE`; we
+confirm the invariant holds regardless.
+
+<<TX: valid state>>=
+always @(posedge clk) assert(state <= S_STOP);
+@
+
+Counter is always strictly less than a full bit time in any active
+state.
+
+<<TX: counter bounds>>=
+always @(posedge clk) begin
+   if (state != S_IDLE)
+      assert(count < CLKS_PER_BIT);
+end
+@
+
+Only eight data bits per frame, so `bit_idx` never exceeds 7.
+
+<<TX: bit index bound>>=
+always @(posedge clk) assert(bit_idx <= 3'd7);
+@
+
+In idle, the counter and bit index are both zero so the next `start`
+pulse begins a fresh frame from a clean slate.
+
+<<TX: idle register state>>=
+always @(posedge clk) begin
+   if (state == S_IDLE) begin
+      assert(count == 0);
+      assert(bit_idx == 0);
+   end
+end
+@
+
+Line-level invariants. Idle is an unconditional `tx == 1` --- the idle
+case reassigns it every cycle and the initial value is also 1. The
+start-bit property needs a `$past` guard because the very first cycle
+of `S_START` still carries the `tx <= 1` NBA from the `S_IDLE` case we
+just left; by the second cycle the `S_START` assignment has taken effect.
+
+<<TX: line level per state>>=
+reg f_past_valid;
+initial f_past_valid = 0;
+always @(posedge clk) f_past_valid <= 1;
+
+always @(posedge clk) begin
+   if (state == S_IDLE)
+      assert(tx == 1'b1);
+   if (f_past_valid && state == S_START && $past(state) == S_START)
+      assert(tx == 1'b0);
+end
+@
+
+`busy` must exactly reflect "not in idle" --- this closes the contract
+with the arbiter, which ANDs `busy` with its own start pulse.
+
+<<TX: busy matches state>>=
+always @(posedge clk) assert(busy == (state != S_IDLE));
+@
+
+== Heartbeat byte source
+
+`uart_hello` is a byte producer: every `PERIOD_CYCLES` clock ticks it
+walks the 21-byte `"Hello from iCEstick\r\n"` message out through a
+valid/ready handshake. It owns no transmitter --- the parent module
+provides one, so a single `uart_tx` can serve the heartbeat and any
+other byte source (e.g. an echo loopback) through simple arbitration.
+
+The handshake: `tx_valid` goes high when a byte is ready and stays high
+until the parent asserts `tx_ready` for one cycle to acknowledge the
+handoff. `tx_data` is stable across the handshake.
+
+<<uart_hello.v>>=
+module uart_hello #(
+      parameter PERIOD_CYCLES = 12_000_000
+   )(
+      input            clk,
+      input            tx_ready,
+      output           tx_valid,
+      output     [7:0] tx_data
+   );
+   <<Hello: heartbeat state>>
+   <<Hello: message ROM>>
+   <<Hello: outputs>>
+   <<Hello: heartbeat always block>>
+endmodule
+@
+
+The heartbeat has three pieces of state: the period timer, the current
+position in the message, and an `active` flag marking "a message is
+in-flight." All three come up zero from power-on configuration.
+
+<<Hello: heartbeat state>>=
+reg [$clog2(PERIOD_CYCLES)-1:0] timer;
+reg [5:0]                       msg_idx;
+reg                             active;
+
+initial begin
+   timer   = 0;
+   msg_idx = 0;
+   active  = 0;
+end
+@
+
+The message is a small combinational ROM addressed by `msg_idx`.
+`MSG_LEN` counts both the visible "Hello from iCEstick" bytes and the
+trailing CR/LF.
+
+<<Hello: message ROM>>=
+localparam MSG_LEN = 6'd21;
+
+reg [7:0] msg_byte;
+always @* begin
+   case (msg_idx)
+      6'd0:  msg_byte = "H";
+      6'd1:  msg_byte = "e";
+      6'd2:  msg_byte = "l";
+      6'd3:  msg_byte = "l";
+      6'd4:  msg_byte = "o";
+      6'd5:  msg_byte = " ";
+      6'd6:  msg_byte = "f";
+      6'd7:  msg_byte = "r";
+      6'd8:  msg_byte = "o";
+      6'd9:  msg_byte = "m";
+      6'd10: msg_byte = " ";
+      6'd11: msg_byte = "i";
+      6'd12: msg_byte = "C";
+      6'd13: msg_byte = "E";
+      6'd14: msg_byte = "s";
+      6'd15: msg_byte = "t";
+      6'd16: msg_byte = "i";
+      6'd17: msg_byte = "c";
+      6'd18: msg_byte = "k";
+      6'd19: msg_byte = 8'h0d;
+      6'd20: msg_byte = 8'h0a;
+      default: msg_byte = 8'h00;
+   endcase
+end
+@
+
+Outputs are pure combinational views of the state: `tx_valid` mirrors
+`active`, and `tx_data` exposes the current ROM byte. No pipelining, so
+the parent sees the next byte the cycle after the previous handshake
+completes.
+
+<<Hello: outputs>>=
+assign tx_valid = active;
+assign tx_data  = msg_byte;
+@
+
+One synchronous process advances the period timer and consumes the
+handshake. When the timer wraps we arm a new message, unless one is
+still in flight (only possible at tiny `PERIOD_CYCLES`, e.g. in
+simulation), in which case we drop the tick instead of clobbering the
+in-flight stream. When `tx_ready` pulses while `active`, we advance
+`msg_idx`, clearing `active` on the last byte.
+
+<<Hello: heartbeat always block>>=
+always @(posedge clk) begin
+   if (timer == PERIOD_CYCLES - 1) begin
+      timer <= 0;
+      if (!active) begin
+         active  <= 1'b1;
+         msg_idx <= 0;
+      end
+   end else begin
+      timer <= timer + 1;
+   end
+
+   if (active && tx_ready) begin
+      if (msg_idx == MSG_LEN - 1) begin
+         active  <= 1'b0;
+         msg_idx <= 0;
+      end else begin
+         msg_idx <= msg_idx + 1;
+      end
+   end
+end
+@
+
+== Loopback + heartbeat demo top
+
+The iCEstick demo instantiates one `uart_rx`, one `uart_hello`, and one
+`uart_tx`, plus a small arbiter that picks between the hello byte
+stream and the echoed rx byte. Hello wins when both want the
+transmitter in the same cycle --- the echo byte is simply dropped,
+which is acceptable at human typing rates against a 1 Hz heartbeat.
+The low five bits of the last received byte drive the board LEDs so a
+logic-analyzer-free sanity check is possible by watching the board.
+
+<<uart.v>>=
+module uart #(
+      parameter CLKS_PER_BIT = 104,
+      parameter HELLO_PERIOD = 12_000_000
+   )(
+      input        clk,
+      input        rx,
+      output       tx,
+      output [4:0] led
+   );
+   <<Top: receive path>>
+   <<Top: hello instance>>
+   <<Top: arbiter>>
+   <<Top: transmitter instance>>
+   <<Top: LED display>>
+endmodule
+@
+
+The received bytes come from a plain `uart_rx` instance. `rx_ready`
+strobes for one cycle when a new byte has been captured, and the
+arbiter latches it into the transmit path before the next strobe can
+arrive.
+
+<<Top: receive path>>=
+wire       rx_ready;
+wire [7:0] rx_data;
+uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_rx (
+   .clk  (clk),
+   .rx   (rx),
+   .ready(rx_ready),
+   .data (rx_data)
+);
+@
+
+The heartbeat source owns its own timer and ROM internally and exposes
+a valid/ready byte stream. `hello_ready` is driven by the arbiter as a
+one-cycle pulse per consumed byte.
+
+<<Top: hello instance>>=
+wire       hello_valid;
+wire [7:0] hello_data;
+reg        hello_ready;
+initial hello_ready = 0;
+
+uart_hello #(.PERIOD_CYCLES(HELLO_PERIOD)) u_hello (
+   .clk     (clk),
+   .tx_ready(hello_ready),
+   .tx_valid(hello_valid),
+   .tx_data (hello_data)
+);
+@
+
+The arbiter fires `tx_start` and latches `tx_data` whenever the
+transmitter is idle and a source has a byte. Hello has priority:
+if `hello_valid` is high, we take the hello byte and pulse
+`hello_ready` in the same cycle to acknowledge the handoff. Otherwise
+we forward the rx byte if `rx_ready` just fired. Both `tx_start` and
+`hello_ready` default to zero each cycle, so they are always
+one-cycle pulses.
+
+<<Top: arbiter>>=
+reg       tx_start;
+reg [7:0] tx_data;
+wire      tx_busy;
+
+initial begin
+   tx_start = 0;
+   tx_data  = 0;
+end
+
+always @(posedge clk) begin
+   tx_start    <= 1'b0;
+   hello_ready <= 1'b0;
+   if (!tx_busy && !tx_start) begin
+      if (hello_valid) begin
+         tx_start    <= 1'b1;
+         tx_data     <= hello_data;
+         hello_ready <= 1'b1;
+      end else if (rx_ready) begin
+         tx_start <= 1'b1;
+         tx_data  <= rx_data;
+      end
+   end
+end
+@
+
+The single shared transmitter, driven by the arbiter above.
+
+<<Top: transmitter instance>>=
+uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
+   .clk  (clk),
+   .start(tx_start),
+   .data (tx_data),
+   .tx   (tx),
+   .busy (tx_busy)
+);
+@
+
+A tiny visual-feedback path: the low five bits of each received byte
+are latched into a register that drives the five on-board LEDs. This
+lets us distinguish "bitstream loaded but nothing coming back" from
+"bitstream loaded, receiver working" without a logic analyzer.
+
+<<Top: LED display>>=
+reg [4:0] led_reg;
+initial led_reg = 0;
+always @(posedge clk)
+   if (rx_ready)
+      led_reg <= rx_data[4:0];
+assign led = led_reg;
+@
+
+== Test bench
+
+The testbench has two phases. First it drives four test characters
+through the echo loop and checks that each comes back verbatim, covering
+upper, lower, digit, and control-code ASCII classes. Second, once the
+echo tests have finished, it captures the next heartbeat and asserts
+that all 21 bytes of `"Hello from iCEstick\r\n"` arrive in order.
+
+`CLKS_PER_BIT` is shrunk to 10 so each UART byte takes 100 cycles.
+`HELLO_PERIOD` is sized so the heartbeat does not fire during the echo
+phase but does fire a short time after, which keeps the second phase
+fast without racing the first.
+
+<<tb_uart.sv>>=
+`timescale 1ns/1ps
+
+module tb_uart;
+   <<TB parameters>>
+   <<TB clock and reset>>
+   <<TB DUT instance>>
+   <<TB: send_byte task>>
+   <<TB: recv_byte task>>
+   <<TB: xfer helper>>
+   <<TB: expect_heartbeat task>>
+   <<TB stimulus>>
+endmodule
+@
+
+Shrunken parameters keep the simulation short. `CLKS_PER_BIT = 10`
+means each UART byte takes 100 cycles. `HELLO_PERIOD = 2000` is chosen
+so the first heartbeat fires well after the four echo tests complete
+(~800 cycles) but soon enough that the test does not sit idle waiting.
+
+<<TB parameters>>=
+localparam CLKS_PER_BIT = 10;
+localparam HELLO_PERIOD = 2000;
+@
+
+Free-running 100 MHz (10 ns period) clock for Verilator's absolute
+timescale. The DUT has no reset input, so there is no reset stimulus to
+declare --- `initial` blocks inside the DUT establish the starting state.
+
+<<TB clock and reset>>=
+reg clk;
+initial clk = 0;
+always #5 clk <= ~clk;
+@
+
+The DUT is instantiated with the simulation-sized parameters. `rx`
+starts at the UART idle level so the receiver's first transition only
+happens when the test stimulus drives it low.
+
+A second `uart_rx` instance --- the "sniffer" --- is wired to the
+DUT's `tx` output and runs continuously on the same clock. The
+testbench pulls decoded bytes out of the sniffer rather than sampling
+the raw `tx` line, which avoids a Verilator scheduling race where
+`@(negedge tx)` or `wait(tx === 0)` can miss a falling edge that
+happens in the same time step a task is entered.
+
+<<TB DUT instance>>=
+reg  rx;
+wire tx;
+wire [4:0] led;
+
+uart #(
+   .CLKS_PER_BIT(CLKS_PER_BIT),
+   .HELLO_PERIOD(HELLO_PERIOD)
+) dut (
+   .clk(clk), .rx(rx), .tx(tx), .led(led)
+);
+
+initial rx = 1;
+
+wire       sniff_ready;
+wire [7:0] sniff_data;
+uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) sniffer (
+   .clk  (clk),
+   .rx   (tx),
+   .ready(sniff_ready),
+   .data (sniff_data)
+);
+
+<<TB: sniffer queue>>
+@
+
+The sniffer's one-cycle `ready` strobe is captured into a 64-entry
+circular FIFO so the stimulus can fall behind (or a heartbeat burst
+can arrive faster than we pop bytes) without losing data. The head
+and tail are 6-bit registers, so they wrap around naturally --- the
+queue is truly circular rather than a bounded linear buffer. The 64
+slots are far more than any test in this file exercises (the longest
+burst is the 21-byte heartbeat).
+
+<<TB: sniffer queue>>=
+reg [7:0] rx_queue [0:63];
+reg [5:0] rx_head, rx_tail;
+
+initial begin
+   rx_head = 0;
+   rx_tail = 0;
+end
+
+always @(posedge clk) begin
+   if (sniff_ready) begin
+      rx_queue[rx_head] <= sniff_data;
+      rx_head <= rx_head + 1;
+   end
+end
+@
+
+`send_byte` drives `rx` with one complete 8N1 frame: start bit low,
+eight LSB-first data bits, stop bit high. Each transition is aligned to
+`@(negedge clk)` so the DUT's synchronous logic samples on a stable
+line rather than racing the testbench. All tasks are declared
+`automatic` so their locals do not alias under `fork...join`.
+
+<<TB: send_byte task>>=
+task automatic send_byte(input [7:0] b);
+   integer i;
+   begin
+      @(negedge clk);
+      rx = 1'b0;
+      repeat (CLKS_PER_BIT) @(negedge clk);
+      for (i = 0; i < 8; i = i + 1) begin
+         rx = b[i];
+         repeat (CLKS_PER_BIT) @(negedge clk);
+      end
+      rx = 1'b1;
+      repeat (CLKS_PER_BIT) @(negedge clk);
+   end
+endtask
+@
+
+`recv_byte` pops the next decoded byte from the sniffer queue. Because
+the sniffer runs continuously, there is no edge to arm and no race
+condition --- the only question is whether the queue has a byte yet,
+which we handle by polling `rx_head` against `rx_tail` on each clock
+posedge. Dequeue is a plain head/tail advance; the 64-entry queue is
+far more than any test exercises.
+
+<<TB: recv_byte task>>=
+task automatic recv_byte(output [7:0] b);
+   begin
+      while (rx_head === rx_tail) @(posedge clk);
+      b = rx_queue[rx_tail];
+      rx_tail = rx_tail + 1;
+   end
+endtask
+@
+
+`xfer` runs `send_byte` alongside a plain `recv_byte` wait. Because the
+sniffer is decoding continuously in the background, the receive side
+does not need to be armed before the DUT's echo begins --- any bytes
+the DUT emits land in the queue and are popped in order.
+
+<<TB: xfer helper>>=
+task automatic xfer(input [7:0] sent, output [7:0] got);
+   begin
+      send_byte(sent);
+      recv_byte(got);
+   end
+endtask
+@
+
+`expect_heartbeat` captures the next 21 bytes the DUT emits and
+compares each against the known `"Hello from iCEstick\r\n"` string. An
+inline `reg` array holds the expected bytes; any mismatch fatals with
+the offending index so the mis-transmitted character is obvious from
+the log. The expected bytes are deliberately duplicated here rather
+than shared with the DUT's `<<Hello ROM arms>>` chunk --- the oracle
+must not derive from the same source of truth as the thing it
+verifies.
+
+<<TB: expect_heartbeat task>>=
+task automatic expect_heartbeat();
+   integer i;
+   reg [7:0] b;
+   reg [7:0] expected [0:20];
+   begin
+      expected[0]  = "H";
+      expected[1]  = "e";
+      expected[2]  = "l";
+      expected[3]  = "l";
+      expected[4]  = "o";
+      expected[5]  = " ";
+      expected[6]  = "f";
+      expected[7]  = "r";
+      expected[8]  = "o";
+      expected[9]  = "m";
+      expected[10] = " ";
+      expected[11] = "i";
+      expected[12] = "C";
+      expected[13] = "E";
+      expected[14] = "s";
+      expected[15] = "t";
+      expected[16] = "i";
+      expected[17] = "c";
+      expected[18] = "k";
+      expected[19] = 8'h0d;
+      expected[20] = 8'h0a;
+      for (i = 0; i < 21; i = i + 1) begin
+         recv_byte(b);
+         if (b !== expected[i])
+            $fatal(1, "FAIL heartbeat[%0d]: got 0x%02h want 0x%02h",
+                   i, b, expected[i]);
+      end
+   end
+endtask
+@
+
+The test body settles briefly, runs the per-character echo checks, then
+waits for and validates the heartbeat.
+
+<<TB stimulus>>=
+reg [7:0] got;
+initial begin
+   repeat (20) @(negedge clk);
+
+   <<TB: check each character>>
+   <<TB: check LED latch>>
+   <<TB: check heartbeat message>>
+
+   $display("PASS: echo and heartbeat paths both correct");
+   $finish;
+end
+@
+
+Echo phase. Each xfer sends a byte and confirms the exact same byte
+comes back out on `tx`.
+
+<<TB: check each character>>=
+xfer(8'h61, got); // 'a'
+if (got !== 8'h61) $fatal(1, "FAIL 'a': got 0x%02h", got);
+
+xfer(8'h5a, got); // 'Z'
+if (got !== 8'h5a) $fatal(1, "FAIL 'Z': got 0x%02h", got);
+
+xfer(8'h35, got); // '5'
+if (got !== 8'h35) $fatal(1, "FAIL '5': got 0x%02h", got);
+
+xfer(8'h00, got); // NUL
+if (got !== 8'h00) $fatal(1, "FAIL NUL: got 0x%02h", got);
+@
+
+LED register. After the NUL frame, the low five bits of the last
+received byte (all zeros) must be visible on the LED output.
+
+<<TB: check LED latch>>=
+if (led !== 5'h00)
+   $fatal(1, "FAIL led: got %b, want %b (low 5 of NUL)", led, 5'h00);
+@
+
+Heartbeat phase. After echo tests the receive line is idle; the next
+thing the DUT emits is the heartbeat burst, and `expect_heartbeat()`
+captures and validates all 21 of its bytes.
+
+<<TB: check heartbeat message>>=
+expect_heartbeat();
+@
+
+== Formal verification
+
+Both `uart_rx` and `uart_tx` carry their own `ifdef FORMAL` blocks of
+safety invariants. SymbiYosys runs a separate BMC task per module,
+each elaborated with the bit-period parameter shrunk to 10. The RX
+task's depth is set to 120 so the solver has room to drive a full
+frame through `S_START`, `S_DATA`, `S_STOP`, and the `S_DONE` ready
+pulse; without that depth the ready-related assertions would pass
+vacuously. The TX task's depth can be shorter because its `S_START`
+and idle invariants fire within a single bit time. Each task loads
+only the one module it verifies, keeping elaboration independent.
+
+<<uart.sby>>=
+[tasks]
+bmc_rx
+bmc_tx
+
+[options]
+bmc_rx: mode bmc
+bmc_rx: depth 120
+bmc_tx: mode bmc
+bmc_tx: depth 30
+timeout 120
+
+[engines]
+smtbmc z3
+
+[script]
+bmc_rx: read -formal uart_rx.v
+bmc_rx: chparam -set CLKS_PER_BIT 10 uart_rx
+bmc_rx: prep -top uart_rx
+bmc_tx: read -formal uart_tx.v
+bmc_tx: chparam -set CLKS_PER_BIT 10 uart_tx
+bmc_tx: prep -top uart_tx
+
+[files]
+../verilog/uart_rx.v
+../verilog/uart_tx.v
+@
+
+== iCEstick pin mapping
+
+Clock on pin 21 (GBIN6, 12 MHz Discera MEMS oscillator), UART RX on pin 9
+(from the FT2232H channel B, the PC's COM port), UART TX on pin 8 (back
+to the same FTDI channel), five LEDs on pins 95..99. No IrDA or Pmod
+pins used.
+
+<<uart.pcf>>=
+set_io clk    21
+set_io rx     9
+set_io tx     8
+set_io led[0] 99
+set_io led[1] 98
+set_io led[2] 97
+set_io led[3] 96
+set_io led[4] 95
+@
+
+== Build fragment
+
+Four Verilog modules from one `.nw` is the only per-module customization
+this chapter needs. The top Makefile handles single-output tangles
+generically; modules like `uart` that declare multiple outputs tangle
+their own Makefile fragment into `build/uart.mk`, which the top
+Makefile includes automatically. The fragment is the single source of
+truth for `uart`'s multi-file tangle and for the custom sim/formal/
+synth recipes that reference all four `.v` sources.
+
+<<uart.mk>>=
+UART_VS := verilog/uart.v verilog/uart_rx.v verilog/uart_tx.v verilog/uart_hello.v
+
+$(UART_VS) &: src/uart.nw | verilog
+	cd verilog && tangle uart.v uart_rx.v uart_tx.v uart_hello.v < ../$<
+
+build/sim_uart: tb/tb_uart.sv $(UART_VS) | build
+	cd build && verilator -Wall --binary --top-module tb_uart ../tb/tb_uart.sv ../verilog/uart.v ../verilog/uart_rx.v ../verilog/uart_tx.v ../verilog/uart_hello.v
+	cd build && obj_dir/Vtb_uart
+	@touch $@
+
+build/formal_uart: build/uart.sby $(UART_VS)
+	cd build && sby -f uart.sby
+	@touch $@
+
+build/uart.json: $(UART_VS) | build
+	cd build && yosys -q -p "read_verilog ../verilog/uart.v ../verilog/uart_rx.v ../verilog/uart_tx.v ../verilog/uart_hello.v; synth_ice40 -top uart -json uart.json"
+
+bitstream: build/uart.bin
+@
+
+== Summary
+
+Three primitives and one demo top. `uart_rx` and `uart_tx` are 8N1
+workhorses; `uart_hello` is a periodic byte source that emits
+"Hello from iCEstick" over a valid/ready handshake for any caller to
+drive through a shared transmitter. `uart.v` wires one of each
+together into the iCEstick echo + heartbeat demo.
+
+Verification is split between simulation (round-trip echo of four
+characters plus the 21-byte heartbeat burst) and formal BMC
+(state, counter, bit-index, ready-strobe, and line-level invariants on
+both `uart_rx` and `uart_tx`).

@@ -20,42 +20,35 @@ Install from cargo:
     cargo install typst-cli
     cargo install --git https://github.com/js216/littst
 
-Verify all tools are available:
-
-    which tangle weave verilator yosys sby nextpnr-ice40 typst python3
-
 ### Getting started
 
-Build documentation and run all tests:
+Build everything (docs, sims, formal proofs, bitstreams):
 
-    make test
+    make
 
-Build only the PDF documentation:
+Individual targets: `make doc`, `make sim`, `make formal`, `make bitstream`.
 
-    make doc
+Bitstreams default to the iCEstick (iCE40-HX1K, TQ144, 12 MHz).
+Override the target part on the command line:
 
-Run synthesis estimation (informational, targets ICE40HX4K-TQ144):
-
-    make synth
+    make bitstream DEVICE=hx8k PACKAGE=ct256
 
 ### Structure
 
-Each `.nw` file is a self-contained literate program containing:
+Each `src/*.nw` file is a self-contained literate program containing:
 
-- Synthesizable Verilog (tangled to `%.v`)
-- SystemVerilog testbench (tangled to `tb_%.sv`)
-- Golden model script, if needed (tangled to `golden_%.py`)
-- SymbiYosys configuration (tangled to `%.sby`)
-- Formal property module (tangled to `%_props.sv`)
-
-All code, including tests, appears in the PDF for offline review.
+- Synthesizable Verilog (tangled to `verilog/%.v`)
+- SystemVerilog testbench (tangled to `tb/tb_%.sv`)
+- SymbiYosys configuration (tangled to `build/%.sby`)
+- iCEstick pin constraints, where applicable (tangled to `verilog/%.pcf`)
 
 ### Modules
 
 | Module | Description |
 |--------|-------------|
-| `cordic.nw` | CORDIC sine/cosine generator |
-| `blinky.nw` | Parameterized LED blinker (hardware bring-up) |
+| `src/blinky.nw` | Parameterized LED blinker (hardware bring-up) |
+| `src/uart.nw`   | 8N1 UART receiver, transmitter, and iCEstick echo demo |
+| `src/cordic.nw` | CORDIC sine/cosine generator |
 
 ### Author
 
