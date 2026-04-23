@@ -1,0 +1,526 @@
+== GPIO monitor
+
+The iCEstick has two unpopulated 0.1" expansion headers, `J1` and `J3`,
+exposing 16 general-purpose I/O pins to the iCE40-HX1K --- eight in
+Bank 0 (pins 112--119) on `J1`, and eight in Bank 2 (pins 44, 45, 47,
+48, 56, 60, 61, 62) on `J3`. This chapter brings those sixteen pins up
+as inputs and periodically prints their state as a hex line over the
+FTDI UART. It is the bring-up fixture for any external wiring to the
+expansion headers: scope the pins, toggle them by hand, and watch the
+line change in a terminal.
+
+No new UART machinery is introduced: the byte stream is driven through
+a single `uart_tx` instance, reusing the transmitter defined in the
+`uart` chapter. The only new piece is a small byte producer that
+snapshots the GPIO bus, walks the formatted line out one character at a
+time, and arms again roughly every 100 ms.
+
+<<gpio.v>>=
+module gpio #(
+      parameter CLKS_PER_BIT = 104,
+      parameter TICK_CYCLES  = 1_200_000
+   )(
+      input         clk,
+      input  [15:0] gpio,
+      output        tx
+   );
+   <<GPIO: state registers>>
+   <<GPIO: initial state>>
+   <<GPIO: hex digit helper>>
+   <<GPIO: character at index>>
+   <<GPIO: main always block>>
+   <<GPIO: transmitter instance>>
+`ifdef FORMAL
+   <<GPIO: formal properties>>
+`endif
+endmodule
+@
+
+The formatted line is always exactly six bytes: four ASCII hex nibbles
+from MSB to LSB, then CR, then LF. Six is small enough that a 3-bit
+character index covers the whole line with one spare code point for the
+"done" terminator, and big enough that a human or an automated tail
+can read every bit of every J1/J3 pin at a glance.
+
+`TICK_CYCLES` defaults to 1.2 million, which at the iCEstick's 12 MHz
+clock yields a 100 ms heartbeat. `CLKS_PER_BIT` matches the rest of
+this project at 115200 baud against the same 12 MHz domain.
+
+=== State
+
+Four pieces of state carry the line across its transmission: a period
+timer that schedules the next snapshot, a latched copy of the GPIO bus
+so the line is coherent even if pins wiggle mid-transmission, a
+character index into the six-byte line, and an `active` flag that
+marks "a line is in flight." Two additional registers form the
+tx-side handshake: `tx_start` as a one-cycle pulse and `tx_data`
+holding the byte that pulse hands to the transmitter.
+
+<<GPIO: state registers>>=
+reg [$clog2(TICK_CYCLES)-1:0] timer;
+reg [15:0] snapshot;
+reg [2:0]  char_idx;
+reg        active;
+reg        tx_start;
+reg  [7:0] tx_data;
+wire       tx_busy;
+
+localparam LAST_IDX = 3'd5;
+@
+
+Power-on state puts the module at idle with the timer at zero and no
+line in flight. The iCE40 configuration SRAM carries these initial
+values into real hardware, so the first heartbeat arrives exactly
+`TICK_CYCLES` cycles after configuration, not whenever random
+power-on values happen to align.
+
+<<GPIO: initial state>>=
+initial begin
+   timer    = 0;
+   snapshot = 0;
+   char_idx = 0;
+   active   = 0;
+   tx_start = 0;
+   tx_data  = 0;
+end
+@
+
+=== Line formatting
+
+The hex helper is a small combinational function: a nibble less than
+10 becomes `'0'..'9'`, otherwise `'a'..'f'`. Lower-case hex is chosen
+because it visually distinguishes letters from digits better than
+upper-case in most terminal fonts.
+
+<<GPIO: hex digit helper>>=
+function [7:0] hex_digit;
+   input [3:0] n;
+   begin
+      hex_digit = (n < 4'd10) ? (8'h30 + {4'd0, n})
+                              : (8'h57 + {4'd0, n});
+   end
+endfunction
+@
+
+The character at position `char_idx` is a pure combinational view
+of the latched snapshot. Positions 0..3 map to hex nibbles from the
+high half of the snapshot down to the low half, so reading the
+serial line left-to-right matches reading the 16-bit value
+MSB-first. Positions 4 and 5 are CR and LF, giving a plain `\r\n`
+line terminator that every serial terminal handles.
+
+<<GPIO: character at index>>=
+reg [7:0] cur_char;
+always @* begin
+   case (char_idx)
+      3'd0: cur_char = hex_digit(snapshot[15:12]);
+      3'd1: cur_char = hex_digit(snapshot[11:8]);
+      3'd2: cur_char = hex_digit(snapshot[7:4]);
+      3'd3: cur_char = hex_digit(snapshot[3:0]);
+      3'd4: cur_char = 8'h0d;
+      3'd5: cur_char = 8'h0a;
+      default: cur_char = 8'h00;
+   endcase
+end
+@
+
+=== Main always block
+
+One synchronous process drives everything: a default deassert of
+`tx_start` so it is always a one-cycle pulse, the period timer with
+its snapshot latch, and the byte-feed handshake against `uart_tx`.
+Each concern is its own chunk so that reading top to bottom tracks
+the order in which the three effects compose on the clock edge.
+
+<<GPIO: main always block>>=
+always @(posedge clk) begin
+   <<GPIO: tx_start default>>
+   <<GPIO: period timer and snapshot>>
+   <<GPIO: byte feed>>
+end
+@
+
+Default `tx_start` low every cycle. Any branch below that wants a
+pulse simply reassigns it to 1; NBA ordering guarantees the pulse
+lasts exactly one cycle.
+
+<<GPIO: tx_start default>>=
+tx_start <= 1'b0;
+@
+
+The period timer free-runs and wraps at `TICK_CYCLES - 1`. On the
+wrap cycle, if no line is currently in flight, we latch the GPIO bus
+into `snapshot`, reset the character index, and raise `active`. If
+`active` is already high (only possible at tiny `TICK_CYCLES`, e.g.
+in simulation) we drop the tick rather than clobber the in-flight
+line --- the same pattern `uart_hello` uses to protect its ROM walk.
+
+<<GPIO: period timer and snapshot>>=
+if (timer == TICK_CYCLES - 1) begin
+   timer <= 0;
+   if (!active) begin
+      snapshot <= gpio;
+      char_idx <= 0;
+      active   <= 1'b1;
+   end
+end else begin
+   timer <= timer + 1;
+end
+@
+
+Byte feed handshake against `uart_tx`. When `active` is high and the
+transmitter is idle, pulse `tx_start`, present the current character
+on `tx_data`, and advance the index. On the final index we also
+clear `active`, which closes the line and leaves the module idle
+until the next timer wrap. Gating on both `!tx_busy` and `!tx_start`
+is belt-and-suspenders --- `!tx_busy` alone is enough, since
+`uart_tx` raises `busy` combinationally the cycle after `start` is
+seen --- but it mirrors the arbiter pattern in `uart.v` so a reader
+moving between the two modules reads the same idiom.
+
+<<GPIO: byte feed>>=
+if (active && !tx_busy && !tx_start) begin
+   tx_start <= 1'b1;
+   tx_data  <= cur_char;
+   if (char_idx == LAST_IDX) begin
+      active   <= 1'b0;
+      char_idx <= 0;
+   end else begin
+      char_idx <= char_idx + 1;
+   end
+end
+@
+
+=== Transmitter
+
+One plain `uart_tx` instance does all the UART-level work. The gating
+against `tx_busy` and the one-cycle `tx_start` pulse above match the
+contract documented in the `uart` chapter.
+
+<<GPIO: transmitter instance>>=
+uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
+   .clk  (clk),
+   .start(tx_start),
+   .data (tx_data),
+   .tx   (tx),
+   .busy (tx_busy)
+);
+@
+
+=== Formal properties
+
+The safety properties cover state hygiene on the pieces this module
+owns --- timer and character index in range, idle implies a clean
+slate --- plus the one handshake invariant this module is
+contractually required to honour against `uart_tx`: a `tx_start`
+pulse is never wider than a single cycle.
+
+<<GPIO: formal properties>>=
+<<GPIO: timer bound>>
+<<GPIO: char index bound>>
+<<GPIO: idle index>>
+<<GPIO: tx_start is one cycle wide>>
+@
+
+The timer never exceeds its terminal value.
+
+<<GPIO: timer bound>>=
+always @(posedge clk) assert(timer < TICK_CYCLES);
+@
+
+The character index never addresses a byte past the end of the line.
+
+<<GPIO: char index bound>>=
+always @(posedge clk) assert(char_idx <= LAST_IDX);
+@
+
+When no line is in flight, the character index must be zero, so
+the next tick begins a fresh line from position zero rather than
+picking up where a previous line happened to stop.
+
+<<GPIO: idle index>>=
+always @(posedge clk) begin
+   if (!active)
+      assert(char_idx == 0);
+end
+@
+
+`tx_start` is a one-cycle strobe: once asserted, the next cycle
+must drop it. The default-assignment at the top of the main always
+block drives this, but the formal property nails the handshake
+contract with `uart_tx` so a future edit that forgets the default
+cannot silently break the protocol. `f_past_valid` avoids false
+alarms in the very first BMC cycle, where `$past` is not defined.
+
+<<GPIO: tx_start is one cycle wide>>=
+reg f_past_valid;
+initial f_past_valid = 0;
+always @(posedge clk) f_past_valid <= 1;
+
+always @(posedge clk) begin
+   if (f_past_valid && $past(tx_start))
+      assert(!tx_start);
+end
+@
+
+== Test bench
+
+The testbench shrinks `CLKS_PER_BIT` to 10 and `TICK_CYCLES` to 2000
+so a full line arrives in a tractable number of simulation cycles.
+A sniffer `uart_rx` decodes the DUT's `tx` output into a queue; the
+stimulus drives a fixed GPIO pattern and asserts that the next line
+popped off the queue matches the expected six-byte sequence.
+
+<<tb_gpio.sv>>=
+`timescale 1ns/1ps
+
+module tb_gpio;
+   <<TB parameters>>
+   <<TB clock>>
+   <<TB DUT and sniffer>>
+   <<TB sniffer queue>>
+   <<TB recv_byte task>>
+   <<TB expect_line task>>
+   <<TB stimulus>>
+endmodule
+@
+
+<<TB parameters>>=
+localparam CLKS_PER_BIT = 10;
+localparam TICK_CYCLES  = 2000;
+@
+
+<<TB clock>>=
+reg clk;
+initial clk = 0;
+always #5 clk <= ~clk;
+@
+
+The DUT is wired with the simulation parameters and driven with a
+fixed GPIO vector. A second `uart_rx` on the DUT's `tx` output acts
+as a continuous sniffer, avoiding Verilator scheduling races around
+the start-bit falling edge.
+
+<<TB DUT and sniffer>>=
+reg  [15:0] gpio_drv;
+wire        tx;
+
+gpio #(
+   .CLKS_PER_BIT(CLKS_PER_BIT),
+   .TICK_CYCLES (TICK_CYCLES)
+) dut (
+   .clk(clk), .gpio(gpio_drv), .tx(tx)
+);
+
+wire       sniff_ready;
+wire [7:0] sniff_data;
+uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) sniffer (
+   .clk  (clk),
+   .rx   (tx),
+   .ready(sniff_ready),
+   .data (sniff_data)
+);
+@
+
+The sniffer's one-cycle `ready` strobe is captured into a 64-entry
+circular FIFO, matching the pattern used in the `uart` chapter's
+testbench.
+
+<<TB sniffer queue>>=
+reg [7:0] rx_queue [0:63];
+reg [5:0] rx_head, rx_tail;
+
+initial begin
+   rx_head = 0;
+   rx_tail = 0;
+end
+
+always @(posedge clk) begin
+   if (sniff_ready) begin
+      rx_queue[rx_head] <= sniff_data;
+      rx_head <= rx_head + 1;
+   end
+end
+@
+
+<<TB recv_byte task>>=
+task automatic recv_byte(output [7:0] b);
+   begin
+      while (rx_head === rx_tail) @(posedge clk);
+      b = rx_queue[rx_tail];
+      rx_tail = rx_tail + 1;
+   end
+endtask
+@
+
+`expect_line` captures the next six bytes emitted by the DUT and
+checks them against the expected "XXXX\r\n" for the given GPIO value.
+The expected hex digits are computed independently in the testbench
+rather than reused from the DUT's `hex_digit` function, so the
+oracle does not derive from the thing it verifies.
+
+<<TB expect_line task>>=
+function [7:0] oracle_hex;
+   input [3:0] n;
+   begin
+      case (n)
+         4'h0: oracle_hex = "0"; 4'h1: oracle_hex = "1";
+         4'h2: oracle_hex = "2"; 4'h3: oracle_hex = "3";
+         4'h4: oracle_hex = "4"; 4'h5: oracle_hex = "5";
+         4'h6: oracle_hex = "6"; 4'h7: oracle_hex = "7";
+         4'h8: oracle_hex = "8"; 4'h9: oracle_hex = "9";
+         4'ha: oracle_hex = "a"; 4'hb: oracle_hex = "b";
+         4'hc: oracle_hex = "c"; 4'hd: oracle_hex = "d";
+         4'he: oracle_hex = "e"; 4'hf: oracle_hex = "f";
+      endcase
+   end
+endfunction
+
+task automatic expect_line(input [15:0] expected);
+   reg [7:0] b;
+   reg [7:0] want [0:5];
+   integer i;
+   begin
+      want[0] = oracle_hex(expected[15:12]);
+      want[1] = oracle_hex(expected[11:8]);
+      want[2] = oracle_hex(expected[7:4]);
+      want[3] = oracle_hex(expected[3:0]);
+      want[4] = 8'h0d;
+      want[5] = 8'h0a;
+      for (i = 0; i < 6; i = i + 1) begin
+         recv_byte(b);
+         if (b !== want[i])
+            $fatal(1, "FAIL line[%0d]: got 0x%02h want 0x%02h",
+                   i, b, want[i]);
+      end
+   end
+endtask
+@
+
+The stimulus drives two different GPIO values across two successive
+heartbeats and validates the formatted line in each case. Between
+the two heartbeats we change the GPIO pattern and rely on the
+DUT's snapshot-on-tick behaviour to pick up the new value.
+
+<<TB stimulus>>=
+initial begin
+   gpio_drv = 16'ha5c3;
+   expect_line(16'ha5c3);
+
+   gpio_drv = 16'h0000;
+   expect_line(16'h0000);
+
+   $display("PASS: gpio heartbeat lines correct");
+   $finish;
+end
+@
+
+== Formal verification
+
+A single BMC task checks the invariants declared inside the module.
+`TICK_CYCLES` is shrunk to 20 so the solver reaches a timer wrap
+and the `active` transition within a handful of cycles;
+`CLKS_PER_BIT` is shrunk to 10 so a `tx_start` pulse + the
+subsequent `uart_tx` busy phase fit in the same depth budget.
+The properties are all state-local safety invariants, not bounded
+reachability of a specific output, so there is no requirement that
+depth span a full six-byte line --- what matters is that every
+branch of the main always block is exercised at least once, which
+happens within the first 40 cycles at these parameters.
+
+<<gpio.sby>>=
+[tasks]
+bmc
+
+[options]
+bmc: mode bmc
+bmc: depth 40
+timeout 120
+
+[engines]
+smtbmc z3
+
+[script]
+read -formal gpio.v uart_tx.v
+chparam -set CLKS_PER_BIT 10 -set TICK_CYCLES 20 gpio
+prep -top gpio
+
+[files]
+../verilog/gpio.v
+../verilog/uart_tx.v
+@
+
+== iCEstick pin mapping
+
+Clock on pin 21 (12 MHz Discera MEMS oscillator), UART TX on pin 8
+(FT2232H channel B, the PC's COM port). The sixteen GPIO inputs map
+to the expansion headers `J1` (Bank 0) and `J3` (Bank 2) in
+connector-position order: `gpio[0]` at `J1.3` up through `gpio[15]`
+at `J3.10`. FPGA pin numbers on `J1` happen to run ascending
+(`112..119`) with connector position, while on `J3` they run
+descending (`62, 61, 60, 56, 48, 47, 45, 44`) --- the ordering is
+by connector pin, not by FPGA pin number, so a scope probe stepped
+from `J3.3` to `J3.10` reads bits `gpio[8]` through `gpio[15]` in
+order.
+
+<<gpio.pcf>>=
+set_io clk      21
+
+set_io tx       8
+
+set_io gpio[0]  112
+set_io gpio[1]  113
+set_io gpio[2]  114
+set_io gpio[3]  115
+set_io gpio[4]  116
+set_io gpio[5]  117
+set_io gpio[6]  118
+set_io gpio[7]  119
+
+set_io gpio[8]  62
+set_io gpio[9]  61
+set_io gpio[10] 60
+set_io gpio[11] 56
+set_io gpio[12] 48
+set_io gpio[13] 47
+set_io gpio[14] 45
+set_io gpio[15] 44
+@
+
+== Build fragment
+
+The gpio top pulls in `uart_tx.v` as a dependency, so the generic
+single-file rules in the top Makefile do not suffice. This fragment
+overrides the sim, formal, and synth targets to include both
+`gpio.v` and `uart_tx.v`. The `uart_tx.v` prerequisite resolves
+through the tangle rules declared by the `uart` chapter's own
+fragment.
+
+<<gpio.mk>>=
+GPIO_VS    := verilog/gpio.v verilog/uart_tx.v
+GPIO_TB_VS := $(GPIO_VS) verilog/uart_rx.v
+
+build/sim_gpio: tb/tb_gpio.sv $(GPIO_TB_VS) | build
+	cd build && verilator -Wall --binary --top-module tb_gpio ../tb/tb_gpio.sv ../verilog/gpio.v ../verilog/uart_tx.v ../verilog/uart_rx.v
+	cd build && obj_dir/Vtb_gpio
+	@touch $@
+
+build/formal_gpio: build/gpio.sby $(GPIO_VS)
+	cd build && sby -f gpio.sby
+	@touch $@
+
+build/gpio.json: $(GPIO_VS) | build
+	cd build && yosys -q -p "read_verilog ../verilog/gpio.v ../verilog/uart_tx.v; synth_ice40 -top gpio -json gpio.json"
+
+bitstream: build/gpio.bin
+@
+
+== Summary
+
+One new producer module, no new UART machinery. The `gpio` top
+snapshots all sixteen J1/J3 expansion pins every 100 ms, formats them
+as a four-digit hex line with a CRLF terminator, and streams the six
+bytes through a private `uart_tx` instance reusing the transmitter
+from the `uart` chapter. Simulation validates two back-to-back lines
+against an independently-computed oracle, and formal BMC pins down
+timer, character-index, and idle-state invariants.
