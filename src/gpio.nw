@@ -1,28 +1,56 @@
-== GPIO monitor
+== GPIO monitor and driver
 
 The iCEstick has two unpopulated 0.1" expansion headers, `J1` and `J3`,
 exposing 16 general-purpose I/O pins to the iCE40-HX1K --- eight in
 Bank 0 (pins 112--119) on `J1`, and eight in Bank 2 (pins 44, 45, 47,
 48, 56, 60, 61, 62) on `J3`. This chapter brings those sixteen pins up
-as inputs and periodically prints their state as a hex line over the
-FTDI UART. It is the bring-up fixture for any external wiring to the
-expansion headers: scope the pins, toggle them by hand, and watch the
-line change in a terminal.
+as bidirectional I/O, periodically prints their physical state as a
+hex line over the FTDI UART, and accepts a tiny command protocol on
+the FTDI UART's receive channel to drive any subset of them low or
+high. It is the bring-up fixture for any external wiring to the
+expansion headers: scope the pins, toggle them by hand, watch the
+line change --- or type a command in a terminal and watch the lines
+go where you drove them.
 
-No new UART machinery is introduced: the byte stream is driven through
-a single `uart_tx` instance, reusing the transmitter defined in the
-`uart` chapter. The only new piece is a small byte producer that
-snapshots the GPIO bus, walks the formatted line out one character at a
-time, and arms again roughly every 100 ms.
+No new UART machinery is introduced: a single `uart_tx` instance
+emits the heartbeat line and a single `uart_rx` instance decodes the
+inbound command bytes, both reused verbatim from the `uart` chapter.
+The new pieces are a byte producer that walks the formatted line out
+one character at a time, a command parser that latches drive-data
+and drive-enable registers from short ASCII commands, and a
+per-bit tri-state driver mapping those registers onto the `inout`
+bus.
+
+=== Command protocol
+
+Two commands, each exactly five ASCII characters, no terminator
+required. `Wxxxx` loads `gpio_out` with a 16-bit drive word; `Exxxx`
+loads `gpio_oe` with a 16-bit output-enable mask (`1` means drive,
+`0` means high-impedance).  Both values are four hex digits,
+MSB-first, where each `x` is any of `0..9`, `a..f`, or `A..F`. An
+invalid character at any position aborts the in-flight command and
+returns the parser to idle; at idle, a leading `W` or `E` starts a
+fresh command and anything else is ignored. Note that `E` is also a
+valid hex digit, so the parser does not treat a mid-command `E` as
+a restart sentinel --- do not type a new command into one that is
+still in flight.  Stray bytes between commands (whitespace,
+newlines, typos) are silently dropped.
+
+There is no echo and no acknowledgement; the next heartbeat line is
+the feedback channel. After issuing a command, watch the line for
+the bits you expect to flip. On power-on `gpio_oe = 0`, so every
+pin comes up high-impedance and the expansion headers stay
+electrically passive until a command explicitly enables a drive.
 
 <<gpio.v>>=
 module gpio #(
       parameter CLKS_PER_BIT = 104,
       parameter TICK_CYCLES  = 1_200_000
    )(
-      input         clk,
-      input  [15:0] gpio,
-      output        tx
+      input          clk,
+      input          rx,
+      inout  [15:0]  pins,
+      output         tx
    );
    <<GPIO: state registers>>
    <<GPIO: initial state>>
@@ -30,6 +58,10 @@ module gpio #(
    <<GPIO: character at index>>
    <<GPIO: main always block>>
    <<GPIO: transmitter instance>>
+   <<GPIO: receiver instance>>
+   <<GPIO: ascii hex decode>>
+   <<GPIO: command parser>>
+   <<GPIO: tri-state drivers>>
 `ifdef FORMAL
    <<GPIO: formal properties>>
 `endif
@@ -48,13 +80,18 @@ this project at 115200 baud against the same 12 MHz domain.
 
 === State
 
-Four pieces of state carry the line across its transmission: a period
-timer that schedules the next snapshot, a latched copy of the GPIO bus
-so the line is coherent even if pins wiggle mid-transmission, a
-character index into the six-byte line, and an `active` flag that
-marks "a line is in flight." Two additional registers form the
-tx-side handshake: `tx_start` as a one-cycle pulse and `tx_data`
-holding the byte that pulse hands to the transmitter.
+State falls into three groups. The heartbeat path owns the period
+timer, the line-in-flight flag, the snapshot of the physical `pins`
+bus at tick time, the character index into the line, and the
+tx-side handshake registers. The drive path owns `gpio_out` (the
+16-bit value we want to drive) and `gpio_oe` (the per-bit drive
+enable). The command parser owns its FSM state, a flag remembering
+whether the currently-decoded command is a `W` or an `E`, and a
+12-bit accumulator into which the first three hex nibbles are
+shifted; the fourth nibble is concatenated on at commit time, so
+twelve bits is all that is needed. The non-idle states
+`RX_D0..RX_D3` double as the digit index, so no separate position
+counter exists.
 
 <<GPIO: state registers>>=
 reg [$clog2(TICK_CYCLES)-1:0] timer;
@@ -65,23 +102,43 @@ reg        tx_start;
 reg  [7:0] tx_data;
 wire       tx_busy;
 
+reg [15:0] gpio_out;
+reg [15:0] gpio_oe;
+
+reg [2:0]  rx_state;
+reg        cmd_is_enable;
+reg [11:0] accum;
+wire       rx_ready;
+wire [7:0] rx_data;
+
 localparam LAST_IDX = 3'd5;
+
+localparam RX_IDLE = 3'd0;
+localparam RX_D0   = 3'd1;
+localparam RX_D1   = 3'd2;
+localparam RX_D2   = 3'd3;
+localparam RX_D3   = 3'd4;
 @
 
-Power-on state puts the module at idle with the timer at zero and no
-line in flight. The iCE40 configuration SRAM carries these initial
-values into real hardware, so the first heartbeat arrives exactly
-`TICK_CYCLES` cycles after configuration, not whenever random
-power-on values happen to align.
+Power-on leaves `gpio_oe = 0` so the expansion headers come up
+high-impedance; a user must issue an explicit `E` command before
+any pin is driven. The iCE40 configuration SRAM carries these
+`initial` values into real hardware, so the property is
+synthesis-guaranteed rather than reset-dependent.
 
 <<GPIO: initial state>>=
 initial begin
-   timer    = 0;
-   snapshot = 0;
-   char_idx = 0;
-   active   = 0;
-   tx_start = 0;
-   tx_data  = 0;
+   timer         = 0;
+   snapshot      = 0;
+   char_idx      = 0;
+   active        = 0;
+   tx_start      = 0;
+   tx_data       = 0;
+   gpio_out      = 0;
+   gpio_oe       = 0;
+   rx_state      = RX_IDLE;
+   cmd_is_enable = 0;
+   accum         = 0;
 end
 @
 
@@ -149,17 +206,18 @@ tx_start <= 1'b0;
 @
 
 The period timer free-runs and wraps at `TICK_CYCLES - 1`. On the
-wrap cycle, if no line is currently in flight, we latch the GPIO bus
-into `snapshot`, reset the character index, and raise `active`. If
-`active` is already high (only possible at tiny `TICK_CYCLES`, e.g.
-in simulation) we drop the tick rather than clobber the in-flight
-line --- the same pattern `uart_hello` uses to protect its ROM walk.
+wrap cycle, if no line is currently in flight, we latch the `pins`
+bus into `snapshot`, reset the character index, and raise `active`.
+If `active` is already high (only possible at tiny `TICK_CYCLES`,
+e.g. in simulation) we drop the tick rather than clobber the
+in-flight line --- the same pattern `uart_hello` uses to protect
+its ROM walk.
 
 <<GPIO: period timer and snapshot>>=
 if (timer == TICK_CYCLES - 1) begin
    timer <= 0;
    if (!active) begin
-      snapshot <= gpio;
+      snapshot <= pins;
       char_idx <= 0;
       active   <= 1'b1;
    end
@@ -172,11 +230,12 @@ Byte feed handshake against `uart_tx`. When `active` is high and the
 transmitter is idle, pulse `tx_start`, present the current character
 on `tx_data`, and advance the index. On the final index we also
 clear `active`, which closes the line and leaves the module idle
-until the next timer wrap. Gating on both `!tx_busy` and `!tx_start`
-is belt-and-suspenders --- `!tx_busy` alone is enough, since
-`uart_tx` raises `busy` combinationally the cycle after `start` is
-seen --- but it mirrors the arbiter pattern in `uart.v` so a reader
-moving between the two modules reads the same idiom.
+until the next timer wrap.  The gate `!tx_busy && !tx_start` is
+load-bearing on *both* terms: `uart_tx.busy` only rises the cycle
+*after* its FSM sees `start`, so for one cycle `tx_busy` is still
+zero even though a pulse has already been issued; without
+`!tx_start` the arm would fire a second time on that cycle,
+double-advance `char_idx`, and skip a character.
 
 <<GPIO: byte feed>>=
 if (active && !tx_busy && !tx_start) begin
@@ -207,19 +266,168 @@ uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
 );
 @
 
+=== Receiver
+
+The matching `uart_rx` reuses the same baud parameter. Its
+`rx_ready` pulses high for one cycle each time a byte is decoded;
+`rx_data` is stable during that cycle. The command parser below
+inspects both on every clock edge.
+
+<<GPIO: receiver instance>>=
+uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_rx (
+   .clk  (clk),
+   .rx   (rx),
+   .ready(rx_ready),
+   .data (rx_data)
+);
+@
+
+=== ASCII hex decode
+
+`nib_valid` is true when the current `rx_data` byte is one of
+`'0'..'9'`, `'a'..'f'`, or `'A'..'F'`. `nib` is the corresponding
+binary nibble.  The `+ 4'd9` trick works because the low four bits
+of `'a'..'f'` (0x61..0x66) and `'A'..'F'` (0x41..0x46) are
+`1..6`, which must map to `10..15`; for `'0'..'9'` (0x30..0x39)
+the low four bits are already `0..9` so no offset is applied. Both
+signals are pure combinational views of the current `rx_data`
+register, so they are only meaningful when `rx_ready` is high ---
+the command parser guards every use with `rx_ready`.
+
+<<GPIO: ascii hex decode>>=
+wire rx_is_dec = (rx_data >= "0") && (rx_data <= "9");
+wire rx_is_lc  = (rx_data >= "a") && (rx_data <= "f");
+wire rx_is_uc  = (rx_data >= "A") && (rx_data <= "F");
+wire rx_nib_valid = rx_is_dec | rx_is_lc | rx_is_uc;
+wire [3:0] rx_nib =
+   rx_is_dec ? rx_data[3:0]
+             : (rx_data[3:0] + 4'd9);
+@
+
+=== Command parser
+
+Five-state FSM, advanced one step per `rx_ready` pulse.  Idle waits
+for a leading `W` or `E` and remembers which via `cmd_is_enable`.
+`RX_D0..RX_D2` accept one hex digit each, shifting the nibble into
+`accum` from the right. `RX_D3` accepts the final hex digit and
+commits the full 16-bit value to either `gpio_out` or `gpio_oe`
+depending on `cmd_is_enable`.  Any state other than idle drops back
+to idle on an invalid character, so a typo or an errant control
+byte costs at most one command.
+
+<<GPIO: command parser>>=
+always @(posedge clk) begin
+   if (rx_ready) begin
+      case (rx_state)
+         <<GPIO: parser idle>>
+         <<GPIO: parser accumulate>>
+         <<GPIO: parser commit>>
+         default: rx_state <= RX_IDLE;
+      endcase
+   end
+end
+@
+
+Idle: start a new command on `W` or `E`, ignore anything else.
+
+<<GPIO: parser idle>>=
+RX_IDLE: begin
+   if (rx_data == "W") begin
+      rx_state      <= RX_D0;
+      cmd_is_enable <= 1'b0;
+   end else if (rx_data == "E") begin
+      rx_state      <= RX_D0;
+      cmd_is_enable <= 1'b1;
+   end
+end
+@
+
+Accumulate: three hex digits shifted into `accum` from the right.
+Any non-hex byte aborts the command.
+
+<<GPIO: parser accumulate>>=
+RX_D0, RX_D1, RX_D2: begin
+   if (rx_nib_valid) begin
+      accum    <= {accum[7:0], rx_nib};
+      rx_state <= rx_state + 1;
+   end else begin
+      rx_state <= RX_IDLE;
+   end
+end
+@
+
+Commit: the fourth hex digit closes the 16-bit value and lands it in
+`gpio_out` or `gpio_oe`. The accumulator is not reset --- it is
+written again from the left on the next command, so its residue is
+invisible.
+
+<<GPIO: parser commit>>=
+RX_D3: begin
+   if (rx_nib_valid) begin
+      if (cmd_is_enable)
+         gpio_oe  <= {accum, rx_nib};
+      else
+         gpio_out <= {accum, rx_nib};
+   end
+   rx_state <= RX_IDLE;
+end
+@
+
+=== Tri-state drivers
+
+Per-bit conditional drive of the `inout` bus.  `synth_ice40` maps
+each bit to an `SB_IO` cell with `PIN_OUTPUT_TRISTATE` enable, so
+the external pin is truly high-impedance when `gpio_oe[i] == 0` and
+an external signal can drive it freely.  A `generate` loop keeps
+the sixteen lines compact; expanding to a per-bit list would add
+nothing but transcription risk.
+
+<<GPIO: tri-state drivers>>=
+genvar g;
+generate
+   for (g = 0; g < 16; g = g + 1) begin : gpio_tri
+      assign pins[g] = gpio_oe[g] ? gpio_out[g] : 1'bz;
+   end
+endgenerate
+@
+
 === Formal properties
 
-The safety properties cover state hygiene on the pieces this module
-owns --- timer and character index in range, idle implies a clean
-slate --- plus the one handshake invariant this module is
-contractually required to honour against `uart_tx`: a `tx_start`
-pulse is never wider than a single cycle.
+Three families of property cover the module:
+
+- state hygiene: bounds on timer, character index, and FSM state;
+  idle implies a clean slate; `char_idx == LAST_IDX` implies a
+  line is in flight;
+- handshake contracts with `uart_tx`: `tx_start` is a single-cycle
+  strobe, and `tx_start` and `tx_busy` are mutually exclusive so
+  no byte can be dropped;
+- parser contracts: `rx_state` transitions monotonically along
+  the defined edges, and the drive registers `gpio_out`/`gpio_oe`
+  only change on the commit cycle with a valid nibble.
 
 <<GPIO: formal properties>>=
+<<GPIO: power-on is Hi-Z>>
 <<GPIO: timer bound>>
 <<GPIO: char index bound>>
 <<GPIO: idle index>>
 <<GPIO: tx_start is one cycle wide>>
+<<GPIO: tx_start and tx_busy are exclusive>>
+<<GPIO: tx_data stable while tx_busy>>
+<<GPIO: rx state monotonic>>
+<<GPIO: drive regs commit only in RX_D3>>
+@
+
+Power-on safety: `gpio_oe` must come up zero. This is the single
+hardware-facing promise the chapter makes to a user wiring external
+circuitry to the expansion headers; asserting it in formal closes
+the loop with the initial block and refuses any future edit that
+would bring pins up already driven.
+
+<<GPIO: power-on is Hi-Z>>=
+initial begin
+   assert(gpio_oe  == 16'h0000);
+   assert(gpio_out == 16'h0000);
+end
 @
 
 The timer never exceeds its terminal value.
@@ -263,55 +471,165 @@ always @(posedge clk) begin
 end
 @
 
+`tx_start` and `tx_busy` must never be high in the same cycle.
+`uart_tx` only latches `data` into its shift register when `start`
+is sampled in `S_IDLE`; a `start` pulse that coincides with a busy
+transmitter is a dropped byte. This is the exact contract the
+`!tx_busy && !tx_start` gate in the byte-feed arm is responsible
+for, and the property catches a future edit that simplifies the
+gate in a way that breaks it.
+
+<<GPIO: tx_start and tx_busy are exclusive>>=
+always @(posedge clk) begin
+   if (tx_start)
+      assert(!tx_busy);
+end
+@
+
+`tx_data` is stable for the entire time the transmitter is busy,
+because the byte-feed arm only writes `tx_data` when `tx_busy` is
+low. Asserting this as a formal property locks that discipline
+down: a future edit that moved the write outside the `!tx_busy`
+gate would be a silent corruption of the in-flight byte, since
+`uart_tx` reads `shift` (its latched copy of `data`) bit-by-bit
+for the whole frame.
+
+<<GPIO: tx_data stable while tx_busy>>=
+always @(posedge clk) begin
+   if (f_past_valid && tx_busy)
+      assert(tx_data == $past(tx_data));
+end
+@
+
+
+The parser FSM never skips a state and never leaves the
+five-value legal set. Forward transitions can only advance by
+one; the only path out of `RX_D3` is back to `RX_IDLE`; every
+non-idle state can also fall back to `RX_IDLE` on an abort. This
+subsumes a bare `rx_state <= RX_D3` range check: since every
+listed next-state is in `{RX_IDLE, RX_D0, RX_D1, RX_D2, RX_D3}`
+and `rx_state` starts at `RX_IDLE`, the reachable set is
+inductively bounded. Catches any future edit that lets `rx_state`
+wrap or jumps between non-adjacent digits.
+
+<<GPIO: rx state monotonic>>=
+always @(posedge clk) begin
+   if (f_past_valid) begin
+      if ($past(rx_state) == RX_IDLE)
+         assert(rx_state == RX_IDLE || rx_state == RX_D0);
+      if ($past(rx_state) == RX_D0)
+         assert(rx_state == RX_D0   || rx_state == RX_D1 ||
+                rx_state == RX_IDLE);
+      if ($past(rx_state) == RX_D1)
+         assert(rx_state == RX_D1   || rx_state == RX_D2 ||
+                rx_state == RX_IDLE);
+      if ($past(rx_state) == RX_D2)
+         assert(rx_state == RX_D2   || rx_state == RX_D3 ||
+                rx_state == RX_IDLE);
+      if ($past(rx_state) == RX_D3)
+         assert(rx_state == RX_IDLE);
+   end
+end
+@
+
+`gpio_out` and `gpio_oe` are latched from the command parser only,
+and only in the commit cycle (`rx_state == RX_D3`, `rx_ready`
+high, `rx_nib_valid` high). Any change to either register outside
+that cycle indicates a logic bug: a stray write from a non-commit
+parser state, a write on an invalid nibble, or a write driven by
+something other than the parser.
+
+<<GPIO: drive regs commit only in RX_D3>>=
+always @(posedge clk) begin
+   if (f_past_valid) begin
+      if (gpio_out != $past(gpio_out))
+         assert($past(rx_state) == RX_D3 &&
+                $past(rx_ready)         &&
+                $past(rx_nib_valid)     &&
+                !$past(cmd_is_enable));
+      if (gpio_oe != $past(gpio_oe))
+         assert($past(rx_state) == RX_D3 &&
+                $past(rx_ready)         &&
+                $past(rx_nib_valid)     &&
+                $past(cmd_is_enable));
+   end
+end
+@
+
+
 == Test bench
 
-The testbench shrinks `CLKS_PER_BIT` to 10 and `TICK_CYCLES` to 2000
-so a full line arrives in a tractable number of simulation cycles.
-A sniffer `uart_rx` decodes the DUT's `tx` output into a queue; the
-stimulus drives a fixed GPIO pattern and asserts that the next line
-popped off the queue matches the expected six-byte sequence.
+The testbench exercises three paths: the heartbeat read path (DUT
+reads an externally-driven GPIO pattern and the formatted line
+reflects it), the `E` command (setting `gpio_oe` enables internal
+drive on selected bits), and the `W` command (the drive value
+reaches the bus).  Parameters are shrunk to `CLKS_PER_BIT = 10`
+and `TICK_CYCLES = 4000` so each UART byte takes 100 cycles and a
+heartbeat arrives every 4000 cycles --- enough slack that a burst
+of several commands fits comfortably between ticks.
+
+The bus is truly bidirectional: both the DUT and a per-bit external
+driver inside the testbench can drive `gpio_line`, with a per-bit
+enable on the tb side so they never fight.  A sniffer `uart_rx` on
+the DUT's `tx` output decodes heartbeat bytes into a queue, and a
+tb-owned `uart_tx` drives the DUT's `rx` input with command bytes.
 
 <<tb_gpio.sv>>=
 `timescale 1ns/1ps
 
 module tb_gpio;
-   <<TB parameters>>
-   <<TB clock>>
-   <<TB DUT and sniffer>>
-   <<TB sniffer queue>>
-   <<TB recv_byte task>>
-   <<TB expect_line task>>
-   <<TB stimulus>>
+   <<TB: parameters>>
+   <<TB: clock>>
+   <<TB: DUT instance>>
+   <<TB: sniffer>>
+   <<TB: command sender>>
+   <<TB: external bus driver>>
+   <<TB: sniffer queue>>
+   <<TB: recv_byte task>>
+   <<TB: expect_line task>>
+   <<TB: send_char task>>
+   <<TB: send_string task>>
+   <<TB: stimulus>>
 endmodule
 @
 
-<<TB parameters>>=
+<<TB: parameters>>=
 localparam CLKS_PER_BIT = 10;
-localparam TICK_CYCLES  = 2000;
+localparam TICK_CYCLES  = 4000;
 @
 
-<<TB clock>>=
+<<TB: clock>>=
 reg clk;
 initial clk = 0;
 always #5 clk <= ~clk;
 @
 
-The DUT is wired with the simulation parameters and driven with a
-fixed GPIO vector. A second `uart_rx` on the DUT's `tx` output acts
-as a continuous sniffer, avoiding Verilator scheduling races around
-the start-bit falling edge.
+The DUT has three UART-facing nets.  `tx` goes into the sniffer so
+the testbench can decode heartbeat lines.  `rx` is driven by a
+tb-owned `uart_tx` so the testbench can inject command bytes as
+real serial frames rather than poking internal registers.  The
+`gpio_line` is a tri-state wire that the DUT can drive via its
+`inout` port; the testbench drives the same line through a
+separate set of per-bit tri-state assigns.
 
-<<TB DUT and sniffer>>=
-reg  [15:0] gpio_drv;
+<<TB: DUT instance>>=
 wire        tx;
+wire        rx_line;
+wire [15:0] gpio_line;
 
 gpio #(
    .CLKS_PER_BIT(CLKS_PER_BIT),
    .TICK_CYCLES (TICK_CYCLES)
 ) dut (
-   .clk(clk), .gpio(gpio_drv), .tx(tx)
+   .clk(clk), .rx(rx_line), .pins(gpio_line), .tx(tx)
 );
+@
 
+The sniffer is a plain `uart_rx` tied to the DUT's `tx` output. It
+runs continuously so heartbeat bytes end up in the shared queue
+regardless of what the stimulus is doing.
+
+<<TB: sniffer>>=
 wire       sniff_ready;
 wire [7:0] sniff_data;
 uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) sniffer (
@@ -322,11 +640,56 @@ uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) sniffer (
 );
 @
 
+The command sender is a tb-owned `uart_tx` whose output line is
+the DUT's `rx`. The stimulus drives `tb_tx_start`/`tb_tx_data`
+through the `send_char` task defined below.
+
+<<TB: command sender>>=
+reg        tb_tx_start;
+reg  [7:0] tb_tx_data;
+wire       tb_tx_busy;
+initial begin
+   tb_tx_start = 0;
+   tb_tx_data  = 0;
+end
+uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) sender (
+   .clk  (clk),
+   .start(tb_tx_start),
+   .data (tb_tx_data),
+   .tx   (rx_line),
+   .busy (tb_tx_busy)
+);
+@
+
+The external bus driver lets the testbench simulate other parts
+driving the expansion headers.  `ext_en[i]` gates the tb's drive of
+bit `i`: when low, the tb leaves bit `i` high-impedance so the DUT
+can drive it; when high, the tb drives `ext_drv[i]`.  Tests must
+never set `ext_en[i]` and `gpio_oe[i]` both high, or the two sides
+fight and the bus resolves to `X`.  A `generate` loop stamps out
+the per-bit assign.
+
+<<TB: external bus driver>>=
+reg  [15:0] ext_en;
+reg  [15:0] ext_drv;
+initial begin
+   ext_en  = 0;
+   ext_drv = 0;
+end
+
+genvar i;
+generate
+   for (i = 0; i < 16; i = i + 1) begin : ext_tri
+      assign gpio_line[i] = ext_en[i] ? ext_drv[i] : 1'bz;
+   end
+endgenerate
+@
+
 The sniffer's one-cycle `ready` strobe is captured into a 64-entry
 circular FIFO, matching the pattern used in the `uart` chapter's
 testbench.
 
-<<TB sniffer queue>>=
+<<TB: sniffer queue>>=
 reg [7:0] rx_queue [0:63];
 reg [5:0] rx_head, rx_tail;
 
@@ -343,7 +706,7 @@ always @(posedge clk) begin
 end
 @
 
-<<TB recv_byte task>>=
+<<TB: recv_byte task>>=
 task automatic recv_byte(output [7:0] b);
    begin
       while (rx_head === rx_tail) @(posedge clk);
@@ -359,7 +722,7 @@ The expected hex digits are computed independently in the testbench
 rather than reused from the DUT's `hex_digit` function, so the
 oracle does not derive from the thing it verifies.
 
-<<TB expect_line task>>=
+<<TB: expect_line task>>=
 function [7:0] oracle_hex;
    input [3:0] n;
    begin
@@ -379,7 +742,7 @@ endfunction
 task automatic expect_line(input [15:0] expected);
    reg [7:0] b;
    reg [7:0] want [0:5];
-   integer i;
+   integer k;
    begin
       want[0] = oracle_hex(expected[15:12]);
       want[1] = oracle_hex(expected[11:8]);
@@ -387,46 +750,201 @@ task automatic expect_line(input [15:0] expected);
       want[3] = oracle_hex(expected[3:0]);
       want[4] = 8'h0d;
       want[5] = 8'h0a;
-      for (i = 0; i < 6; i = i + 1) begin
+      for (k = 0; k < 6; k = k + 1) begin
          recv_byte(b);
-         if (b !== want[i])
+         if (b !== want[k])
             $fatal(1, "FAIL line[%0d]: got 0x%02h want 0x%02h",
-                   i, b, want[i]);
+                   k, b, want[k]);
       end
    end
 endtask
 @
 
-The stimulus drives two different GPIO values across two successive
-heartbeats and validates the formatted line in each case. Between
-the two heartbeats we change the GPIO pattern and rely on the
-DUT's snapshot-on-tick behaviour to pick up the new value.
+`send_char` hands a byte to the tb-owned `uart_tx` and waits for
+the frame to leave.  The `@(negedge clk)` pacing keeps the stimulus
+aligned to stable clock phases, matching the same idiom used in the
+`uart` chapter testbench.
 
-<<TB stimulus>>=
+<<TB: send_char task>>=
+task automatic send_char(input [7:0] c);
+   begin
+      @(negedge clk);
+      while (tb_tx_busy) @(negedge clk);
+      tb_tx_data  = c;
+      tb_tx_start = 1;
+      @(negedge clk);
+      tb_tx_start = 0;
+      while (!tb_tx_busy) @(negedge clk);
+      while (tb_tx_busy)  @(negedge clk);
+      repeat (CLKS_PER_BIT) @(negedge clk);
+   end
+endtask
+@
+
+`send_string` just loops `send_char`. The sixteen-byte packed
+width covers every test string in the stimulus (the longest is a
+ten-byte back-to-back command in Phase 8) with null padding
+skipped.  Five- or ten-character command strings cost 500--1000
+cycles to transmit, well inside a single `TICK_CYCLES = 4000`
+heartbeat period.
+
+<<TB: send_string task>>=
+localparam SEND_STRING_MAX = 16;
+
+task automatic send_string(input [8*SEND_STRING_MAX-1:0] s);
+   integer k;
+   reg [7:0] c;
+   begin
+      for (k = SEND_STRING_MAX - 1; k >= 0; k = k - 1) begin
+         c = s[k*8 +: 8];
+         if (c != 8'h00)
+            send_char(c);
+      end
+   end
+endtask
+@
+
+The stimulus has eight phases covering every user-visible path
+through the module.
+
+Phase 1 verifies the read path still works with the new
+bidirectional port: external driver sets the full bus to `a5c3`
+with the DUT fully Hi-Z (power-on state) and the first heartbeat
+reads `a5c3`.
+
+Phase 2 verifies the `E`+`W` drive path: external driver releases
+the low byte (`ext_en <= 16'hff00`), testbench sends `E00FF` to
+enable DUT drive on the low byte and `W0042` to drive `0x42`
+there. External driver still covers the upper byte with `0x33`,
+so the next heartbeat reads `3342`.
+
+Phase 3 verifies drive release: `E0000` returns the bus to
+external-only, and with `ext_drv = 16'hbeef` the next heartbeat
+reads `beef`.
+
+Phase 4 exercises the mid-command abort path (in `RX_D2`) and
+lowercase-hex decoding in one stimulus: re-enable DUT drive on the
+low byte, send an aborted `W0A!` followed by a lowercase-hex
+`WabCD`. The abort leaves `gpio_out` at its previous value
+(`0042`), and `WabCD` lands `cd` on the low byte; combined with
+`ext_drv = 16'h9900` the heartbeat reads `99cd`.
+
+Phase 5 exercises the `RX_D3` abort path, which Phase 4 doesn't
+reach --- the abort there lands in `RX_D2`.  We send `W123!` (3
+valid digits, then `!` in the commit state).  The parser's
+`RX_D3` arm only commits when `rx_nib_valid` is high, so
+`gpio_out` stays at `abcd` from the previous commit and the
+heartbeat reads `99cd` unchanged.
+
+Phase 6 exercises per-bit tri-state independence with a
+checkerboard output-enable: `EAAAA` makes the DUT drive only the
+odd bits, `ext_en = 16'h5555` makes the testbench drive only the
+even bits, so every bit is driven by exactly one source. With
+`WAAAA` and `ext_drv = 16'h5555`, the union is `0xFFFF`.  A bug
+that accidentally shared `gpio_oe[0]` across all 16 tri-state
+assigns would fail this check, whereas the byte-aligned tests of
+Phases 1--5 would still pass.
+
+Phase 7 verifies back-to-back command handoff: after the
+checkerboard of Phase 6 the DUT is driving `AAAA`, so we first
+send `E0000` to release the bus (collapsing the drive would
+otherwise fight external drivers in the next step), then
+concatenate two commands with no intervening byte
+(`E00FFW0042`) and verify the second one commits correctly ---
+the parser's return-to-idle after commit is immediate enough for
+the next `W` to be picked up on the very next `rx_ready` pulse.
+
+Phase 8 verifies snapshot coherence when a commit lands during
+an in-flight heartbeat transmission.  The stimulus waits for the
+tick edge via `@(posedge dut.active)` so the heartbeat has just
+latched its snapshot and started streaming; the testbench then
+sends `W1234` while the line is being transmitted.  The current
+line must still read the pre-commit snapshot (`7742` from Phase
+7), and only the next heartbeat may reflect the post-commit state
+(`7734` --- ext high byte `0x77`, DUT low byte `0x34`).  A
+regression where `cur_char` accidentally reads live `pins` instead
+of `snapshot` would corrupt mid-line bytes and fail the first
+`expect_line`.
+
+Timing note: each command is ~500 cycles to transmit.  The first
+heartbeat after power-on arrives at cycle `TICK_CYCLES = 4000`,
+so the Phase 1 expect_line consumes cycles 0..4600 (heartbeat
+sent between cycles 4000 and 4600).  Each subsequent phase sends
+one or two 5-byte commands (~500--1000 cycles) before waiting for
+the next tick at 8000, 12000, etc. --- ample slack for every
+phase including the four-command burst in Phase 4.
+
+<<TB: stimulus>>=
 initial begin
-   gpio_drv = 16'ha5c3;
+   ext_en  = 16'hffff;
+   ext_drv = 16'ha5c3;
    expect_line(16'ha5c3);
 
-   gpio_drv = 16'h0000;
-   expect_line(16'h0000);
+   ext_en  = 16'hff00;
+   ext_drv = 16'h3300;
+   send_string("E00FF");
+   send_string("W0042");
+   expect_line(16'h3342);
 
-   $display("PASS: gpio heartbeat lines correct");
+   send_string("E0000");
+   ext_en  = 16'hffff;
+   ext_drv = 16'hbeef;
+   expect_line(16'hbeef);
+
+   ext_en  = 16'hff00;
+   ext_drv = 16'h9900;
+   send_string("E00FF");
+   send_string("W0A");
+   send_char("!");
+   send_string("WabCD");
+   expect_line(16'h99cd);
+
+   send_string("W123");
+   send_char("!");
+   expect_line(16'h99cd);
+
+   ext_en  = 16'h5555;
+   ext_drv = 16'h5555;
+   send_string("EAAAA");
+   send_string("WAAAA");
+   expect_line(16'hffff);
+
+   send_string("E0000");
+   ext_en  = 16'hff00;
+   ext_drv = 16'h7700;
+   send_string("E00FFW0042");
+   expect_line(16'h7742);
+
+   @(posedge dut.active);
+   send_string("W1234");
+   expect_line(16'h7742);
+   expect_line(16'h7734);
+
+   $display("PASS: heartbeat + command-drive paths both correct");
    $finish;
 end
 @
 
 == Formal verification
 
-A single BMC task checks the invariants declared inside the module.
+A single BMC task proves every `assert` within its depth budget.
 `TICK_CYCLES` is shrunk to 20 so the solver reaches a timer wrap
 and the `active` transition within a handful of cycles;
-`CLKS_PER_BIT` is shrunk to 10 so a `tx_start` pulse + the
-subsequent `uart_tx` busy phase fit in the same depth budget.
-The properties are all state-local safety invariants, not bounded
-reachability of a specific output, so there is no requirement that
-depth span a full six-byte line --- what matters is that every
-branch of the main always block is exercised at least once, which
-happens within the first 40 cycles at these parameters.
+`CLKS_PER_BIT` is shrunk to 10 so one inbound UART frame completes
+in roughly 100 cycles. Depth is 120 --- enough to drive a full
+UART byte into `uart_rx` and step the parser from `RX_IDLE` into
+`RX_D0` while keeping z3 runtime bounded (roughly two minutes on
+z3). The monotonicity and commit-discipline assertions are sound
+at any depth; reachability depth only bounds how many states a
+concrete counterexample search can touch.
+
+A `cover` task that demanded a concrete trace reaching `RX_D3`
+was attempted and dropped: z3 could not drive four full UART
+frames into `uart_rx` inside a fifteen-minute solver budget, so
+the cover was uninformative on timeout. Reachability of the
+commit path is witnessed concretely by the testbench instead ---
+every phase that issues a `W` or `E` command exercises exactly
+that path.
 
 <<gpio.sby>>=
 [tasks]
@@ -434,73 +952,74 @@ bmc
 
 [options]
 bmc: mode bmc
-bmc: depth 40
-timeout 120
+bmc: depth 120
+timeout 600
 
 [engines]
 smtbmc z3
 
 [script]
-read -formal gpio.v uart_tx.v
+read -formal gpio.v uart_tx.v uart_rx.v
 chparam -set CLKS_PER_BIT 10 -set TICK_CYCLES 20 gpio
 prep -top gpio
 
 [files]
 ../verilog/gpio.v
 ../verilog/uart_tx.v
+../verilog/uart_rx.v
 @
 
 == iCEstick pin mapping
 
 Clock on pin 21 (12 MHz Discera MEMS oscillator), UART TX on pin 8
-(FT2232H channel B, the PC's COM port). The sixteen GPIO inputs map
-to the expansion headers `J1` (Bank 0) and `J3` (Bank 2) in
-connector-position order: `gpio[0]` at `J1.3` up through `gpio[15]`
-at `J3.10`. FPGA pin numbers on `J1` happen to run ascending
-(`112..119`) with connector position, while on `J3` they run
-descending (`62, 61, 60, 56, 48, 47, 45, 44`) --- the ordering is
-by connector pin, not by FPGA pin number, so a scope probe stepped
-from `J3.3` to `J3.10` reads bits `gpio[8]` through `gpio[15]` in
-order.
+and RX on pin 9 (FT2232H channel B, the PC's COM port). The sixteen
+GPIO bidirectional pins map to the expansion headers `J1` (Bank 0)
+and `J3` (Bank 2) in connector-position order: `pins[0]` at `J1.3`
+up through `pins[15]` at `J3.10`. FPGA pin numbers on `J1` happen
+to run ascending (`112..119`) with connector position, while on
+`J3` they run descending (`62, 61, 60, 56, 48, 47, 45, 44`) ---
+the ordering is by connector pin, not by FPGA pin number, so a
+scope probe stepped from `J3.3` to `J3.10` reads bits `pins[8]`
+through `pins[15]` in order.
 
 <<gpio.pcf>>=
 set_io clk      21
 
 set_io tx       8
+set_io rx       9
 
-set_io gpio[0]  112
-set_io gpio[1]  113
-set_io gpio[2]  114
-set_io gpio[3]  115
-set_io gpio[4]  116
-set_io gpio[5]  117
-set_io gpio[6]  118
-set_io gpio[7]  119
+set_io pins[0]  112
+set_io pins[1]  113
+set_io pins[2]  114
+set_io pins[3]  115
+set_io pins[4]  116
+set_io pins[5]  117
+set_io pins[6]  118
+set_io pins[7]  119
 
-set_io gpio[8]  62
-set_io gpio[9]  61
-set_io gpio[10] 60
-set_io gpio[11] 56
-set_io gpio[12] 48
-set_io gpio[13] 47
-set_io gpio[14] 45
-set_io gpio[15] 44
+set_io pins[8]  62
+set_io pins[9]  61
+set_io pins[10] 60
+set_io pins[11] 56
+set_io pins[12] 48
+set_io pins[13] 47
+set_io pins[14] 45
+set_io pins[15] 44
 @
 
 == Build fragment
 
-The gpio top pulls in `uart_tx.v` as a dependency, so the generic
-single-file rules in the top Makefile do not suffice. This fragment
-overrides the sim, formal, and synth targets to include both
-`gpio.v` and `uart_tx.v`. The `uart_tx.v` prerequisite resolves
-through the tangle rules declared by the `uart` chapter's own
-fragment.
+The gpio top pulls in `uart_tx.v` and `uart_rx.v` as dependencies,
+so the generic single-file rules in the top Makefile do not
+suffice. This fragment overrides the sim, formal, and synth
+targets to include all three sources. The `uart_tx.v` and
+`uart_rx.v` prerequisites resolve through the tangle rules declared
+by the `uart` chapter's own fragment.
 
 <<gpio.mk>>=
-GPIO_VS    := verilog/gpio.v verilog/uart_tx.v
-GPIO_TB_VS := $(GPIO_VS) verilog/uart_rx.v
+GPIO_VS := verilog/gpio.v verilog/uart_tx.v verilog/uart_rx.v
 
-build/sim_gpio: tb/tb_gpio.sv $(GPIO_TB_VS) | build
+build/sim_gpio: tb/tb_gpio.sv $(GPIO_VS) | build
 	cd build && verilator -Wall --binary --top-module tb_gpio ../tb/tb_gpio.sv ../verilog/gpio.v ../verilog/uart_tx.v ../verilog/uart_rx.v
 	cd build && obj_dir/Vtb_gpio
 	@touch $@
@@ -510,17 +1029,30 @@ build/formal_gpio: build/gpio.sby $(GPIO_VS)
 	@touch $@
 
 build/gpio.json: $(GPIO_VS) | build
-	cd build && yosys -q -p "read_verilog ../verilog/gpio.v ../verilog/uart_tx.v; synth_ice40 -top gpio -json gpio.json"
+	cd build && yosys -q -p "read_verilog ../verilog/gpio.v ../verilog/uart_tx.v ../verilog/uart_rx.v; synth_ice40 -top gpio -json gpio.json"
 
 bitstream: build/gpio.bin
 @
 
 == Summary
 
-One new producer module, no new UART machinery. The `gpio` top
-snapshots all sixteen J1/J3 expansion pins every 100 ms, formats them
-as a four-digit hex line with a CRLF terminator, and streams the six
-bytes through a private `uart_tx` instance reusing the transmitter
-from the `uart` chapter. Simulation validates two back-to-back lines
-against an independently-computed oracle, and formal BMC pins down
-timer, character-index, and idle-state invariants.
+One top module, no new UART machinery. The `gpio` top reads all
+sixteen J1/J3 expansion pins every 100 ms and streams the state as
+a four-digit hex line through a private `uart_tx`. A matching
+`uart_rx` decodes short ASCII commands (`Wxxxx` and `Exxxx`) that
+latch a 16-bit drive word and a 16-bit output enable; per-bit
+tri-state drivers map those registers back onto the same `inout`
+bus so the heartbeat line reflects the combined state of internal
+drive and external signals.
+
+Verification is split between simulation and formal BMC. The eight
+testbench phases cover read-through, `E`+`W` drive, release,
+mid-command abort in both `RX_D2` and `RX_D3`, lowercase-hex
+decoding, per-bit tri-state independence via a checkerboard
+output-enable, back-to-back command handoff, and snapshot
+coherence when a commit lands during an in-flight heartbeat.
+Nine formal assertions pin down power-on Hi-Z safety, timer and
+character-index bounds, the `uart_tx` handshake contract (pulse
+width + `tx_start`/`tx_busy` exclusivity + `tx_data` stability
+across a busy frame), parser FSM monotonicity, and the commit
+discipline for the drive registers.

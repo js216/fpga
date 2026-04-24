@@ -1,21 +1,22 @@
 set_io clk      21
 
 set_io tx       8
+set_io rx       9
 
-set_io gpio[0]  112
-set_io gpio[1]  113
-set_io gpio[2]  114
-set_io gpio[3]  115
-set_io gpio[4]  116
-set_io gpio[5]  117
-set_io gpio[6]  118
-set_io gpio[7]  119
+set_io pins[0]  112
+set_io pins[1]  113
+set_io pins[2]  114
+set_io pins[3]  115
+set_io pins[4]  116
+set_io pins[5]  117
+set_io pins[6]  118
+set_io pins[7]  119
 
-set_io gpio[8]  62
-set_io gpio[9]  61
-set_io gpio[10] 60
-set_io gpio[11] 56
-set_io gpio[12] 48
-set_io gpio[13] 47
-set_io gpio[14] 45
-set_io gpio[15] 44
+set_io pins[8]  62
+set_io pins[9]  61
+set_io pins[10] 60
+set_io pins[11] 56
+set_io pins[12] 48
+set_io pins[13] 47
+set_io pins[14] 45
+set_io pins[15] 44

@@ -2,9 +2,10 @@ module gpio #(
       parameter CLKS_PER_BIT = 104,
       parameter TICK_CYCLES  = 1_200_000
    )(
-      input         clk,
-      input  [15:0] gpio,
-      output        tx
+      input          clk,
+      input          rx,
+      inout  [15:0]  pins,
+      output         tx
    );
    reg [$clog2(TICK_CYCLES)-1:0] timer;
    reg [15:0] snapshot;
@@ -14,14 +15,34 @@ module gpio #(
    reg  [7:0] tx_data;
    wire       tx_busy;
    
+   reg [15:0] gpio_out;
+   reg [15:0] gpio_oe;
+   
+   reg [2:0]  rx_state;
+   reg        cmd_is_enable;
+   reg [11:0] accum;
+   wire       rx_ready;
+   wire [7:0] rx_data;
+   
    localparam LAST_IDX = 3'd5;
+   
+   localparam RX_IDLE = 3'd0;
+   localparam RX_D0   = 3'd1;
+   localparam RX_D1   = 3'd2;
+   localparam RX_D2   = 3'd3;
+   localparam RX_D3   = 3'd4;
    initial begin
-      timer    = 0;
-      snapshot = 0;
-      char_idx = 0;
-      active   = 0;
-      tx_start = 0;
-      tx_data  = 0;
+      timer         = 0;
+      snapshot      = 0;
+      char_idx      = 0;
+      active        = 0;
+      tx_start      = 0;
+      tx_data       = 0;
+      gpio_out      = 0;
+      gpio_oe       = 0;
+      rx_state      = RX_IDLE;
+      cmd_is_enable = 0;
+      accum         = 0;
    end
    function [7:0] hex_digit;
       input [3:0] n;
@@ -47,7 +68,7 @@ module gpio #(
       if (timer == TICK_CYCLES - 1) begin
          timer <= 0;
          if (!active) begin
-            snapshot <= gpio;
+            snapshot <= pins;
             char_idx <= 0;
             active   <= 1'b1;
          end
@@ -72,7 +93,63 @@ module gpio #(
       .tx   (tx),
       .busy (tx_busy)
    );
+   uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_rx (
+      .clk  (clk),
+      .rx   (rx),
+      .ready(rx_ready),
+      .data (rx_data)
+   );
+   wire rx_is_dec = (rx_data >= "0") && (rx_data <= "9");
+   wire rx_is_lc  = (rx_data >= "a") && (rx_data <= "f");
+   wire rx_is_uc  = (rx_data >= "A") && (rx_data <= "F");
+   wire rx_nib_valid = rx_is_dec | rx_is_lc | rx_is_uc;
+   wire [3:0] rx_nib =
+      rx_is_dec ? rx_data[3:0]
+                : (rx_data[3:0] + 4'd9);
+   always @(posedge clk) begin
+      if (rx_ready) begin
+         case (rx_state)
+            RX_IDLE: begin
+               if (rx_data == "W") begin
+                  rx_state      <= RX_D0;
+                  cmd_is_enable <= 1'b0;
+               end else if (rx_data == "E") begin
+                  rx_state      <= RX_D0;
+                  cmd_is_enable <= 1'b1;
+               end
+            end
+            RX_D0, RX_D1, RX_D2: begin
+               if (rx_nib_valid) begin
+                  accum    <= {accum[7:0], rx_nib};
+                  rx_state <= rx_state + 1;
+               end else begin
+                  rx_state <= RX_IDLE;
+               end
+            end
+            RX_D3: begin
+               if (rx_nib_valid) begin
+                  if (cmd_is_enable)
+                     gpio_oe  <= {accum, rx_nib};
+                  else
+                     gpio_out <= {accum, rx_nib};
+               end
+               rx_state <= RX_IDLE;
+            end
+            default: rx_state <= RX_IDLE;
+         endcase
+      end
+   end
+   genvar g;
+   generate
+      for (g = 0; g < 16; g = g + 1) begin : gpio_tri
+         assign pins[g] = gpio_oe[g] ? gpio_out[g] : 1'bz;
+      end
+   endgenerate
 `ifdef FORMAL
+   initial begin
+      assert(gpio_oe  == 16'h0000);
+      assert(gpio_out == 16'h0000);
+   end
    always @(posedge clk) assert(timer < TICK_CYCLES);
    always @(posedge clk) assert(char_idx <= LAST_IDX);
    always @(posedge clk) begin
@@ -86,6 +163,45 @@ module gpio #(
    always @(posedge clk) begin
       if (f_past_valid && $past(tx_start))
          assert(!tx_start);
+   end
+   always @(posedge clk) begin
+      if (tx_start)
+         assert(!tx_busy);
+   end
+   always @(posedge clk) begin
+      if (f_past_valid && tx_busy)
+         assert(tx_data == $past(tx_data));
+   end
+   always @(posedge clk) begin
+      if (f_past_valid) begin
+         if ($past(rx_state) == RX_IDLE)
+            assert(rx_state == RX_IDLE || rx_state == RX_D0);
+         if ($past(rx_state) == RX_D0)
+            assert(rx_state == RX_D0   || rx_state == RX_D1 ||
+                   rx_state == RX_IDLE);
+         if ($past(rx_state) == RX_D1)
+            assert(rx_state == RX_D1   || rx_state == RX_D2 ||
+                   rx_state == RX_IDLE);
+         if ($past(rx_state) == RX_D2)
+            assert(rx_state == RX_D2   || rx_state == RX_D3 ||
+                   rx_state == RX_IDLE);
+         if ($past(rx_state) == RX_D3)
+            assert(rx_state == RX_IDLE);
+      end
+   end
+   always @(posedge clk) begin
+      if (f_past_valid) begin
+         if (gpio_out != $past(gpio_out))
+            assert($past(rx_state) == RX_D3 &&
+                   $past(rx_ready)         &&
+                   $past(rx_nib_valid)     &&
+                   !$past(cmd_is_enable));
+         if (gpio_oe != $past(gpio_oe))
+            assert($past(rx_state) == RX_D3 &&
+                   $past(rx_ready)         &&
+                   $past(rx_nib_valid)     &&
+                   $past(cmd_is_enable));
+      end
    end
 `endif
 endmodule
