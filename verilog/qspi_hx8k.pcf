@@ -1,0 +1,9 @@
+set_io clk      J3
+set_io tx       B12
+set_io rx       B10
+set_io cs_n     A16
+set_io sclk     B16
+set_io io[0]    C16
+set_io io[1]    D16
+set_io io[2]    E16
+set_io io[3]    F16
