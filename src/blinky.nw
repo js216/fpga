@@ -177,7 +177,7 @@ chparam -set PERIOD 10 blinky
 prep -top blinky
 
 [files]
-../verilog/blinky.v
+../../verilog/blinky.v
 @
 
 The `[script]` section tells Yosys to read the Verilog source with
@@ -249,16 +249,93 @@ bitstream target. The top Makefile's `bitstream` phony collects
 prereqs from each module's `.mk` fragment.
 
 <<blinky.mk>>=
-bitstream: build/blinky.bin
+BLINKY_VS := verilog/blinky.v
+
+build/blinky/blinky.json: $(BLINKY_VS) | build/blinky
+	cd build/blinky && yosys -q -p "read_verilog ../../verilog/blinky.v; synth_ice40 -top blinky -json blinky.json"
+
+build/blinky/sim: tb/tb_blinky.sv $(BLINKY_VS) | build/blinky
+	cd build/blinky && verilator --Mdir obj_dir -Wall --binary --top-module tb_blinky ../../tb/tb_blinky.sv ../../verilog/blinky.v
+	cd build/blinky && obj_dir/Vtb_blinky
+	@touch $@
+
+build/blinky/formal: build/blinky/blinky.sby $(BLINKY_VS)
+	cd build/blinky && sby -f blinky.sby
+	@touch $@
+
+bitstream: build/blinky/blinky.bin
+sim: build/blinky/sim
+formal: build/blinky/formal
+@
+
+=== Hardware testing
+
+==== Hardware Needed
+
+- Lattice iCEstick (iCE40-HX1K, 12 MHz)
+- USB-A extension cable or hub for the iCEstick
+
+==== Test Setup
+
+The blink rate is visible on the iCEstick's on-board LED D1; no
+off-board probe is required for the manual check.
+
+==== Manual Test
+
+Program the bitstream and watch LED D1. The default
+`PERIOD = 6_000_000` cycles at the 12 MHz oscillator gives a
+0.5-second toggle rate, i.e. a 1 Hz blink: one full on-off cycle
+per second.
+
+==== Automated Test
+
+The plan programs the bitstream and confirms `test_serv` reports
+no errors.
+
+<<TEST.md>>=
+```
+fpga:program bin=@blinky.bin
+```
+
+- Check `test_serv` had no errors
+@
+
+The verifier has only one check, and it is the generic "no errors"
+predicate from the shared library: the plan's only meaningful
+outcome is whether `fpga:program` returned cleanly. The path-fixup
+at the top mirrors every other chapter; everything else is one
+dictionary entry.
+
+<<verify.py>>=
+import os
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
+import verify_lib as v
+
+
+DISPATCH = {
+    "Check `test_serv` had no errors":
+        v.check_no_errors,
+}
+
+
+if __name__ == "__main__":
+    sys.exit(v.main(DISPATCH, sys.argv))
 @
 
 === Summary
 
-This module was verified in two stages. First, a self-checking test bench
-instantiated the design with `PERIOD = 10` and confirmed that the LED
-toggles exactly five times at the correct period. Second, SymbiYosys proved
-via bounded model checking that for all possible input sequences up to 30
-cycles: (1) the initial state is zero, (2) the counter stays below
-`PERIOD`, and (3) the counter increments by one each cycle or wraps to
-zero. Together, simulation and formal proof cover both the specific
-behavior and the general correctness of the design.
+This module is verified in three stages. First, a self-checking
+test bench instantiates the design with `PERIOD = 10` and confirms
+that the LED toggles exactly five times at the correct period.
+Second, SymbiYosys proves via bounded model checking that for all
+possible input sequences up to 30 cycles: (1) the initial state is
+zero, (2) the counter stays below `PERIOD`, and (3) the counter
+increments by one each cycle or wraps to zero. Third, hardware
+testing loads the bitstream onto a real iCEstick and confirms the
+program path is clean; visual confirmation of the blink rate is
+the manual step. `TEST.md` and `verify.py` tangle out of this
+chapter so the plan and the per-bullet check stay attached to the
+prose that justifies them.

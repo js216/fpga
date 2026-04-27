@@ -964,9 +964,9 @@ chparam -set CLKS_PER_BIT 10 -set TICK_CYCLES 20 gpio
 prep -top gpio
 
 [files]
-../verilog/gpio.v
-../verilog/uart_tx.v
-../verilog/uart_rx.v
+../../verilog/gpio.v
+../../verilog/uart_tx.v
+../../verilog/uart_rx.v
 @
 
 == iCEstick pin mapping
@@ -1019,19 +1019,21 @@ by the `uart` chapter's own fragment.
 <<gpio.mk>>=
 GPIO_VS := verilog/gpio.v verilog/uart_tx.v verilog/uart_rx.v
 
-build/sim_gpio: tb/tb_gpio.sv $(GPIO_VS) | build
-	cd build && verilator -Wall --binary --top-module tb_gpio ../tb/tb_gpio.sv ../verilog/gpio.v ../verilog/uart_tx.v ../verilog/uart_rx.v
-	cd build && obj_dir/Vtb_gpio
+build/gpio/gpio.json: $(GPIO_VS) | build/gpio
+	cd build/gpio && yosys -q -p "read_verilog ../../verilog/gpio.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v; synth_ice40 -top gpio -json gpio.json"
+
+build/gpio/sim: tb/tb_gpio.sv $(GPIO_VS) | build/gpio
+	cd build/gpio && verilator --Mdir obj_dir -Wall --binary --top-module tb_gpio ../../tb/tb_gpio.sv ../../verilog/gpio.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v
+	cd build/gpio && obj_dir/Vtb_gpio
 	@touch $@
 
-build/formal_gpio: build/gpio.sby $(GPIO_VS)
-	cd build && sby -f gpio.sby
+build/gpio/formal: build/gpio/gpio.sby $(GPIO_VS)
+	cd build/gpio && sby -f gpio.sby
 	@touch $@
 
-build/gpio.json: $(GPIO_VS) | build
-	cd build && yosys -q -p "read_verilog ../verilog/gpio.v ../verilog/uart_tx.v ../verilog/uart_rx.v; synth_ice40 -top gpio -json gpio.json"
-
-bitstream: build/gpio.bin
+bitstream: build/gpio/gpio.bin
+sim: build/gpio/sim
+formal: build/gpio/formal
 @
 
 == Summary

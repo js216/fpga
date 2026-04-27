@@ -8,17 +8,23 @@ PACKAGE ?= tq144
 
 all: doc sim formal bitstream
 
-doc:    $(addprefix doc/,$(addsuffix .pdf,$(CHAPTERS)))
-sim:    $(addprefix build/sim_,$(CHAPTERS))
-formal: $(addprefix build/formal_,$(CHAPTERS))
-bitstream:  # per-chapter .mk fragments append prereqs
+# Top-level aggregates start empty; per-chapter rules add prereqs below.
+doc:
+sim:
+formal:
+bitstream:
 
 .NOTINTERMEDIATE:
 
-build verilog tb:
+verilog tb:
 	mkdir -p $@
 
-# ---- tangle ----
+# Order-only dependency target for doc dir (separate from .PHONY doc).
+docdir:
+	mkdir -p doc
+.PHONY: docdir
+
+# ---- tangle to top-level dirs ----
 
 verilog/%.v: src/%.nw | verilog
 	cd verilog && tangle $*.v < ../$<
@@ -29,55 +35,57 @@ verilog/%.pcf: src/%.nw | verilog
 tb/tb_%.sv: src/%.nw | tb
 	cd tb && tangle tb_$*.sv < ../$<
 
-build/%.sby: src/%.nw | build
-	cd build && tangle $*.sby < ../$<
+# ---- per-chapter generic rules ----
+#
+# Everything that fits a single-file pattern lives here; chapters with
+# multi-file synthesis lists override .json / sim / formal in their own
+# .mk fragment (see below).
+define CHAP_RULES
 
-# Makefile fragment: optional, empty if chapter has no <<%.mk>> chunk.
-build/%.mk: src/%.nw | build
-	@cd build && tangle $*.mk < ../$< 2>/dev/null
-	@touch $@
+build/$(1):
+	mkdir -p $$@
 
-# ---- doc ----
+build/$(1)/$(1).sby: src/$(1).nw | build/$(1)
+	cd build/$(1) && tangle $(1).sby < ../../$$<
 
-doc/%.pdf: src/%.nw style.typ | build
-	@mkdir -p doc
-	cp style.typ build/$*.typ
-	weave < $< >> build/$*.typ
-	typst compile build/$*.typ doc/$*.pdf
+build/$(1)/$(1).mk: src/$(1).nw | build/$(1)
+	@cd build/$(1) && tangle $(1).mk < ../../$$< 2>/dev/null
+	@touch $$@
 
-# ---- sim ----
+build/$(1)/TEST.md: src/$(1).nw | build/$(1)
+	@cd build/$(1) && tangle TEST.md < ../../$$< 2>/dev/null
+	@touch $$@
 
-build/sim_%: tb/tb_%.sv verilog/%.v | build
-	cd build && verilator -Wall --binary --top-module tb_$* \
-		../tb/tb_$*.sv ../verilog/$*.v
-	cd build && obj_dir/Vtb_$*
-	@touch $@
+build/$(1)/verify.py: src/$(1).nw | build/$(1)
+	@cd build/$(1) && tangle verify.py < ../../$$< 2>/dev/null
+	@touch $$@
 
-# ---- formal ----
+build/$(1)/$(1).typ: src/$(1).nw style.typ | build/$(1)
+	cp style.typ $$@
+	weave < $$< >> $$@
 
-build/formal_%: build/%.sby verilog/%.v
-	cd build && sby -f $*.sby
-	@touch $@
+doc/$(1).pdf: build/$(1)/$(1).typ | docdir
+	typst compile $$< $$@
 
-# ---- bitstream ----
+build/$(1)/$(1).asc: build/$(1)/$(1).json verilog/$(1).pcf
+	cd build/$(1) && nextpnr-ice40 --$$(DEVICE) --package $$(PACKAGE) \
+		--json $(1).json --pcf ../../verilog/$(1).pcf \
+		--asc $(1).asc --freq 12 -q
 
-build/%.json: verilog/%.v | build
-	cd build && yosys -q -p "read_verilog ../verilog/$*.v; \
-		synth_ice40 -top $* -json $*.json"
+build/$(1)/$(1).bin: build/$(1)/$(1).asc
+	cd build/$(1) && icepack $(1).asc $(1).bin
 
-build/%.asc: build/%.json verilog/%.pcf
-	cd build && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) \
-		--json $*.json --pcf ../verilog/$*.pcf --asc $*.asc \
-		--freq 12 -q
+doc: doc/$(1).pdf
 
-build/%.bin: build/%.asc
-	cd build && icepack $*.asc $*.bin
+endef
+
+$(foreach c,$(CHAPTERS),$(eval $(call CHAP_RULES,$(c))))
 
 # ---- clean ----
 
 clean:
 	rm -rf build doc
 
-# ---- per-chapter fragments ----
-
--include $(addprefix build/,$(addsuffix .mk,$(CHAPTERS)))
+# Per-chapter fragments: VS list, .json (multi-file deps), sim, formal,
+# and any bitstream/sim/formal aggregate appends.
+-include $(foreach c,$(CHAPTERS),build/$(c)/$(c).mk)

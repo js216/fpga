@@ -33,22 +33,29 @@ Override the target part on the command line:
 
     make bitstream DEVICE=hx8k PACKAGE=ct256
 
-### Structure
+### How to Test
 
-Each `src/*.nw` file is a self-contained literate program containing:
+The source file in each example explains the hardware and procedure needed to
+test manually, as well as a description of the automated test procedure using
+the [`test_serv`](https://github.com/js216/test_serv) framework.
 
-- Synthesizable Verilog (tangled to `verilog/%.v`)
-- SystemVerilog testbench (tangled to `tb/tb_%.sv`)
-- SymbiYosys configuration (tangled to `build/%.sby`)
-- iCEstick pin constraints, where applicable (tangled to `verilog/%.pcf`)
+Each example defines a `verify.py` script which makes use of the bullet points
+following each automated test description to check that the returned test
+artifacts pass the test criteria.
+
+With the test server running, each example can be verified in one step. For
+example:
+
+    cd build/uart
+    python3 $TEST_SERV/run_md.py
 
 ### Modules
 
-| Module | Description |
-|--------|-------------|
-| `src/blinky.nw` | Parameterized LED blinker (hardware bring-up) |
-| `src/uart.nw`   | 8N1 UART receiver, transmitter, and iCEstick echo demo |
-| `src/cordic.nw` | CORDIC sine/cosine generator |
+- **blinky**: Parameterized LED blinker (hardware bring-up)
+- **uart**: 8N1 UART receiver, transmitter, and iCEstick echo demo
+- **gpio**: Verify and emit signals on GPIO pins
+- **qspi**: Emulate a QSPI flash interface
+- **cordic**: CORDIC sine/cosine generator
 
 ### Author
 

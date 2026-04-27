@@ -876,7 +876,7 @@ read -formal cordic.v
 prep -top cordic
 
 [files]
-../verilog/cordic.v
+../../verilog/cordic.v
 @
 
 The formal properties are embedded directly in the module. We assume
@@ -921,4 +921,26 @@ always @(posedge clk_in) begin
          assert(cos_out > 0);
    end
 end
+@
+
+
+== Build fragment
+
+Cordic only has formal proofs and a sim --- no synthesis target. The
+fragment wires sim and formal into the top Makefile's aggregates.
+
+<<cordic.mk>>=
+CORDIC_VS := verilog/cordic.v
+
+build/cordic/sim: tb/tb_cordic.sv $(CORDIC_VS) | build/cordic
+	cd build/cordic && verilator --Mdir obj_dir -Wall --binary --top-module tb_cordic ../../tb/tb_cordic.sv ../../verilog/cordic.v
+	cd build/cordic && obj_dir/Vtb_cordic
+	@touch $@
+
+build/cordic/formal: build/cordic/cordic.sby $(CORDIC_VS)
+	cd build/cordic && sby -f cordic.sby
+	@touch $@
+
+sim: build/cordic/sim
+formal: build/cordic/formal
 @

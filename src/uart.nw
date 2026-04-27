@@ -1038,8 +1038,8 @@ bmc_tx: chparam -set CLKS_PER_BIT 10 uart_tx
 bmc_tx: prep -top uart_tx
 
 [files]
-../verilog/uart_rx.v
-../verilog/uart_tx.v
+../../verilog/uart_rx.v
+../../verilog/uart_tx.v
 @
 
 == iCEstick pin mapping
@@ -1076,22 +1076,187 @@ UART_VS := verilog/uart.v verilog/uart_rx.v verilog/uart_tx.v verilog/uart_hello
 $(UART_VS) &: src/uart.nw | verilog
 	cd verilog && tangle uart.v uart_rx.v uart_tx.v uart_hello.v < ../$<
 
-build/sim_uart: tb/tb_uart.sv $(UART_VS) | build
-	cd build && verilator -Wall --binary --top-module tb_uart ../tb/tb_uart.sv ../verilog/uart.v ../verilog/uart_rx.v ../verilog/uart_tx.v ../verilog/uart_hello.v
-	cd build && obj_dir/Vtb_uart
+build/uart/uart.json: $(UART_VS) | build/uart
+	cd build/uart && yosys -q -p "read_verilog ../../verilog/uart.v ../../verilog/uart_rx.v ../../verilog/uart_tx.v ../../verilog/uart_hello.v; synth_ice40 -top uart -json uart.json"
+
+build/uart/sim: tb/tb_uart.sv $(UART_VS) | build/uart
+	cd build/uart && verilator --Mdir obj_dir -Wall --binary --top-module tb_uart ../../tb/tb_uart.sv ../../verilog/uart.v ../../verilog/uart_rx.v ../../verilog/uart_tx.v ../../verilog/uart_hello.v
+	cd build/uart && obj_dir/Vtb_uart
 	@touch $@
 
-build/formal_uart: build/uart.sby $(UART_VS)
-	cd build && sby -f uart.sby
+build/uart/formal: build/uart/uart.sby $(UART_VS)
+	cd build/uart && sby -f uart.sby
 	@touch $@
 
-build/uart.json: $(UART_VS) | build
-	cd build && yosys -q -p "read_verilog ../verilog/uart.v ../verilog/uart_rx.v ../verilog/uart_tx.v ../verilog/uart_hello.v; synth_ice40 -top uart -json uart.json"
-
-bitstream: build/uart.bin
+bitstream: build/uart/uart.bin
+sim: build/uart/sim
+formal: build/uart/formal
 @
 
-== Summary
+=== Hardware testing
+
+==== Hardware Needed
+
+- Lattice iCEstick (iCE40-HX1K, 12 MHz)
+- USB-A extension cable or hub for the iCEstick
+
+==== Test Setup
+
+The on-board FT2232H exposes two interfaces: one for programming
+the FPGA, one for the UART. The UART runs at 115200, 8N1.
+
+==== Manual Test
+
+Program the bitstream and open a 115200/8N1 terminal on the FPGA UART.
+Within `PERIOD_CYCLES` (one second at 12 MHz) the heartbeat should emit
+`Hello from iCEstick` followed by `\r\n`, repeating once per second.
+Type any character into the terminal: the receiver's echo path loops
+the byte back through the shared transmitter so each keystroke prints
+locally. The heartbeat does not interrupt mid-byte; arbitration in
+`uart.v` waits for an in-flight character to finish before pivoting
+the `uart_tx` between sources.
+
+==== Automated Test
+
+The plan resets the FPGA, opens the UART capture, programs the
+bitstream, lets the heartbeat run for two periods so we see the
+banner cleanly, sends a four-byte echo probe, waits for the echo to
+land, and then closes the capture.
+
+<<TEST.md>>=
+```
+fpga:program bin=@uart.bin
+fpga:uart_open
+delay ms=2200
+fpga:uart_write data="x"
+delay ms=300
+fpga:uart_write data="y"
+delay ms=300
+fpga:uart_close
+```
+
+- Check `test_serv` had no errors
+- Check heartbeat banner present
+- Check echo loop returned the probe bytes
+@
+
+The verifier is a thin wrapper: read the captured UART stream, look
+for the heartbeat banner, and confirm the echo probes came back.
+The shared dispatcher in `verify_lib` handles argument parsing,
+sweep mode, and reporting; this file only supplies the per-check
+predicates plus a `DISPATCH` table that maps each bullet from
+`TEST.md` to a callable.
+
+The dispatcher lives in `lib/verify_lib.py` next to the literate
+sources. The path-fixup at the top is the only piece of boilerplate;
+without it, Python cannot find the shared module from a generated
+test directory.
+
+<<verify.py>>=
+import os
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
+import verify_lib as v
+
+<<UART verify constants>>
+<<UART verify helpers>>
+<<UART verify checks>>
+<<UART verify dispatch>>
+
+if __name__ == "__main__":
+    sys.exit(v.main(DISPATCH, sys.argv))
+@
+
+The captured UART bytes land in `streams/fpga.uart.bin` next to the
+verifier's working directory. The heartbeat string is the same
+ASCII block emitted from the message ROM in `uart_hello.v`. Two
+single-byte echo probes (`x` and `y`) are sent by the plan; the
+arbitration in `uart.v` may stall a probe behind an in-flight
+heartbeat byte, so we accept any one of the two coming back as
+proof that the echo path is alive.
+
+<<UART verify constants>>=
+UART_LOG = "streams/fpga.uart.bin"
+BANNER = "Hello from iCEstick"
+ECHO_PROBES = ("x", "y")
+MIN_ECHOES = 1
+@
+
+Every check needs the captured bytes, decoded as ASCII so the
+heartbeat substring matches verbatim. A small dump helper is used
+on failure so the failing log appears in the run output without
+the user having to look at the artefact tar.
+
+<<UART verify helpers>>=
+def _read_uart():
+    with open(UART_LOG, "rb") as f:
+        return f.read().decode("ascii", errors="replace")
+
+
+def _dump_uart():
+    sys.stderr.write("--- uart log ---\n")
+    text = _read_uart()
+    sys.stderr.write(text)
+    if not text.endswith("\n"):
+        sys.stderr.write("\n")
+    sys.stderr.write("--- end uart log ---\n")
+@
+
+The banner check is a literal substring count. `v._set_info` puts
+the hit count on the colored summary line so a passing run still
+shows how many heartbeats fit inside the capture window.
+
+The echo check first strips the heartbeat copies and CR/LF noise
+out of the captured stream so probe bytes are not double-counted
+inside the "Hello from iCEstick" body (which contains an `i`, an
+`l`, and so on). Then it tallies probe occurrences across both
+probes and accepts any single hit.
+
+<<UART verify checks>>=
+def check_banner():
+    text = _read_uart()
+    n = text.count(BANNER)
+    v._set_info(f"{n} banner hits")
+    if n < 1:
+        sys.stderr.write(f"banner {BANNER!r} not in uart log\n")
+        _dump_uart()
+        return False
+    return True
+
+
+def check_echo():
+    text = _read_uart()
+    stripped = text.replace(BANNER, "").replace("\r", "").replace("\n", "")
+    n = sum(stripped.count(p) for p in ECHO_PROBES)
+    v._set_info(f"{n}/{len(ECHO_PROBES)} probes echoed")
+    if n < MIN_ECHOES:
+        sys.stderr.write(
+            f"echoed {n}/{len(ECHO_PROBES)} probes "
+            f"(need >= {MIN_ECHOES})\n")
+        _dump_uart()
+        return False
+    return True
+@
+
+`DISPATCH` keys are the literal bullet strings from `TEST.md`; the
+runtime strips whitespace before matching, but the spelling and
+backticks must agree. The first entry reuses the library's generic
+"no errors" check; the next two bind to the predicates above.
+
+<<UART verify dispatch>>=
+DISPATCH = {
+    "Check `test_serv` had no errors":
+        v.check_no_errors,
+    "Check heartbeat banner present":
+        check_banner,
+    "Check echo loop returned the probe bytes":
+        check_echo,
+}
+@
+
+=== Summary
 
 Three primitives and one demo top. `uart_rx` and `uart_tx` are 8N1
 workhorses; `uart_hello` is a periodic byte source that emits
@@ -1099,7 +1264,13 @@ workhorses; `uart_hello` is a periodic byte source that emits
 drive through a shared transmitter. `uart.v` wires one of each
 together into the iCEstick echo + heartbeat demo.
 
-Verification is split between simulation (round-trip echo of four
-characters plus the 21-byte heartbeat burst) and formal BMC
-(state, counter, bit-index, ready-strobe, and line-level invariants on
-both `uart_rx` and `uart_tx`).
+Verification is split across three layers. Simulation drives a
+round-trip echo of four characters plus the 21-byte heartbeat
+burst against the Verilator-elaborated design. Formal BMC pins
+down state, counter, bit-index, ready-strobe, and line-level
+invariants on both `uart_rx` and `uart_tx`. Hardware testing
+loads the bitstream onto a real iCEstick and runs the same
+heartbeat-and-echo conversation through the FT2232H UART, with
+`TEST.md` and `verify.py` tangling out of this chapter so the
+plan and the per-bullet checks stay in sync with everything
+else described above.
