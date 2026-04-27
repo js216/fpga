@@ -1036,6 +1036,179 @@ sim: build/gpio/sim
 formal: build/gpio/formal
 @
 
+=== Hardware testing
+
+==== Hardware Needed
+
+- Lattice iCEstick (iCE40-HX1K, 12 MHz)
+- USB-A extension cable or hub for the iCEstick
+
+The expansion headers `J1` and `J3` may be left unconnected for this
+test. With nothing wired, the sixteen pins float at the input side of
+the FPGA, so the heartbeat lines in the power-on `gpio_oe = 0` phase
+read whatever the unloaded pins happen to settle to. The drive phase
+of the test enables every pin and overrides this with known values.
+
+==== Test Setup
+
+The on-board FT2232H exposes two interfaces: one for programming
+the FPGA, one for the UART. The UART runs at 115200, 8N1.
+
+==== Manual Test
+
+Program the bitstream and open a 115200/8N1 terminal on the FPGA
+UART. Every 100 ms a four-digit hex line followed by `\r\n` should
+appear. With nothing connected to `J1` and `J3` the digits reflect
+the floating pin state. Type `EFFFF` to enable drive on every bit,
+then `W1234` to drive that 16-bit pattern; the heartbeat lines
+should change to `1234`. `Wabcd` flips the pattern to `abcd`.
+`E0000` releases all sixteen pins back to high-impedance and the
+lines return to whatever the floating pins read.
+
+==== Automated Test
+
+The plan programs the bitstream, opens the UART capture, lets a
+few power-on heartbeats arrive, then drives a sequence of two
+known 16-bit patterns through the `E`/`W` command pair so the
+verifier has concrete oracles for the read-back lines.
+
+<<TEST.md>>=
+```
+fpga:program bin=@gpio.bin
+fpga:uart_open
+delay ms=400
+fpga:uart_write data="EFFFF"
+delay ms=200
+fpga:uart_write data="W1234"
+delay ms=400
+fpga:uart_write data="Wabcd"
+delay ms=400
+fpga:uart_write data="E0000"
+delay ms=200
+fpga:uart_close
+```
+
+- Check `test_serv` had no errors
+- Check heartbeat lines present
+- Check driven pattern 1234 read back
+- Check driven pattern abcd read back
+@
+
+The verifier reads the captured UART stream and looks for two
+things: well-formed heartbeat lines, and the two driven patterns
+in the expected order. The shared dispatcher in `verify_lib`
+handles argument parsing, sweep mode, and reporting; this file
+only supplies the per-check predicates plus a `DISPATCH` table.
+
+<<verify.py>>=
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
+import verify_lib as v
+
+<<GPIO verify constants>>
+<<GPIO verify helpers>>
+<<GPIO verify checks>>
+<<GPIO verify dispatch>>
+
+if __name__ == "__main__":
+    sys.exit(v.main(DISPATCH, sys.argv))
+@
+
+The captured UART bytes land in `streams/fpga.uart.bin`. Each
+heartbeat is four lowercase hex digits followed by CR/LF; a regex
+matches that exact shape so partial bytes from a torn capture do
+not inflate the count. The two driven patterns must appear in
+order, since `W1234` is sent before `Wabcd` and the verifier
+walks the matches forward to confirm both arrived.
+
+<<GPIO verify constants>>=
+UART_LOG = "streams/fpga.uart.bin"
+LINE_RE = re.compile(rb"([0-9a-f]{4})\r\n")
+MIN_HEARTBEATS = 4
+EXPECTED_PATTERNS = (b"1234", b"abcd")
+@
+
+<<GPIO verify helpers>>=
+def _read_uart():
+    with open(UART_LOG, "rb") as f:
+        return f.read()
+
+
+def _dump_uart():
+    sys.stderr.write("--- uart log ---\n")
+    sys.stderr.write(_read_uart().decode("ascii", errors="replace"))
+    sys.stderr.write("\n--- end uart log ---\n")
+
+
+def _matches():
+    return LINE_RE.findall(_read_uart())
+@
+
+The heartbeat check counts well-formed hex lines and demands at
+least `MIN_HEARTBEATS` of them, which the plan's roughly 1.6 s
+capture window comfortably exceeds at the 100 ms tick.
+
+The pattern check walks the line list forward, advancing past
+each expected match in turn so a stray earlier line that happens
+to read the same value does not consume the slot reserved for a
+later pattern. The two checks bind to a small factory so the
+dispatch table can give each pattern its own bullet.
+
+<<GPIO verify checks>>=
+def check_heartbeat():
+    matches = _matches()
+    n = len(matches)
+    v._set_info(f"{n} heartbeat lines")
+    if n < MIN_HEARTBEATS:
+        sys.stderr.write(
+            f"only {n} heartbeat lines (need >= {MIN_HEARTBEATS})\n")
+        _dump_uart()
+        return False
+    return True
+
+
+def _check_pattern_at(idx):
+    def _check():
+        matches = _matches()
+        target = EXPECTED_PATTERNS[idx]
+        seen_prior = set(EXPECTED_PATTERNS[:idx])
+        cursor = 0
+        for prior in EXPECTED_PATTERNS[:idx]:
+            while cursor < len(matches) and matches[cursor] != prior:
+                cursor += 1
+            if cursor < len(matches):
+                cursor += 1
+        for m in matches[cursor:]:
+            if m == target:
+                v._set_info(f"saw {target.decode()}")
+                return True
+        sys.stderr.write(
+            f"pattern {target.decode()!r} not seen "
+            f"after {sorted(seen_prior)}\n")
+        _dump_uart()
+        return False
+    return _check
+@
+
+`DISPATCH` keys are the literal bullet strings from `TEST.md`.
+
+<<GPIO verify dispatch>>=
+DISPATCH = {
+    "Check `test_serv` had no errors":
+        v.check_no_errors,
+    "Check heartbeat lines present":
+        check_heartbeat,
+    "Check driven pattern 1234 read back":
+        _check_pattern_at(0),
+    "Check driven pattern abcd read back":
+        _check_pattern_at(1),
+}
+@
+
 == Summary
 
 One top module, no new UART machinery. The `gpio` top reads all
@@ -1047,14 +1220,18 @@ tri-state drivers map those registers back onto the same `inout`
 bus so the heartbeat line reflects the combined state of internal
 drive and external signals.
 
-Verification is split between simulation and formal BMC. The eight
-testbench phases cover read-through, `E`+`W` drive, release,
+Verification is split across three layers. Simulation drives the
+eight testbench phases (read-through, `E`+`W` drive, release,
 mid-command abort in both `RX_D2` and `RX_D3`, lowercase-hex
 decoding, per-bit tri-state independence via a checkerboard
 output-enable, back-to-back command handoff, and snapshot
-coherence when a commit lands during an in-flight heartbeat.
-Nine formal assertions pin down power-on Hi-Z safety, timer and
+coherence when a commit lands during an in-flight heartbeat).
+Formal BMC pins down power-on Hi-Z safety, timer and
 character-index bounds, the `uart_tx` handshake contract (pulse
 width + `tx_start`/`tx_busy` exclusivity + `tx_data` stability
 across a busy frame), parser FSM monotonicity, and the commit
-discipline for the drive registers.
+discipline for the drive registers. Hardware testing loads the
+bitstream onto a real iCEstick and runs an `E`+`W` command pair
+through the FT2232H UART, with `TEST.md` and `verify.py`
+tangling out of this chapter so the plan and per-bullet checks
+stay in sync with the prose.
