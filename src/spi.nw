@@ -24,16 +24,39 @@ the UPPER. This matches the
 the `qspi` chapter --- byte-swap-on-the-wire is a host-side
 post-process there too.
 
-Reset is asynchronous off `cs_n`: while CS is high (frame idle)
-all sclk-domain state is held cleared, and the falling edge of
-CS releases the reset cleanly before the master's first SCLK
-rise. Mode 0 says SCLK idles low and the slave sets up data on
-each negedge for the master to sample on the following posedge,
-so the very first negedge of the data phase needs valid output
-already in `q`. We get that by precomputing the nibble (or bit)
-on the rising edge that immediately precedes the negedge and
-registering the result one half-cycle later; the rise that
-"completes" byte K-1 primes the negedge that opens byte K.
+Reset is synchronous to `sclk` and gated by `cs_n` as a level
+input. The state registers (`phase`, `data_byte`) sit inside
+`always @(posedge sclk)`, with `if (cs_n)` choosing the clear
+branch and the `else` branch advancing the counter. The output
+presenter `q` is *combinational*: the bit (or nibble) currently
+sitting on the wire is `data_byte[7 - phase]` (or the
+phase-selected nibble), driven directly through the tri-state
+buffer with no `negedge sclk` flop in the path. There is no
+asynchronous reset on `cs_n` anywhere.
+
+The motivating hardware symptom: with the previous structure
+that used `posedge cs_n` as an asynchronous reset, the master
+saw byte 0 = 0x00 (correct for an incrementing pattern that
+starts at 0) but every subsequent byte = 0x00 too --- the
+counter never advanced past zero. The cs_n→FF reset path on
+the iCE40 has enough chip-pin-to-fabric delay that the first
+`posedge sclk` after CS-fall captured `phase` while its
+async-clear input was still asserted, so `phase` stayed at 0
+and the byte-boundary increment never fired. With cs_n used
+purely as a synchronous level reset, the first `posedge sclk`
+inside the frame sees `cs_n=0` directly through the
+combinational reset gate and unambiguously takes the
+counter-advance branch.
+
+The negedge-clocked output register that the previous version
+carried for setup-time relief is gone. With the counter
+clocked on `posedge sclk` and the output a combinational mux
+of that counter, the data the master sees at posedge K is
+`data_byte[7 - phase_pre_edge]`, where `phase_pre_edge` is the
+pre-edge counter value. That is exactly the bit position the
+master is supposed to sample at rise K. Between rises, sclk is
+low, `phase` holds its post-rise value, and the mux output is
+stable for the master's setup window before the next rise.
 
 <<spi.v>>=
 module spi #(
@@ -51,18 +74,17 @@ endmodule
 
 The state lives in the sclk domain. `data_byte` is the running
 pattern counter (advances at byte boundaries) and is shared
-across both LANES variants. The `phase` counter and the output
-register `q` are declared inside the active generate branch so
-each variant carries only the bits it actually uses --- 3 bits
-of phase plus 1 bit of `q` for 1-lane (eight rises per byte,
-MSB-first), and 1 bit of phase plus 4 bits of `q` for 4-lane
+across both LANES variants. The `phase` counter is declared
+inside the active generate branch so each variant carries only
+the bits it actually uses --- 3 bits of phase for 1-lane
+(eight rises per byte, MSB-first), 1 bit of phase for 4-lane
 (two rises per byte, lower nibble first then upper).
 
-The presented output is a `negedge`-clocked register `q`,
-declared inside whichever generate branch is active so the
-4-lane case has a 4-bit register and the 1-lane case has a
-single-bit register --- letting the linter see every bit
-reach a pin.
+There is no `q` register: the lane outputs come from a
+combinational mux of `data_byte` indexed by `phase`, declared
+inside whichever generate branch is active so the 4-lane case
+sees a 4-bit nibble select and the 1-lane case sees a 1-bit
+slice --- letting the linter see every bit reach a pin.
 
 <<SPI streaming: state>>=
 reg [7:0] data_byte;
@@ -71,26 +93,26 @@ initial data_byte = 8'd0;
 
 The posedge process advances `phase` and schedules the
 byte-pattern increment at the rise that closes the current
-byte. The negedge process registers the next slice of
-`data_byte` onto `q`. `cs_n` is the asynchronous reset for
-both. The "`data_byte` increment fires on the rise that ends
-byte K" arrangement lets the negedge process drive byte K+1's
-first slice immediately, without any extra prefetch register:
-the negedge that follows sees the post-increment `data_byte`
-directly.
+byte. `cs_n` is a synchronous level reset: any `posedge sclk`
+taken while `cs_n` is high clears the state, and any taken
+while `cs_n` is low advances it. The combinational output
+mux reads the *post-rise* value of `phase` (since `phase` is
+clocked on the same posedge), which is the pre-edge value
+seen by the master at the *next* rise --- so the mux always
+presents the bit (or nibble) the master is about to sample.
 
-For 4-lane the negedge picks the lower nibble when
-`phase[0] == 0` and the upper nibble when `phase[0] == 1` ---
-matching the STM32MP1 QUADSPI indirect-read assembly of
-`{second_sample, first_sample}`. For 1-lane the negedge picks
+For 4-lane the mux picks the lower nibble when `phase == 0`
+and the upper nibble when `phase == 1` --- matching the
+STM32MP1 QUADSPI indirect-read assembly of
+`{second_sample, first_sample}`. For 1-lane the mux picks
 bit `7 - phase`, MSB-first.
 
 <<SPI streaming: sclk processes>>=
 generate if (LANES == 4) begin : g_quad
    reg       phase;
-   reg [3:0] q;
-   initial begin phase = 1'b0; q = 4'd0; end
-   always @(posedge sclk or posedge cs_n) begin
+   wire [3:0] q = phase ? data_byte[7:4] : data_byte[3:0];
+   initial phase = 1'b0;
+   always @(posedge sclk) begin
       if (cs_n) begin
          data_byte <= 8'd0;
          phase     <= 1'b0;
@@ -99,15 +121,11 @@ generate if (LANES == 4) begin : g_quad
          if (phase) data_byte <= data_byte + 8'd1;
       end
    end
-   always @(negedge sclk or posedge cs_n) begin
-      if (cs_n) q <= 4'd0;
-      else      q <= phase ? data_byte[7:4] : data_byte[3:0];
-   end
 end else begin : g_one
    reg [2:0] phase;
-   reg       q;
-   initial begin phase = 3'd0; q = 1'b0; end
-   always @(posedge sclk or posedge cs_n) begin
+   wire      q = data_byte[7 - phase];
+   initial phase = 3'd0;
+   always @(posedge sclk) begin
       if (cs_n) begin
          data_byte <= 8'd0;
          phase     <= 3'd0;
@@ -115,10 +133,6 @@ end else begin : g_one
          phase <= phase + 3'd1;
          if (phase == 3'd7) data_byte <= data_byte + 8'd1;
       end
-   end
-   always @(negedge sclk or posedge cs_n) begin
-      if (cs_n) q <= 1'b0;
-      else      q <= data_byte[7 - phase];
    end
 end endgenerate
 @
@@ -595,8 +609,12 @@ def check_pattern(mode, presc):
         return False
     fe = int(m.group(4))
     if fe != -1:
-        sys.stderr.write(
-            f"{mode} @ presc={presc}: firsterr={fe} (expected -1)\n")
+        msg = f"{mode} @ presc={presc}: firsterr={fe} (expected -1)"
+        tail = m.string[m.end():m.end() + 256]
+        gm = re.search(rb"got=([0-9a-fA-F ]+?)(?=\r?\n|$)", tail)
+        if gm:
+            msg += f" got={gm.group(1).decode('ascii').strip()}"
+        sys.stderr.write(msg + "\n")
         return False
     return True
 
@@ -618,4 +636,30 @@ DISPATCH = _make_dispatch()
 
 if __name__ == "__main__":
     sys.exit(v.main(DISPATCH, sys.argv))
+@
+
+=== Test runner
+
+`build/spi/Makefile` is the entry point invoked from `cd build/spi
+&& make test`. It re-tangles the plan and the verifier from
+`src/spi.nw` so an edit to this chapter is picked up on the next
+test run, then hands off to the shared `run_md.py` driver pointed at
+by `$TEST_SERV`. The tangle recipes mirror the per-chapter rules in
+the top Makefile but are reachable from inside the build directory
+without invoking the parent.
+
+<<Makefile>>=
+NW := ../../src/spi.nw
+
+.PHONY: all test
+all: TEST.md verify.py
+
+test: all
+	python3 $$TEST_SERV/run_md.py
+
+TEST.md: $(NW)
+	tangle TEST.md < $<
+
+verify.py: $(NW)
+	tangle verify.py < $<
 @

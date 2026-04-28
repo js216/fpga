@@ -9,9 +9,9 @@ module spi #(
    initial data_byte = 8'd0;
    generate if (LANES == 4) begin : g_quad
       reg       phase;
-      reg [3:0] q;
-      initial begin phase = 1'b0; q = 4'd0; end
-      always @(posedge sclk or posedge cs_n) begin
+      wire [3:0] q = phase ? data_byte[7:4] : data_byte[3:0];
+      initial phase = 1'b0;
+      always @(posedge sclk) begin
          if (cs_n) begin
             data_byte <= 8'd0;
             phase     <= 1'b0;
@@ -20,15 +20,11 @@ module spi #(
             if (phase) data_byte <= data_byte + 8'd1;
          end
       end
-      always @(negedge sclk or posedge cs_n) begin
-         if (cs_n) q <= 4'd0;
-         else      q <= phase ? data_byte[7:4] : data_byte[3:0];
-      end
    end else begin : g_one
       reg [2:0] phase;
-      reg       q;
-      initial begin phase = 3'd0; q = 1'b0; end
-      always @(posedge sclk or posedge cs_n) begin
+      wire      q = data_byte[7 - phase];
+      initial phase = 3'd0;
+      always @(posedge sclk) begin
          if (cs_n) begin
             data_byte <= 8'd0;
             phase     <= 3'd0;
@@ -36,10 +32,6 @@ module spi #(
             phase <= phase + 3'd1;
             if (phase == 3'd7) data_byte <= data_byte + 8'd1;
          end
-      end
-      always @(negedge sclk or posedge cs_n) begin
-         if (cs_n) q <= 1'b0;
-         else      q <= data_byte[7 - phase];
       end
    end endgenerate
    wire oe = ~cs_n;
