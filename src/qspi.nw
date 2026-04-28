@@ -2502,6 +2502,32 @@ if __name__ == "__main__":
     sys.exit(v.main(DISPATCH, sys.argv))
 @
 
+==== Test runner
+
+`build/qspi/Makefile` is the entry point invoked from `cd build/qspi
+&& make test`. It re-tangles the plan and the verifier from
+`src/qspi.nw` so an edit to this chapter is picked up on the next
+test run, then hands off to the shared `run_md.py` driver pointed at
+by `$TEST_SERV`. The tangle recipes mirror the per-chapter rules in
+the top Makefile but are reachable from inside the build directory
+without invoking the parent.
+
+<<Makefile>>=
+NW := ../../src/qspi.nw
+
+.PHONY: all test
+all: TEST.md verify.py
+
+test: all
+	python3 $$TEST_SERV/run_md.py
+
+TEST.md: $(NW)
+	tangle TEST.md < $<
+
+verify.py: $(NW)
+	tangle verify.py < $<
+@
+
 === Summary
 
 The chapter's verification stack now mirrors the rest of the

@@ -1125,7 +1125,9 @@ land, and then closes the capture.
 
 <<TEST.md>>=
 ```
+fpga:uart_close
 fpga:program bin=@uart.bin
+delay ms=2000
 fpga:uart_open
 delay ms=2200
 fpga:uart_write data="x"
@@ -1254,6 +1256,32 @@ DISPATCH = {
     "Check echo loop returned the probe bytes":
         check_echo,
 }
+@
+
+==== Test runner
+
+`build/uart/Makefile` is the entry point invoked from `cd build/uart
+&& make test`. It re-tangles the plan and the verifier from
+`src/uart.nw` so an edit to this chapter is picked up on the next
+test run, then hands off to the shared `run_md.py` driver pointed at
+by `$TEST_SERV`. The tangle recipes mirror the per-chapter rules in
+the top Makefile but are reachable from inside the build directory
+without invoking the parent.
+
+<<Makefile>>=
+NW := ../../src/uart.nw
+
+.PHONY: all test
+all: TEST.md verify.py
+
+test: all
+	python3 $$TEST_SERV/run_md.py
+
+TEST.md: $(NW)
+	tangle TEST.md < $<
+
+verify.py: $(NW)
+	tangle verify.py < $<
 @
 
 === Summary

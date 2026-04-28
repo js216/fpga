@@ -60,6 +60,10 @@ build/$(1)/verify.py: src/$(1).nw | build/$(1)
 	@cd build/$(1) && tangle verify.py < ../../$$< 2>/dev/null
 	@touch $$@
 
+build/$(1)/Makefile: src/$(1).nw | build/$(1)
+	@cd build/$(1) && tangle Makefile < ../../$$< 2>/dev/null
+	@touch $$@
+
 build/$(1)/$(1).typ: src/$(1).nw style.typ | build/$(1)
 	cp style.typ $$@
 	weave < $$< >> $$@
@@ -98,6 +102,9 @@ stage: bitstream
 	@mkdir -p $(CURDIR)/build/spi
 	ln -sf $(MP135_QSPI_DIR)/main.stm32 $(CURDIR)/build/spi/main.stm32
 	ln -sf $(MP135_QSPI_SRC)/flash.tsv  $(CURDIR)/build/spi/flash.tsv
+	@mkdir -p $(CURDIR)/build/uart
+	ln -sf $(MP135_QSPI_DIR)/main.stm32 $(CURDIR)/build/uart/main.stm32
+	ln -sf $(MP135_QSPI_SRC)/flash.tsv  $(CURDIR)/build/uart/flash.tsv
 
 .PHONY: stage
 
