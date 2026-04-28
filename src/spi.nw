@@ -1195,6 +1195,139 @@ mp135:uart_close
 
 - Check 1lane MDMA @ presc=203 pattern correct
 
+Phase 1 -- 1-lane MDMA read at presc=63.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 63\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="m 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=10000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane MDMA @ presc=63 pattern correct
+
+Phase 1 -- 1-lane MDMA read at presc=15.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 15\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="m 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=8000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane MDMA @ presc=15 pattern correct
+
+Phase 1 -- 1-lane MDMA read at presc=5.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5 1\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="m 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane MDMA @ presc=5 pattern correct
+
+Phase 1 -- 1-lane MDMA read at presc=4.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 4 1\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="m 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane MDMA @ presc=4 pattern correct
+
+Phase 1 -- 1-lane MDMA read at presc=3.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 3 1\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="m 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane MDMA @ presc=3 pattern correct
+
+Phase 1 -- 1-lane MDMA read at presc=2.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 2\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="m 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane MDMA @ presc=2 pattern correct
+
+Phase 1 -- 1-lane MDMA read at presc=1.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 1\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="m 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane MDMA @ presc=1 pattern correct
+
 Phase 1 -- 1-lane sweep at presc=4.
 
 ```
@@ -1400,10 +1533,12 @@ plus elapsed time, effective Mbps, and a `firsterr=<offset>` field
 that is `-1` only when every byte of the megabyte matched. A bullet
 check passes iff the matching bench line exists and reports
 `firsterr=-1`. The verifier prints the configured SCLK, firmware
-effective Mbps, and test-server wall time between the `bench_start`
-and `bench_done` marks next to each prescaler result. There is no JEDEC
-or flash-protocol surface to assert here --- the slave just streams raw
-bytes, so the firsterr sentinel is the entire correctness contract.
+effective Mbps, test-server wall time between the `bench_start`
+and `bench_done` marks, and a wall-rate computed from requested payload
+bits divided by measured wall time next to each prescaler result. There
+is no JEDEC or flash-protocol surface to assert here --- the slave just
+streams raw bytes, so the firsterr sentinel is the entire correctness
+contract.
 
 <<verify.py>>=
 import os
@@ -1650,21 +1785,38 @@ def _bench_wall_ms():
     return max(0.0, (done - start) * 1000.0)
 
 
+def _wall_rate_mbps(byte_count, wall_ms):
+    if wall_ms is None or wall_ms <= 0.0:
+        return None
+    return byte_count * 8.0 / (wall_ms * 1000.0)
+
+
+def _wall_text(byte_count, wall_ms):
+    if wall_ms is None:
+        return " wall=unknown wall_rate=unknown"
+    rate = _wall_rate_mbps(byte_count, wall_ms)
+    if rate is None:
+        return f" wall={wall_ms:.0f}ms wall_rate=unknown"
+    return f" wall={wall_ms:.0f}ms wall_rate={rate:.3f}Mbps"
+
+
 def _bench_rate_text(mode, presc, match):
+    byte_count = int(match.group(1))
     ms = int(match.group(4))
     mbps = match.group(5).decode("ascii")
     wall_ms = _bench_wall_ms()
-    wall = f" wall={wall_ms:.0f}ms" if wall_ms is not None else " wall=unknown"
+    wall = _wall_text(byte_count, wall_ms)
     return (f"{mode} @ presc={presc} "
             f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
             f"bench={ms}ms{wall}")
 
 
 def _mdma_rate_text(mode, presc, match):
+    byte_count = int(match.group(1))
     ms = int(match.group(3))
     mbps = match.group(4).decode("ascii")
     wall_ms = _bench_wall_ms()
-    wall = f" wall={wall_ms:.0f}ms" if wall_ms is not None else " wall=unknown"
+    wall = _wall_text(byte_count, wall_ms)
     return (f"{mode} MDMA @ presc={presc} "
             f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
             f"bench={ms}ms{wall}")
@@ -1732,6 +1884,9 @@ def _make_dispatch():
         lambda: check_raw_read_pattern("1lane", 512))
     out["Check 1lane MDMA @ presc=203 pattern correct"] = (
         lambda: check_mdma_pattern("1lane", 203))
+    for p in [63, 15, 5, 4, 3, 2, 1]:
+        key = f"Check 1lane MDMA @ presc={p} pattern correct"
+        out[key] = (lambda pr=p: check_mdma_pattern("1lane", pr))
     out["Check quad bit-bang read returns incrementing pattern"] = (
         lambda: check_bitbang_pattern("quad"))
     out["Check FPGA UART debug reports first 32 SCLK edges"] = (
