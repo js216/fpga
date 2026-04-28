@@ -257,16 +257,17 @@ module qspi (
    reg [1:0] cs_sync;
    initial cs_sync = 2'b11;
    always @(posedge clk) cs_sync <= {cs_sync[0], cs_n};
-   reg cs_async_rst;
-   initial cs_async_rst = 1'b1;
-   always @(posedge clk) cs_async_rst <= cs_n;
    wire cs_s     = cs_sync[1];
    reg  cs_s_d;
    initial cs_s_d = 1'b1;
    always @(posedge clk) cs_s_d <= cs_s;
    wire cs_rise_pulse = !cs_s_d && cs_s;
+   
+   reg cs_async_rst;
+   initial cs_async_rst = 1'b1;
+   always @(posedge clk) cs_async_rst <= cs_s_d;
    always @(posedge clk) begin
-      if (cs_rise_pulse) begin
+      if (frame_done) begin
          if (snap_op == 8'h06 && snap_byte_cnt == 8'd1)
             wel <= 1'b1;
          else if (snap_op == 8'h04 && snap_byte_cnt == 8'd1)
@@ -289,10 +290,12 @@ module qspi (
       frame_crc_raw  = 32'hFFFFFFFF;
    end
    
-   always @(posedge cs_async_rst) begin
-      frame_op      <= opcode;
-      frame_cnt     <= frame_cnt_pre[7:0];
-      frame_crc_raw <= crc_reg;
+   always @(posedge clk) begin
+      if (cs_rise_pulse) begin
+         frame_op      <= opcode;
+         frame_cnt     <= frame_cnt_pre[7:0];
+         frame_crc_raw <= crc_reg;
+      end
    end
    wire [31:0] frame_crc = frame_crc_raw ^ 32'hFFFFFFFF;
    reg         frame_done;

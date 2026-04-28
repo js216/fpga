@@ -62,10 +62,12 @@ The clock-domain partition:
   `addr_low`, RAM writes, CRC, `qin_phase`, `nibble_buf`,
   `quad_in_cnt`) is clocked on `posedge sclk` with `cs_async_rst`
   as an asynchronous clear so the first frame after CS-fall starts
-  cleanly. `cs_async_rst` is `cs_n` reclocked once in the fclk
-  domain; this keeps `cs_n` itself off any async-edge sensitivity
-  list so its sync usage in the cs_sync chain does not collide
-  with its reset role.
+  cleanly. `cs_async_rst` is taken from the *output* of `cs_s_d`
+  (the second-stage delayed mirror of `cs_s`), not directly from
+  `cs_n`. This keeps the asynchronous clear strictly later than
+  the synchronous snapshot trigger (`cs_rise_pulse`, which fires
+  one fclk earlier), so the snapshot always captures the
+  pre-clear value of the source registers.
 - All slave-driven outputs (`shift_out` shift-register tap into
   `miso_out`, `quad_out`) are clocked on `negedge sclk` so data is
   stable on the wire before the master's next rising-edge sample
@@ -78,15 +80,16 @@ The clock-domain partition:
   carry is not written into any storage --- the printer's
   per-frame log line is the observable outcome.
 - WEL update happens in the fclk domain on the cs-rise pulse.
-- Two CDC points feed the fclk domain: `cs_n` is two-flop
-  synchronised into `cs_sync` (rising edge produces the
-  `cs_rise_pulse` consumed by the WEL update and the UART printer
-  FSM) and one-flop reclocked into `cs_async_rst` (the dedicated
-  async-reset network for the sclk domain). By the time
-  `cs_rise_pulse` fires, the sclk-domain registers have been
-  quiescent for at least one fclk cycle (no more sclk edges will
-  arrive until the next CS-fall), so `frame_op` / `frame_cnt` /
-  `frame_crc` snapshot reads are safe.
+- Two fclk-domain consumers tap the `cs_sync` chain: the
+  `cs_rise_pulse` (consumed by the WEL update and the UART printer
+  FSM) and the `cs_async_rst` async-reset for the sclk domain,
+  which is one further fclk-flop downstream of `cs_s`. By the
+  time `cs_rise_pulse` fires, the sclk-domain registers have
+  been quiescent for at least one fclk cycle (no more sclk edges
+  arrive until the next CS-fall), and the snapshot block has had
+  one fclk cycle to copy their values into the fclk-domain
+  `frame_op` / `frame_cnt` / `frame_crc_raw` registers before
+  `cs_async_rst` rises and clears the source flops.
 
 @
 
@@ -554,19 +557,20 @@ end
 reg [1:0] cs_sync;
 initial cs_sync = 2'b11;
 always @(posedge clk) cs_sync <= {cs_sync[0], cs_n};
-reg cs_async_rst;
-initial cs_async_rst = 1'b1;
-always @(posedge clk) cs_async_rst <= cs_n;
 wire cs_s     = cs_sync[1];
 reg  cs_s_d;
 initial cs_s_d = 1'b1;
 always @(posedge clk) cs_s_d <= cs_s;
 wire cs_rise_pulse = !cs_s_d && cs_s;
+
+reg cs_async_rst;
+initial cs_async_rst = 1'b1;
+always @(posedge clk) cs_async_rst <= cs_s_d;
 @
 
 <<SPI: WEL update>>=
 always @(posedge clk) begin
-   if (cs_rise_pulse) begin
+   if (frame_done) begin
       if (snap_op == 8'h06 && snap_byte_cnt == 8'd1)
          wel <= 1'b1;
       else if (snap_op == 8'h04 && snap_byte_cnt == 8'd1)
@@ -942,12 +946,28 @@ wire [7:0]  frame_cnt_pre        = frame_cnt_pre_full[7:0];
 wire [7:0]  unused_frame_cnt_hi  = frame_cnt_pre_full[15:8];
 @
 
-The snapshot uses `cs_async_rst` as the clock --- the same edge
-that asynchronously clears the sclk-domain source flops. Capture
-flops sample the pre-edge values of `opcode`, `frame_cnt_pre`,
-and `crc_reg`. Non-blocking semantics guarantee the RHS is
-sampled before the reset propagates, so the snapshot holds the
-end-of-frame state until the next CS rise.
+The snapshot is clocked synchronously by `clk` and fires on the
+`cs_rise_pulse` --- the fclk-domain rising-edge detector for
+`cs_s`. The CDC chain has been arranged so `cs_async_rst` lags
+`cs_s_d` by one fclk: when `cs_rise_pulse` is asserted (the
+fclk window between `cs_s` rising and `cs_s_d` catching up),
+the upcoming fclk edge both snapshots the source registers
+*and* loads `cs_async_rst <= cs_s_d`. But because that load is
+sampling the pre-edge `cs_s_d = 0`, the asynchronous clear of
+the source flops does not fire on the snapshot edge; it fires
+one fclk later. The snapshot therefore observes the source
+flops in their post-frame state, before any clear propagates.
+
+The earlier formulation used `always @(posedge cs_async_rst)` and
+relied on Verilog non-blocking semantics to sample the source
+registers "before" the asynchronous clear propagated. In silicon
+the snapshot register and the async-clear inputs of the source
+flops both observed the same `cs_async_rst` edge, racing each
+other through whichever global network nextpnr picked for the
+signal; depending on routing skew the snapshot captured the
+post-clear (zero) value, leaving `frame_op` permanently 0 and
+no useful printer output ever reached the UART pin. The
+synchronous formulation below removes that race.
 
 <<SPI: end-of-frame snapshot>>=
 reg [7:0]  frame_op;
@@ -959,10 +979,12 @@ initial begin
    frame_crc_raw  = 32'hFFFFFFFF;
 end
 
-always @(posedge cs_async_rst) begin
-   frame_op      <= opcode;
-   frame_cnt     <= frame_cnt_pre[7:0];
-   frame_crc_raw <= crc_reg;
+always @(posedge clk) begin
+   if (cs_rise_pulse) begin
+      frame_op      <= opcode;
+      frame_cnt     <= frame_cnt_pre[7:0];
+      frame_crc_raw <= crc_reg;
+   end
 end
 @
 
