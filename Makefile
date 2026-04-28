@@ -90,10 +90,14 @@ $(foreach c,$(CHAPTERS),$(eval $(call CHAP_RULES,$(c))))
 # side's `clean` was invoked.
 
 MP135_QSPI_DIR := /home/claude/stm32mp135_test_board/baremetal/qspi/build
+MP135_QSPI_SRC := /home/claude/stm32mp135_test_board/baremetal/qspi
 
 stage: bitstream
 	@mkdir -p $(MP135_QSPI_DIR)
 	ln -sf $(CURDIR)/build/qspi/qspi.bin $(MP135_QSPI_DIR)/qspi.bin
+	@mkdir -p $(CURDIR)/build/spi
+	ln -sf $(MP135_QSPI_DIR)/main.stm32 $(CURDIR)/build/spi/main.stm32
+	ln -sf $(MP135_QSPI_SRC)/flash.tsv  $(CURDIR)/build/spi/flash.tsv
 
 .PHONY: stage
 
