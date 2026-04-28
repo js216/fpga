@@ -1764,9 +1764,11 @@ without invoking the parent.
 
 <<Makefile>>=
 NW := ../../src/spi.nw
+MP135_QSPI_DIR := /home/claude/stm32mp135_test_board/baremetal/qspi/build
+MP135_QSPI_SRC := /home/claude/stm32mp135_test_board/baremetal/qspi
 
 .PHONY: all test bitstreams
-all: TEST.md verify.py
+all: TEST.md verify.py flash.tsv main.stm32
 
 test: all bitstreams
 	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi --log run_md.log
@@ -1779,4 +1781,10 @@ TEST.md: $(NW)
 
 verify.py: $(NW)
 	tangle verify.py < $<
+
+flash.tsv:
+	ln -sf $(MP135_QSPI_SRC)/flash.tsv $@
+
+main.stm32:
+	ln -sf $(MP135_QSPI_DIR)/main.stm32 $@
 @
