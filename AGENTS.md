@@ -3,6 +3,12 @@
 Loop: identify failing hardware test → fix qspi.nw → upload → verify → commit →
 next.
 
+## Hardware test rig reset
+
+/loop 30m Hardware rig is down. Submit the FPGA `uart_echo` to reset rig, as
+follows: cd build/uart && make test. (If makefile missing in build/uart, tangle
+it from uart.nw.)
+
 ## Roles
 
 **Orchestrator**
@@ -33,6 +39,6 @@ next.
 
 - Read-only: `~/stm32mp135_test_board/` (other agent owns).
 - Zero `-Wno-*`, `verilator lint_off`, `(* keep *)`, `#[allow]`. Root-cause
-  warnings.
+  warnings. (See CLAUDE.md for details.)
 - Tangled `.v` / `.sv` are tracked — commit with the `.nw`.
 - No SPDX header on `.nw` / `.v` / `.sv` (only `.rs`).

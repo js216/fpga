@@ -54,7 +54,8 @@ example:
 - **blinky**: Parameterized LED blinker (hardware bring-up)
 - **uart**: 8N1 UART receiver, transmitter, and iCEstick echo demo
 - **gpio**: Verify and emit signals on GPIO pins
-- **qspi**: Emulate a QSPI flash interface
+- **spi**: Emulate a simple SPI and QSPI slave
+- **qspi**: Emulate a JEDEC QSPI flash interface
 - **cordic**: CORDIC sine/cosine generator
 
 ### Author
