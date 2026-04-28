@@ -1093,8 +1093,9 @@ sentinel is `firsterr` --- it appears in the bench summary line
 only after the whole megabyte has been validated against the
 incrementing pattern.
 
-The prescaler sweep covers 203 (~3.25 MHz wire), 63 (~10 MHz),
-15 (~41.5 MHz), 5 (~83 MHz), 2 (~166 MHz), and 1 (~332 MHz);
+The prescaler sweep covers 203 (~1.63 MHz wire), 63 (~5.19 MHz),
+15 (~20.75 MHz), 5 (~55.3 MHz), 4 (~66.4 MHz), 3 (~83 MHz),
+2 (~110.7 MHz), and 1 (~166 MHz);
 timeouts shrink with prescaler since the bench finishes faster
 at higher SCLK.
 
@@ -1166,6 +1167,40 @@ mp135:uart_close
 ```
 
 - Check 1lane @ presc=5 pattern correct
+
+Phase 1 -- 1-lane sweep at presc=4.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 4 1\r"
+delay ms=100
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mp135:uart_close
+```
+
+- Check 1lane @ presc=4 pattern correct
+
+Phase 1 -- 1-lane sweep at presc=3.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 3 1\r"
+delay ms=100
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mp135:uart_close
+```
+
+- Check 1lane @ presc=3 pattern correct
 
 Phase 1 -- 1-lane sweep at presc=2.
 
@@ -1548,7 +1583,7 @@ def check_pattern(mode, presc):
 def _make_dispatch():
     """Generate one DISPATCH entry per (mode, presc) pair declared in
     the hardware test plan. Keys exactly match the TEST.md bullets."""
-    presc_steps = [203, 63, 15, 5, 2, 1]
+    presc_steps = [203, 63, 15, 5, 4, 3, 2, 1]
     out = {}
     out["Check SPI header wiring via GPIO preflight"] = check_gpio_wiring
     out["Check 1lane bit-bang read returns incrementing pattern"] = (
