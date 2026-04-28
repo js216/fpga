@@ -1110,8 +1110,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 203\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=15000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1127,8 +1129,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 63\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=10000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1144,8 +1148,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 15\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=8000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1161,8 +1167,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 5 1\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1178,8 +1186,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 4 1\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1195,8 +1205,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 3 1\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1212,8 +1224,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 2\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1229,8 +1243,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 1\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1247,8 +1263,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 203\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=15000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1265,8 +1283,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 63\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=8000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1283,8 +1303,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 15\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1301,8 +1323,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 5\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1319,8 +1343,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 2\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1337,8 +1363,10 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 1\r"
 delay ms=100
+mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mark tag=bench_done
 mp135:uart_close
 ```
 
@@ -1349,12 +1377,14 @@ The verifier walks the captured MP135 UART stream
 (`streams/mp135.uart.bin`) for the bench summary line that the
 firmware prints once the streaming read has been validated against
 the incrementing pattern. The line carries `<mode> @ presc=<N>`
-plus a `firsterr=<offset>` field that is `-1` only when every byte
-of the megabyte matched. A bullet check passes iff the matching
-bench line exists and reports `firsterr=-1`. There is no JEDEC or
-flash-protocol surface to assert here --- the slave just streams
-raw bytes, so the firsterr sentinel is the entire correctness
-contract.
+plus elapsed time, effective Mbps, and a `firsterr=<offset>` field
+that is `-1` only when every byte of the megabyte matched. A bullet
+check passes iff the matching bench line exists and reports
+`firsterr=-1`. The verifier prints the configured SCLK, firmware
+effective Mbps, and test-server wall time between the `bench_start`
+and `bench_done` marks next to each prescaler result. There is no JEDEC
+or flash-protocol surface to assert here --- the slave just streams raw
+bytes, so the firsterr sentinel is the entire correctness contract.
 
 <<verify.py>>=
 import os
@@ -1368,10 +1398,12 @@ import verify_lib as v
 
 UART = "streams/mp135.uart.bin"
 FPGA_UART = "streams/fpga.uart.bin"
+TIMELINE = "timeline.log"
+QSPI_KER_HZ = 332_000_000
 
 BENCH_RE = re.compile(
     rb"bench\s+(\d+)\s+B\s+(1lane|quad)\s+@\s+presc=(\d+)\s+in\s+"
-    rb"\d+\s+ms,\s+\d+\.\d+\s+Mbps,\s+crc32=[0-9a-f]+,\s+"
+    rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=[0-9a-f]+,\s+"
     rb"firsterr=(-?\d+)")
 DEBUG_RE = re.compile(rb"SPI E=([0-9a-f]{4}) S=([0-9a-f]{8})")
 HEXLINE_RE = re.compile(rb"[0-9a-f]{8}:(?:\s+[0-9a-f]{2}){1,16}")
@@ -1394,6 +1426,14 @@ def _read_fpga_uart():
         sys.stderr.write(f"{FPGA_UART} missing\n")
         return None
     with open(FPGA_UART, "rb") as f:
+        return f.read()
+
+
+def _read_timeline():
+    if not os.path.isfile(TIMELINE):
+        sys.stderr.write(f"{TIMELINE} missing\n")
+        return None
+    with open(TIMELINE, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
 
@@ -1555,6 +1595,37 @@ def _bench_pick(mode, presc):
     return last
 
 
+def _sclk_mhz(presc):
+    return QSPI_KER_HZ / (presc + 1) / 1_000_000
+
+
+def _mark_time(text, tag):
+    m = re.search(r"^\s*(\d+\.\d+)\s+MARK\s+ctrl\s+" + re.escape(tag) + r"\s*$",
+                  text, flags=re.MULTILINE)
+    return float(m.group(1)) if m else None
+
+
+def _bench_wall_ms():
+    text = _read_timeline()
+    if text is None:
+        return None
+    start = _mark_time(text, "bench_start")
+    done = _mark_time(text, "bench_done")
+    if start is None or done is None:
+        return None
+    return max(0.0, (done - start) * 1000.0)
+
+
+def _bench_rate_text(mode, presc, match):
+    ms = int(match.group(4))
+    mbps = match.group(5).decode("ascii")
+    wall_ms = _bench_wall_ms()
+    wall = f" wall={wall_ms:.0f}ms" if wall_ms is not None else " wall=unknown"
+    return (f"{mode} @ presc={presc} "
+            f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
+            f"bench={ms}ms{wall}")
+
+
 def check_pattern(mode, presc):
     if not v.check_no_errors():
         return False
@@ -1568,15 +1639,17 @@ def check_pattern(mode, presc):
             sys.stderr.write(raw[-512:].decode("ascii", "replace"))
             sys.stderr.write("\n")
         return False
-    fe = int(m.group(4))
+    fe = int(m.group(6))
+    rate = _bench_rate_text(mode, presc, m)
     if fe != -1:
-        msg = f"{mode} @ presc={presc}: firsterr={fe} (expected -1)"
+        msg = f"{rate}: firsterr={fe} (expected -1)"
         tail = m.string[m.end():m.end() + 256]
         gm = re.search(rb"got=([0-9a-fA-F ]+?)(?=\r?\n|$)", tail)
         if gm:
             msg += f" got={gm.group(1).decode('ascii').strip()}"
         sys.stderr.write(msg + "\n")
         return False
+    sys.stdout.write(rate + "\n")
     return True
 
 
