@@ -15,6 +15,7 @@ module qspi (
    reg [19:0] quad_in_cnt;
    reg [3:0]  nibble_buf;
    reg        qin_phase;
+   reg [6:0]  sfdp_idx;
    
    initial begin
       bit_cnt     = 0;
@@ -27,6 +28,7 @@ module qspi (
       quad_in_cnt = 0;
       nibble_buf  = 0;
       qin_phase   = 0;
+      sfdp_idx    = 0;
    end
    wire [7:0] byte_captured = {shift_in[6:0], io_d_in[0]};
    wire [3:0] new_low       = byte_captured[3:0];
@@ -44,6 +46,7 @@ module qspi (
          qin_phase   <= 0;
          quad_in_cnt <= 0;
          nibble_buf  <= 0;
+         sfdp_idx    <= 0;
       end else begin
          shift_in <= {shift_in[5:0], io_d_in[0]};
          bit_cnt  <= bit_cnt + 3'd1;
@@ -91,6 +94,14 @@ module qspi (
                addr_low <= new_low;
             end else if (opcode == 8'h6B && phase_cnt == 3'd3) begin
                addr_low <= new_low;
+            end else if (opcode == 8'h5A && phase_cnt == 3'd3) begin
+               sfdp_idx <= byte_captured[6:0];
+            end else if (opcode == 8'h5A && phase_cnt == 3'd4) begin
+               shift_out <= sfdp_rd;
+               sfdp_idx  <= sfdp_idx + 7'd1;
+            end else if (opcode == 8'h5A && phase_cnt > 3'd4) begin
+               shift_out <= sfdp_rd;
+               sfdp_idx  <= sfdp_idx + 7'd1;
             end
          end
       end
@@ -115,6 +126,48 @@ module qspi (
                            ? new_low
                            : addr_low);
    wire [7:0] ram_rd = ram[ram_raddr];
+   reg [7:0] sfdp_rom [0:127];
+   integer   _sfdp_i;
+   initial begin
+      for (_sfdp_i = 0; _sfdp_i < 128; _sfdp_i = _sfdp_i + 1)
+         sfdp_rom[_sfdp_i] = 8'hFF;
+   
+      sfdp_rom[7'h00] = 8'h53;
+      sfdp_rom[7'h01] = 8'h46;
+      sfdp_rom[7'h02] = 8'h44;
+      sfdp_rom[7'h03] = 8'h50;
+      sfdp_rom[7'h04] = 8'h06;
+      sfdp_rom[7'h05] = 8'h01;
+      sfdp_rom[7'h06] = 8'h00;
+      sfdp_rom[7'h07] = 8'hFF;
+   
+      sfdp_rom[7'h08] = 8'h00;
+      sfdp_rom[7'h09] = 8'h06;
+      sfdp_rom[7'h0A] = 8'h01;
+      sfdp_rom[7'h0B] = 8'h10;
+      sfdp_rom[7'h0C] = 8'h30;
+      sfdp_rom[7'h0D] = 8'h00;
+      sfdp_rom[7'h0E] = 8'h00;
+      sfdp_rom[7'h0F] = 8'hFF;
+   
+      sfdp_rom[7'h30] = 8'hFD;
+      sfdp_rom[7'h31] = 8'h20;
+      sfdp_rom[7'h32] = 8'hC0;
+      sfdp_rom[7'h33] = 8'hFF;
+   
+      sfdp_rom[7'h34] = 8'hFF;
+      sfdp_rom[7'h35] = 8'hFF;
+      sfdp_rom[7'h36] = 8'h7F;
+      sfdp_rom[7'h37] = 8'h00;
+   
+      sfdp_rom[7'h50] = 8'h0C;
+      sfdp_rom[7'h51] = 8'h20;
+      sfdp_rom[7'h52] = 8'h10;
+      sfdp_rom[7'h53] = 8'hD8;
+   
+      sfdp_rom[7'h6A] = 8'h8F;
+   end
+   wire [7:0] sfdp_rd = sfdp_rom[sfdp_idx];
    reg [3:0] quad_out;
    reg       quad_phase;
    reg [3:0] data_ptr;
@@ -170,7 +223,8 @@ module qspi (
                    && ( ((opcode == 8'h9F) && (phase_cnt >= 3'd1) && (phase_cnt <= 3'd3))
                      || ((opcode == 8'h05) && (phase_cnt == 3'd1))
                      || ((opcode == 8'h03) && (phase_cnt >= 3'd4))
-                     || ((opcode == 8'h0B) && (phase_cnt >= 3'd5)) );
+                     || ((opcode == 8'h0B) && (phase_cnt >= 3'd5))
+                     || ((opcode == 8'h5A) && (phase_cnt >= 3'd5)) );
    wire quad_data_drive = (!cs_n) && quad_data;
    wire io_oe_0    = quad_data_drive;
    wire io_oe_1    = quad_data_drive | resp_window;
@@ -205,6 +259,7 @@ module qspi (
         (opcode == 8'h9F || opcode == 8'h05)              ? 1'b0 :
         (opcode == 8'h03)                                 ? (phase_cnt <= 3'd3) :
         (opcode == 8'h0B)                                 ? (phase_cnt <= 3'd3) :
+        (opcode == 8'h5A)                                 ? (phase_cnt <= 3'd3) :
         (opcode == 8'h6B)                                 ? (phase_cnt <= 3'd3) :
         (opcode == 8'h32)                                 ? (phase_cnt <= 3'd3) :
                                                             1'b1;

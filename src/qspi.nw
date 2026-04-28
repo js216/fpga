@@ -2,8 +2,9 @@
 
 Four-wire SPI slave in mode 0 with a small opcode set --- JEDEC ID
 (0x9F), RDSR (0x05), Normal Read (0x03), Fast Read (0x0B), Write
-Enable (0x06), Page Program (0x02), and Quad Output Read (0x6B) ---
-backed by a 16-byte page buffer. At the end of every frame (CS
+Enable (0x06), Page Program (0x02), Quad Output Read (0x6B), and
+SFDP Read (0x5A) --- backed by a 16-byte page buffer plus a
+128-byte SFDP parameter ROM. At the end of every frame (CS
 rising edge) the module prints one UART line
 `op=<hh> bytes=<K> mosi_crc=<8hex>\r\n` through the reused `uart_tx`
 from the UART chapter.
@@ -82,6 +83,7 @@ RAM-port wiring.
 <<SPI: shift engine sclk process>>
 <<SPI: shift engine WEL synchroniser>>
 <<SPI: shift engine RAM ports>>
+<<SPI: SFDP ROM>>
 @
 
 The capture state is split between a wide `byte_cnt` that the
@@ -106,6 +108,7 @@ reg [3:0]  addr_low;
 reg [19:0] quad_in_cnt;
 reg [3:0]  nibble_buf;
 reg        qin_phase;
+reg [6:0]  sfdp_idx;
 
 initial begin
    bit_cnt     = 0;
@@ -118,6 +121,7 @@ initial begin
    quad_in_cnt = 0;
    nibble_buf  = 0;
    qin_phase   = 0;
+   sfdp_idx    = 0;
 end
 @
 
@@ -169,6 +173,7 @@ addr_low    <= 0;
 qin_phase   <= 0;
 quad_in_cnt <= 0;
 nibble_buf  <= 0;
+sfdp_idx    <= 0;
 @
 
 The single-lane MOSI bit arrives on `io[0]`. We append it to the
@@ -242,7 +247,13 @@ Read (same pattern with the extra dummy byte); 0x02 Page Program
 (latch address, increment under WEL gating); 0x32 Quad Page
 Program (only the address latch lives here; the data-phase
 write is the quad-input chunk above); 0x6B Quad Output Read
-(latch address; the data presenter is the quad-output engine).
+(latch address; the data presenter is the quad-output engine);
+and 0x5A SFDP Read (latch the low 7 bits of the 24-bit address
+into `sfdp_idx` on byte 3, then on byte 4 onwards present
+`sfdp_rom[sfdp_idx]` as the next response byte and post-increment
+`sfdp_idx` so the catch-all arm streams the table out
+sequentially; bytes 4 and >4 mirror the 0x0B fast-read cadence
+because the dummy byte advances the same way).
 
 <<SPI: byte boundary opcode dispatch>>=
 if (phase_cnt == 3'd0) begin
@@ -275,6 +286,14 @@ end else if (opcode == 8'h32 && phase_cnt == 3'd3) begin
    addr_low <= new_low;
 end else if (opcode == 8'h6B && phase_cnt == 3'd3) begin
    addr_low <= new_low;
+end else if (opcode == 8'h5A && phase_cnt == 3'd3) begin
+   sfdp_idx <= byte_captured[6:0];
+end else if (opcode == 8'h5A && phase_cnt == 3'd4) begin
+   shift_out <= sfdp_rd;
+   sfdp_idx  <= sfdp_idx + 7'd1;
+end else if (opcode == 8'h5A && phase_cnt > 3'd4) begin
+   shift_out <= sfdp_rd;
+   sfdp_idx  <= sfdp_idx + 7'd1;
 end
 @
 
@@ -318,6 +337,98 @@ wire [3:0] ram_raddr = quad_data
                         ? new_low
                         : addr_low);
 wire [7:0] ram_rd = ram[ram_raddr];
+@
+
+The 128-byte SFDP (Serial Flash Discoverable Parameters, JESD216)
+ROM answers the 0x5A opcode. The Linux m25p80 driver issues 0x5A
+to confirm the device's published capabilities --- erase opcode,
+density, fast-read modes --- before exposing the flash to the
+filesystem layer. The ROM has three regions: an 8-byte SFDP
+header at offset 0x00, a single 8-byte parameter header (BFPT,
+Basic Flash Parameter Table) at offset 0x08, and the BFPT itself
+at offset 0x30. Bytes between are 0xFF padding (matching erased
+flash). The 7-bit `sfdp_idx` indexes the table; addresses above
+0x7F wrap because the verifier reads from offsets 0x000, 0x100,
+0x200, 0x300 and picks whichever 256-byte slice carries the
+`SFDP` signature, so wrap is acceptable for the high-offset
+reads as long as offset 0x000 returns the correct table.
+
+The header at 0x00..0x07 is the JESD216 magic `'S','F','D','P'`,
+SFDP minor/major rev (0x06/0x01 = JESD216B), NPH (0 = one
+parameter header follows), and one 0xFF reserved byte.
+
+The parameter header at 0x08..0x0F identifies its parameter
+table as JEDEC BFPT by ID = 0x0000 (split across the LSB at
+0x08 and the MSB at 0x0F per JESD216). Length = 16 dwords
+satisfies the m25p80 sanity check that BFPT is large enough to
+hold the QER (Quad Enable Requirements) field at dword 15. The
+24-bit BFPT pointer is 0x000030 (LSB-first across bytes 0x0C-0x0E).
+
+The BFPT at 0x30..0x6F is little-endian 32-bit dwords. DW1
+(0x30..0x33) encodes erase support: bits[1:0]=01 (4 KB erase
+supported), bits[15:8]=0x20 (4 KB erase opcode), bit 22 set
+(1-1-4 fast read supported), with reserved-1 bits filled. DW2
+(0x34..0x37) is the density field; per JESD216 with MSB=0 the
+encoding is N+1 bits, so `N = 0x007FFFFF = 8388607` advertises
+8 Mbit (= 1 MB), matching the JEDEC-ID continuation 0x14
+(2^20 bytes). DW9 (0x50..0x53) lists sector erase types: type
+1 is 4 KB at opcode 0x20, type 2 is 64 KB at opcode 0xD8.
+DW15 (0x68..0x6B) carries the QER (Quad Enable Requirements)
+field in bits[22:20]. We declare QER = 0 (no QE bit, Micron-
+style) since this emulator never enters quad mode; byte 0x6A
+must therefore present bits[6:4] = 000 with the surrounding
+reserved bits left as 1, giving 0x8F. Without this the m25p80
+driver reads QER = 7 from the all-ones padding and rejects the
+device. All other unused dwords are 0xFF (reserved).
+
+The ROM uses an `initial begin` block: explicit byte
+assignments for the meaningful header/BFPT bytes, and `for`
+loops for the 0xFF-fill regions. yosys infers this as
+distributed LUT RAM because the read port is asynchronous.
+
+<<SPI: SFDP ROM>>=
+reg [7:0] sfdp_rom [0:127];
+integer   _sfdp_i;
+initial begin
+   for (_sfdp_i = 0; _sfdp_i < 128; _sfdp_i = _sfdp_i + 1)
+      sfdp_rom[_sfdp_i] = 8'hFF;
+
+   sfdp_rom[7'h00] = 8'h53;
+   sfdp_rom[7'h01] = 8'h46;
+   sfdp_rom[7'h02] = 8'h44;
+   sfdp_rom[7'h03] = 8'h50;
+   sfdp_rom[7'h04] = 8'h06;
+   sfdp_rom[7'h05] = 8'h01;
+   sfdp_rom[7'h06] = 8'h00;
+   sfdp_rom[7'h07] = 8'hFF;
+
+   sfdp_rom[7'h08] = 8'h00;
+   sfdp_rom[7'h09] = 8'h06;
+   sfdp_rom[7'h0A] = 8'h01;
+   sfdp_rom[7'h0B] = 8'h10;
+   sfdp_rom[7'h0C] = 8'h30;
+   sfdp_rom[7'h0D] = 8'h00;
+   sfdp_rom[7'h0E] = 8'h00;
+   sfdp_rom[7'h0F] = 8'hFF;
+
+   sfdp_rom[7'h30] = 8'hFD;
+   sfdp_rom[7'h31] = 8'h20;
+   sfdp_rom[7'h32] = 8'hC0;
+   sfdp_rom[7'h33] = 8'hFF;
+
+   sfdp_rom[7'h34] = 8'hFF;
+   sfdp_rom[7'h35] = 8'hFF;
+   sfdp_rom[7'h36] = 8'h7F;
+   sfdp_rom[7'h37] = 8'h00;
+
+   sfdp_rom[7'h50] = 8'h0C;
+   sfdp_rom[7'h51] = 8'h20;
+   sfdp_rom[7'h52] = 8'h10;
+   sfdp_rom[7'h53] = 8'hD8;
+
+   sfdp_rom[7'h6A] = 8'h8F;
+end
+wire [7:0] sfdp_rd = sfdp_rom[sfdp_idx];
 @
 
 MISO output is the high bit of `shift_out` driven combinationally
@@ -570,7 +681,8 @@ wire resp_window = (!cs_n)
                 && ( ((opcode == 8'h9F) && (phase_cnt >= 3'd1) && (phase_cnt <= 3'd3))
                   || ((opcode == 8'h05) && (phase_cnt == 3'd1))
                   || ((opcode == 8'h03) && (phase_cnt >= 3'd4))
-                  || ((opcode == 8'h0B) && (phase_cnt >= 3'd5)) );
+                  || ((opcode == 8'h0B) && (phase_cnt >= 3'd5))
+                  || ((opcode == 8'h5A) && (phase_cnt >= 3'd5)) );
 wire quad_data_drive = (!cs_n) && quad_data;
 @
 
@@ -627,6 +739,8 @@ The qualifier decision for the just-completed byte at pre-increment
 - opcode == 0x03: N <= 3 (opcode + 3 addr); N >= 4 excluded;
 - opcode == 0x0B: N <= 3 (opcode + 3 addr); dummy byte N==4 and
   data N >= 5 excluded (the master tri-states MOSI during dummy);
+- opcode == 0x5A: N <= 3 (opcode + 3 addr); dummy byte N==4 and
+  data N >= 5 excluded (same cadence as 0x0B);
 - opcode == 0x6B: N <= 3 (opcode + 3 addr); dummy N==4 and quad
   data N >= 5 excluded (master tri-states all four IO pins during
   dummy and quad data);
@@ -681,6 +795,7 @@ wire master_driven_byte =
      (opcode == 8'h9F || opcode == 8'h05)              ? 1'b0 :
      (opcode == 8'h03)                                 ? (phase_cnt <= 3'd3) :
      (opcode == 8'h0B)                                 ? (phase_cnt <= 3'd3) :
+     (opcode == 8'h5A)                                 ? (phase_cnt <= 3'd3) :
      (opcode == 8'h6B)                                 ? (phase_cnt <= 3'd3) :
      (opcode == 8'h32)                                 ? (phase_cnt <= 3'd3) :
                                                          1'b1;
@@ -1879,6 +1994,39 @@ module tb_qspi;
                $fatal(1, "FAIL: high-rate 6B data[%0d]=%02h want %02h",
                       k, got_arr[k], 8'hE0 + k[7:0]);
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 24: 0x5A SFDP Read at offset 0. Drive opcode + 3
+      // address bytes (0x00 0x00 0x00) + 1 dummy byte, then read
+      // 8 SFDP bytes. The first 4 bytes must be the JESD216
+      // signature `S`,`F`,`D`,`P` (0x53 0x46 0x44 0x50).
+      begin : sfdp_rd
+         reg [7:0] got_dummy;
+         reg [7:0] got_arr [0:7];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h5A, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_byte(8'h00, 1'b0, got_dummy);
+         for (k = 0; k < 8; k = k + 1)
+            spi_byte(8'h00, 1'b0, got_arr[k]);
+         #200 cs_n = 1;
+         $display("SFDP dummy byte: %02h", got_dummy);
+         if (got_dummy !== 8'h00)
+            $fatal(1, "FAIL: 0x5A dummy MISO = %02h, want 00", got_dummy);
+         $write("SFDP trace (5A):");
+         for (k = 0; k < 8; k = k + 1) $write(" %02h", got_arr[k]);
+         $display("");
+         if (got_arr[0] !== 8'h53 || got_arr[1] !== 8'h46
+          || got_arr[2] !== 8'h44 || got_arr[3] !== 8'h50)
+            $fatal(1, "FAIL: SFDP signature = %02h %02h %02h %02h",
+                   got_arr[0], got_arr[1], got_arr[2], got_arr[3]);
+         expect_line("op=5a bytes=13", oracle_crc ^ 32'hFFFFFFFF);
       end
 
       $display("PASS");

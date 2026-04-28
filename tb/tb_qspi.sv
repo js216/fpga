@@ -832,6 +832,39 @@ module tb_qspi;
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
       end
 
+      // Frame 24: 0x5A SFDP Read at offset 0. Drive opcode + 3
+      // address bytes (0x00 0x00 0x00) + 1 dummy byte, then read
+      // 8 SFDP bytes. The first 4 bytes must be the JESD216
+      // signature `S`,`F`,`D`,`P` (0x53 0x46 0x44 0x50).
+      begin : sfdp_rd
+         reg [7:0] got_dummy;
+         reg [7:0] got_arr [0:7];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h5A, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_byte(8'h00, 1'b0, got_dummy);
+         for (k = 0; k < 8; k = k + 1)
+            spi_byte(8'h00, 1'b0, got_arr[k]);
+         #200 cs_n = 1;
+         $display("SFDP dummy byte: %02h", got_dummy);
+         if (got_dummy !== 8'h00)
+            $fatal(1, "FAIL: 0x5A dummy MISO = %02h, want 00", got_dummy);
+         $write("SFDP trace (5A):");
+         for (k = 0; k < 8; k = k + 1) $write(" %02h", got_arr[k]);
+         $display("");
+         if (got_arr[0] !== 8'h53 || got_arr[1] !== 8'h46
+          || got_arr[2] !== 8'h44 || got_arr[3] !== 8'h50)
+            $fatal(1, "FAIL: SFDP signature = %02h %02h %02h %02h",
+                   got_arr[0], got_arr[1], got_arr[2], got_arr[3]);
+         expect_line("op=5a bytes=13", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
       $display("PASS");
       $finish;
    end
