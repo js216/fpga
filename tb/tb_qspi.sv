@@ -920,6 +920,153 @@ module tb_qspi;
          expect_line("op=5a bytes=13", oracle_crc ^ 32'hFFFFFFFF);
       end
 
+      // Streaming pattern stress -- mirrors the MP135 host's 1 MiB
+      // streaming reads. The pattern source emits `addr[7:0]` and
+      // wraps every 256 bytes; these frames check that the wrap
+      // remains glitch-free across many mod-256 cycles, on both
+      // single-lane (0x03 / 0x0B) and quad-output (0x6B) paths,
+      // before hardware comes online. Reuses the high-rate t_q/t_h
+      // already in effect (t_q=5, t_h=10 -> ~50 MHz SCLK) so the
+      // long bursts complete in tens of microseconds each.
+      //
+      // The DUT's printer snapshots `byte_cnt` truncated to 8 bits;
+      // the displayed value is `byte_cnt mod 256` rendered as
+      // 1- or 2-digit decimal. Verified against existing assertions:
+      // frame20b above sends 1+3+40 = 44 single-lane bytes and
+      // expects "op=03 bytes=44".
+
+      // Frame 25: 0x0B Fast Read, 1024 data bytes from addr 0x000.
+      // Total byte_cnt = 1+3+1+1024 = 1029; 1029 mod 256 = 5.
+      begin : stream_0b_1k
+         reg [7:0] got_dummy;
+         reg [7:0] got_arr [0:1023];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h0B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);  // addr LSB = 0x00
+         spi_byte(8'h00, 1'b0, got_dummy);
+         for (k = 0; k < 1024; k = k + 1)
+            spi_byte(8'h00, 1'b0, got_arr[k]);
+         #200 cs_n = 1;
+         if (got_dummy !== 8'h00)
+            $fatal(1, "FAIL: stream-0B-1k dummy MISO = %02h, want 00", got_dummy);
+         for (k = 0; k < 1024; k = k + 1)
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: stream-0B-1k data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
+         expect_line("op=0b bytes=5", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 26: 0x0B Fast Read, 256 data bytes from addr 0x0FE.
+      // Pattern: 0xFE, 0xFF, 0x00, 0x01, ..., 0xFD.
+      // Total byte_cnt = 1+3+1+256 = 261; 261 mod 256 = 5.
+      begin : stream_0b_wrap
+         reg [7:0] got_dummy;
+         reg [7:0] got_arr [0:255];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h0B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'hFE, 1'b1);  // addr LSB = 0xFE -- wrap mid-frame
+         spi_byte(8'h00, 1'b0, got_dummy);
+         for (k = 0; k < 256; k = k + 1)
+            spi_byte(8'h00, 1'b0, got_arr[k]);
+         #200 cs_n = 1;
+         if (got_dummy !== 8'h00)
+            $fatal(1, "FAIL: stream-0B-wrap dummy MISO = %02h, want 00", got_dummy);
+         for (k = 0; k < 256; k = k + 1)
+            if (got_arr[k] !== (8'hFE + k[7:0]))
+               $fatal(1, "FAIL: stream-0B-wrap data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'hFE + k[7:0]);
+         expect_line("op=0b bytes=5", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 27: 0x6B Quad Output Read, 1024 data bytes from addr 0x000.
+      // Each quad data byte = 2 SCLK rises = 0.25 byte_cnt; the dummy
+      // contributes 1 (8 SCLK rises). Total byte_cnt = 1+3+1+1024/4
+      // = 261; 261 mod 256 = 5.
+      begin : stream_6b_1k
+         reg [7:0] got_arr [0:1023];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         release_io();
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);  // addr LSB = 0x00
+         spi_dummy_quad();
+         for (k = 0; k < 1024; k = k + 1)
+            spi_quad_data_byte(got_arr[k]);
+         #200 cs_n = 1;
+         for (k = 0; k < 1024; k = k + 1)
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: stream-6B-1k data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
+         expect_line("op=6b bytes=5", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 28: 0x6B Quad Output Read, 256 data bytes from addr 0x0FE.
+      // Quad pattern wrap: 0xFE, 0xFF, 0x00, ..., 0xFD.
+      // Total byte_cnt = 1+3+1+256/4 = 69 -> "bytes=69".
+      begin : stream_6b_wrap
+         reg [7:0] got_arr [0:255];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         release_io();
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'hFE, 1'b1);  // addr LSB = 0xFE -- wrap mid-frame
+         spi_dummy_quad();
+         for (k = 0; k < 256; k = k + 1)
+            spi_quad_data_byte(got_arr[k]);
+         #200 cs_n = 1;
+         for (k = 0; k < 256; k = k + 1)
+            if (got_arr[k] !== (8'hFE + k[7:0]))
+               $fatal(1, "FAIL: stream-6B-wrap data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'hFE + k[7:0]);
+         expect_line("op=6b bytes=69", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 29: 0x03 Read, 1024 data bytes from addr 0x000. No
+      // dummy byte for 0x03. Total byte_cnt = 1+3+1024 = 1028;
+      // 1028 mod 256 = 4 -> "bytes=4".
+      begin : stream_03_1k
+         reg [7:0] got_arr [0:1023];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         for (k = 0; k < 1024; k = k + 1)
+            spi_byte(8'h00, 1'b0, got_arr[k]);
+         #200 cs_n = 1;
+         for (k = 0; k < 1024; k = k + 1)
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: stream-03-1k data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
+         expect_line("op=03 bytes=4", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
       $display("PASS");
       $finish;
    end
