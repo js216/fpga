@@ -1,44 +1,62 @@
 # Agentic pattern
 
-Loop: identify failing hardware test → fix qspi.nw → upload → verify → commit →
-next.
+Pipeline of single-purpose agents. Orchestrator owns FSM, spawns each
+phase, relays artifacts.
 
-## Hardware test rig reset
+## Rig reset
 
-/loop 30m Hardware rig is down. Submit the FPGA `uart_echo` to reset rig, as
-follows: cd build/uart && make test. (If makefile missing in build/uart, tangle
-it from uart.nw.)
+/loop 30m
+Hardware rig is down. Submit the FPGA `uart_echo` to reset
+rig, as follows: `cd build/uart && make test`. (If Makefile missing in
+build/uart, tangle it from uart.nw.)
 
-## Roles
+## FSM
 
-**Orchestrator**
-- Runs `python3 $TEST_SERV/run_md.py` in
-  `~/stm32mp135_test_board/baremetal/qspi/` (fail-fasts on first red block).
-- Diagnoses the missing qspi.nw feature.
-- Writes a detailed fix spec.
-- Dispatches Worker (background).
-- After Worker returns: re-runs the test runner directly (skip Verifier when
-  PASS/FAIL is already structured).
-- On green: commits `src/qspi.nw` + tangled `verilog/qspi.v` + `tb/tb_qspi.sv`.
-  Loops.
-- On red: feeds output back, re-dispatches.
+Trigger: "read AGENTS.md and work on `<ex>`" → assistant = Orchestrator.
+Per `<ex>`, run:
 
-**Worker** (background `general-purpose`)
-- Edits `src/qspi.nw` per spec. Literate style: named chunks, prose, no
-  comment-as-structure.
-- `make sim` → PASS.
-- `make bitstream` → clean (no new warnings).
-- `cd build/qspi && python3 $TEST_SERV/run_md.py` → uploads via TEST.md
-  (`fpga:program`).
-- Reports: sim pass, build warnings, upload status, files touched.
+    TEST → red?  → DIAGNOSE → EDIT → BUILD → VERIFY → TEST → green? →
+    SCAN     → next issue → TEST  |  DONE
 
-**Verifier** (only when output ambiguous)
-- Runs the MP135 test suite, reports next failure. Most loops skip this.
+Orchestrator drives loop in foreground (state visible to user).  Each
+phase = one short-lived background agent. No heartbeats; exit = status.
+Caps: 8 iterations total, 3 same-issue retries.
 
-## Constraints
+## Phase agents
 
-- Read-only: `~/stm32mp135_test_board/` (other agent owns).
-- Zero `-Wno-*`, `verilator lint_off`, `(* keep *)`, `#[allow]`. Root-cause
-  warnings. (See CLAUDE.md for details.)
-- Tangled `.v` / `.sv` are tracked — commit with the `.nw`.
-- No SPDX header on `.nw` / `.v` / `.sv` (only `.rs`).
+Each spawned `general-purpose` with `run_in_background: true`.
+Orchestrator does not poll; it waits for the completion notification,
+then prints the result before next phase.
+
+- **Tester**: `cd build/<ex> && make test`. Returns PASS/FAIL + failing
+  block name + verbatim block tail. NOTE: runner aborts on first failing
+  block (no `--full`); blocks past the first failure are NOT executed.
+  The summary `K/N BLOCKS FAILED` counts unattempted blocks as
+  not-failed --- never read it as `N-K PASSED`. Only blocks before the
+  first failure are actually exercised.
+- **Diagnoser**: given red output + `<ex>.nw` path, returns fix spec
+  (root cause, target chunk name, proposed change). Read-only.
+- **Editor**: given spec, edits `<ex>.nw` (literate: named chunks +
+  prose, no comment-as-structure). Returns diff.
+- **Builder**: `make sim` (must PASS) + `make bitstream` (no new
+  warnings). Returns sim result, warning delta, artifact paths.
+- **Verifier**: `cd build/<ex> && make test` upload+verify. Same return
+  shape as Tester.
+- **Scanner**: greps `<ex>.nw` for TODO/FIXME/BUG, deferred blocks,
+  prose-flagged issues, recent-commit follow-ups. Returns next
+  actionable issue or "none".
+
+## Orchestrator rules
+
+- One pipeline per `<ex>`, parallel across examples.
+- On VERIFY green: `git commit` (no Claude co-author, no test-result
+  chatter), then SCAN.
+- On Builder warning regression or sim FAIL: re-DIAGNOSE with new
+  evidence.
+- On 3 same-issue VERIFY reds: skip to SCAN.
+- Never run `make` or edit source itself; only spawns + commits +
+  relays.
+- On Diagnoser exit: print full diagnosis (root cause, target chunk,
+  proposed change) verbatim before spawning Editor.
+- On Verifier exit: print full result (PASS/FAIL, failing block name,
+  verbatim tail) verbatim before next FSM transition.

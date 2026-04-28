@@ -58,6 +58,24 @@ example:
 - **qspi**: Emulate a JEDEC QSPI flash interface
 - **cordic**: CORDIC sine/cosine generator
 
+### SPI Hardware Notes
+
+The MP135 QUADSPI tests use SPI mode 0: SCLK idles low and data is
+sampled on the rising edge. The FPGA `spi` slave presents data on the
+falling edge through iCE40 `SB_IO` output flops, so the value is stable
+for the next MP135 rising-edge sample.
+
+Validated single-lane hardware checks:
+
+    cd build/spi
+    python3 $TEST_SERV/run_md.py --block 1   # GPIO bit-bang, 16 bytes
+    python3 $TEST_SERV/run_md.py --block 2   # QUADSPI raw read, 1024 bytes
+
+For the 1 MiB bench sweep, prescalers 203, 63, 15, and 5 pass in
+single-lane mode; prescaler 5 requires `p 5 1` to enable MP135 sample
+shift. Prescaler 4 and faster have not been validated on this wiring.
+Quad-lane work is intentionally deferred until single-lane is complete.
+
 ### Author
 
 Jakob Kastelic (Stanford Research Systems, Inc.)

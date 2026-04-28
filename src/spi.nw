@@ -11,52 +11,68 @@ opcode latch, address capture, or dummy-cycle counter in the
 critical path.
 
 Two synthesis variants are produced from one source. `LANES=1`
-drives the single-lane MISO line `io[1]` on `negedge sclk`,
-MSB-first; the bench command on the host side is `b <len> 0 1`.
+drives the single-lane pattern on both `io[0]` and `io[1]` on
+`negedge sclk`, MSB-first; the bench command on the host side is
+`b <len> 0 1`. Driving both lanes is deliberate: the MP135
+QUADSPI raw read samples IO0 in 1-line data mode even though
+conventional SPI labels often call IO1/MISO the slave-output lane.
+Mirroring the pattern avoids making the raw-read benchmark depend
+on that naming ambiguity.
 `LANES=4` drives all four lanes on `negedge sclk`; the bench
 command is `b <len> 1 1`. The 4-lane case follows the convention
 the rest of this codebase has settled on: the STM32MP1 QUADSPI
 indirect-read engine assembles each byte as
 `{second_sample, first_sample}`, so the FIRST negedge of a byte
 cycle carries the LOWER nibble and the SECOND negedge carries
-the UPPER. This matches the
-`<<SPI: quad output negedge presenter>>` / nibble precompute in
-the `qspi` chapter --- byte-swap-on-the-wire is a host-side
-post-process there too.
+the UPPER. Byte-swap-on-the-wire is a host-side post-process.
 
-Reset is synchronous to `sclk` and gated by `cs_n` as a level
-input. The state registers (`phase`, `data_byte`) sit inside
-`always @(posedge sclk)`, with `if (cs_n)` choosing the clear
-branch and the `else` branch advancing the counter. The output
-presenter `q` is *combinational*: the bit (or nibble) currently
-sitting on the wire is `data_byte[7 - phase]` (or the
-phase-selected nibble), driven directly through the tri-state
-buffer with no `negedge sclk` flop in the path. There is no
-asynchronous reset on `cs_n` anywhere.
+=== Why explicit `SB_IO` instances
 
-The motivating hardware symptom: with the previous structure
-that used `posedge cs_n` as an asynchronous reset, the master
-saw byte 0 = 0x00 (correct for an incrementing pattern that
-starts at 0) but every subsequent byte = 0x00 too --- the
-counter never advanced past zero. The cs_n→FF reset path on
-the iCE40 has enough chip-pin-to-fabric delay that the first
-`posedge sclk` after CS-fall captured `phase` while its
-async-clear input was still asserted, so `phase` stayed at 0
-and the byte-boundary increment never fired. With cs_n used
-purely as a synchronous level reset, the first `posedge sclk`
-inside the frame sees `cs_n=0` directly through the
-combinational reset gate and unambiguously takes the
-counter-advance branch.
+An earlier revision drove the lanes with fabric tri-state
+shapes:
 
-The negedge-clocked output register that the previous version
-carried for setup-time relief is gone. With the counter
-clocked on `posedge sclk` and the output a combinational mux
-of that counter, the data the master sees at posedge K is
-`data_byte[7 - phase_pre_edge]`, where `phase_pre_edge` is the
-pre-edge counter value. That is exactly the bit position the
-master is supposed to sample at rise K. Between rises, sclk is
-low, `phase` holds its post-rise value, and the mux output is
-stable for the master's setup window before the next rise.
+   wire oe = ~cs_n;
+   assign io[1] = oe ? q : 1'bz;
+
+yosys flagged this with `Warning: Yosys has only limited support
+for tri-state logic` and emitted four `$_TBUF_` cells in the
+generic netlist. nextpnr then placed them, but on real iCE40
+silicon the lanes never drove anything --- the master read
+`0xFF` for the entire megabyte transfer because the fabric
+tristate path did not reach the `SB_IO` output enable, and the
+master's MISO pull-up won. The simulator did not catch this
+because verilator's tri-state resolution does not model a master
+pull-up: an undriven net in the TB resolves to `X`, which the
+existing `!==` check happens to flag in some stimulus shapes
+but not in others.
+
+The fix is to bypass tri-state inference entirely and
+instantiate `SB_IO` cells directly. Each pad is configured as
+`PIN_TYPE = 6'b100101` (output registered with output enable)
+and `NEG_TRIGGER = 1` so the IOB's output flop captures
+`D_OUT_0` on `negedge OUTPUT_CLK`. `OUTPUT_CLK = sclk`,
+`OUTPUT_ENABLE = ~cs_n`. The IOB flop is the negedge presenter:
+it captures the next bit half a cycle ahead of the master's
+mode-0 rising-edge sample point.
+
+=== Lane data path
+
+The byte-pattern counter `data_byte` advances on `posedge sclk`
+and is synchronously cleared whenever `cs_n` is high at the
+rise. The output flop starts at the first bit/nibble of byte 0, so
+the first rising edge in a frame samples valid data even before any
+falling edge has occurred. The `phase` counter narrows per variant:
+3 bits for 1-lane (eight rises per byte, MSB-first), 1 bit for
+4-lane (two rises per byte, lower nibble first then upper).
+
+The combinational `dout_lane[3:0]` carries the value the IOB flop
+will latch at the next negedge. For 4-lane, every lane carries a
+real bit of the current nibble. For 1-lane, `dout_lane[0]` and
+`dout_lane[1]` both carry the data bit; the other two lanes are
+held low when enabled. Both variants feed a
+single shared genvar loop that instantiates one `SB_IO` per pad, so
+the synthesis netlist contains exactly four explicit pad drivers and
+no fabric tri-state cells regardless of `LANES`.
 
 <<spi.v>>=
 module spi #(
@@ -67,102 +83,107 @@ module spi #(
       inout  [3:0] io
    );
    <<SPI streaming: state>>
-   <<SPI streaming: sclk processes>>
+   <<SPI streaming: lane logic>>
    <<SPI streaming: io drivers>>
 endmodule
 @
 
-The state lives in the sclk domain. `data_byte` is the running
-pattern counter (advances at byte boundaries) and is shared
-across both LANES variants. The `phase` counter is declared
-inside the active generate branch so each variant carries only
-the bits it actually uses --- 3 bits of phase for 1-lane
-(eight rises per byte, MSB-first), 1 bit of phase for 4-lane
-(two rises per byte, lower nibble first then upper).
-
-There is no `q` register: the lane outputs come from a
-combinational mux of `data_byte` indexed by `phase`, declared
-inside whichever generate branch is active so the 4-lane case
-sees a 4-bit nibble select and the 1-lane case sees a 1-bit
-slice --- letting the linter see every bit reach a pin.
+`data_byte` is shared across both variants; `oe` and `dout_lane`
+are the wires the IOB driver loop reads.
 
 <<SPI streaming: state>>=
 reg [7:0] data_byte;
 initial data_byte = 8'd0;
+wire [3:0] dout_lane;
+wire oe = ~cs_n;
 @
 
-The posedge process advances `phase` and schedules the
-byte-pattern increment at the rise that closes the current
-byte. `cs_n` is a synchronous level reset: any `posedge sclk`
-taken while `cs_n` is high clears the state, and any taken
-while `cs_n` is low advances it. The combinational output
-mux reads the *post-rise* value of `phase` (since `phase` is
-clocked on the same posedge), which is the pre-edge value
-seen by the master at the *next* rise --- so the mux always
-presents the bit (or nibble) the master is about to sample.
+The lane logic chunk holds the per-variant `phase` register,
+the edge counter, and the assignment that drives `dout_lane`
+from `data_byte` and `phase`. The stream state advances after each
+rising-edge sample, while the pad flops below present the already
+computed next value on the following falling edge. Raising `cs_n`
+asynchronously returns both variants to byte zero for the next
+transaction.
 
-For 4-lane the mux picks the lower nibble when `phase == 0`
-and the upper nibble when `phase == 1` --- matching the
-STM32MP1 QUADSPI indirect-read assembly of
-`{second_sample, first_sample}`. For 1-lane the mux picks
-bit `7 - phase`, MSB-first.
-
-<<SPI streaming: sclk processes>>=
+<<SPI streaming: lane logic>>=
 generate if (LANES == 4) begin : g_quad
-   reg       phase;
-   wire [3:0] q = phase ? data_byte[7:4] : data_byte[3:0];
-   initial phase = 1'b0;
-   always @(posedge sclk) begin
-      if (cs_n) begin
-         data_byte <= 8'd0;
-         phase     <= 1'b0;
-      end else begin
-         phase <= ~phase;
-         if (phase) data_byte <= data_byte + 8'd1;
-      end
-   end
+   <<SPI streaming: quad lane>>
 end else begin : g_one
-   reg [2:0] phase;
-   wire      q = data_byte[7 - phase];
-   initial phase = 3'd0;
-   always @(posedge sclk) begin
-      if (cs_n) begin
-         data_byte <= 8'd0;
-         phase     <= 3'd0;
-      end else begin
-         phase <= phase + 3'd1;
-         if (phase == 3'd7) data_byte <= data_byte + 8'd1;
-      end
-   end
+   <<SPI streaming: single lane>>
 end endgenerate
 @
 
-Tri-state drivers. 4-lane drives all four IO pins from `q[3:0]`;
-1-lane drives only `io[1]` (MISO) from `q[0]` and leaves the
-other three lanes Hi-Z. Output enable is held high while CS is
-low.
+For 4-lane the nibble mux picks the lower nibble when
+`phase == 0` and the upper nibble when `phase == 1`, matching
+the STM32MP1 QUADSPI indirect-read assembly of
+`{second_sample, first_sample}`.
+
+<<SPI streaming: quad lane>>=
+reg phase;
+initial phase = 1'b0;
+always @(posedge cs_n or posedge sclk) begin
+   if (cs_n) begin
+      data_byte <= 8'd0;
+      phase     <= 1'b0;
+   end else begin
+      phase <= ~phase;
+      if (phase) data_byte <= data_byte + 8'd1;
+   end
+end
+assign dout_lane = phase ? data_byte[7:4] : data_byte[3:0];
+@
+
+For 1-lane the bit mux picks `data_byte[7 - phase]`, MSB-first,
+and mirrors it onto IO0 and IO1. IO2 and IO3 get a constant
+`1'b0` data input, so those lanes are held low rather than
+floating when output enable is asserted.
+
+<<SPI streaming: single lane>>=
+reg [2:0] phase;
+initial phase = 3'd0;
+always @(posedge cs_n or posedge sclk) begin
+   if (cs_n) begin
+      data_byte <= 8'd0;
+      phase     <= 3'd0;
+   end else begin
+      phase <= phase + 3'd1;
+      if (phase == 3'd7) data_byte <= data_byte + 8'd1;
+   end
+end
+assign dout_lane[0] = data_byte[3'd7 - phase];
+assign dout_lane[1] = data_byte[3'd7 - phase];
+assign dout_lane[2] = 1'b0;
+assign dout_lane[3] = 1'b0;
+@
+
+The IO driver uses one explicit iCE40 `SB_IO` per pad. `NEG_TRIGGER`
+makes each output flop capture `dout_lane[g]` on SCLK falling edges,
+so pad transitions happen half a cycle ahead of the MP135 rising-edge
+sample without making the stream counter itself sensitive to falling
+edges. That distinction matters for long peripheral reads where SCLK
+can pause: repeated or idle falling-edge observations re-present the
+same computed value instead of advancing the byte stream.
 
 <<SPI streaming: io drivers>>=
-wire oe = ~cs_n;
-generate if (LANES == 4) begin : g_io_quad
-   assign io[0] = oe ? g_quad.q[0] : 1'bz;
-   assign io[1] = oe ? g_quad.q[1] : 1'bz;
-   assign io[2] = oe ? g_quad.q[2] : 1'bz;
-   assign io[3] = oe ? g_quad.q[3] : 1'bz;
-end else begin : g_io_one
-   assign io[0] = 1'bz;
-   assign io[1] = oe ? g_one.q : 1'bz;
-   assign io[2] = 1'bz;
-   assign io[3] = 1'bz;
+genvar g;
+generate for (g = 0; g < 4; g = g + 1) begin : g_io
+   SB_IO #(
+      .PIN_TYPE(6'b100101),
+      .NEG_TRIGGER(1'b1)
+   ) iob (
+      .PACKAGE_PIN(io[g]),
+      .OUTPUT_CLK(sclk),
+      .OUTPUT_ENABLE(oe),
+      .D_OUT_0(dout_lane[g])
+   );
 end endgenerate
 @
 
 === Pin map
 
 iCEstick pin numbers, mirroring the `qspi` chapter so the same
-physical wires reach the MP135 `CN8` connector --- only the SPI
-pins are used here; there is no UART TX in this minimum-logic
-slave.
+physical wires reach the MP135 `CN8` connector.
 
 <<spi.pcf>>=
 set_io cs_n    56
@@ -173,111 +194,714 @@ set_io io[2]   60
 set_io io[3]   48
 @
 
+=== Static pin-drive preflight top
+
+The hardware preflight must not depend on the FPGA UART path. A tiny
+one-purpose top lets the MP135 prove the physical QSPI wiring from the
+other side: boot the MP135 while the FPGA bitstream is high-impedance,
+switch the MP135 QSPI pads to GPIO inputs, then reprogram the FPGA with
+static one-hot drive patterns and ask the MP135 to read the six pins.
+
+The bit order intentionally matches the MP135 `g`/`G` commands:
+`CLK, NCS, IO0, IO1, IO2, IO3`.
+
+<<spi_pin_drive.v>>=
+module spi_pin_hiz (
+      inout        cs_n,
+      inout        sclk,
+      inout  [3:0] io
+   );
+   wire [5:0] unused;
+   SB_IO #(.PIN_TYPE(6'b000001)) i_sclk (.PACKAGE_PIN(sclk), .D_IN_0(unused[0]));
+   SB_IO #(.PIN_TYPE(6'b000001)) i_cs_n (.PACKAGE_PIN(cs_n), .D_IN_0(unused[1]));
+   genvar g;
+   generate for (g=0; g<4; g=g+1) begin : g_io
+      SB_IO #(.PIN_TYPE(6'b000001)) iob (.PACKAGE_PIN(io[g]), .D_IN_0(unused[g + 2]));
+   end endgenerate
+endmodule
+
+module spi_pin_walk #(
+      parameter BOOT_TICKS = 48_000_000,
+      parameter STEP_TICKS = 24_000_000
+   ) (
+      input        clk,
+      inout        cs_n,
+      inout        sclk,
+      inout  [3:0] io
+   );
+   reg [27:0] count = 0;
+   always @(posedge clk)
+      if (count < BOOT_TICKS + 7 * STEP_TICKS - 1)
+         count <= count + 1'b1;
+
+   wire drive = count >= BOOT_TICKS;
+   wire [27:0] after_boot = count - BOOT_TICKS;
+   wire [2:0] slot =
+      (after_boot < 1 * STEP_TICKS) ? 3'd0 :
+      (after_boot < 2 * STEP_TICKS) ? 3'd1 :
+      (after_boot < 3 * STEP_TICKS) ? 3'd2 :
+      (after_boot < 4 * STEP_TICKS) ? 3'd3 :
+      (after_boot < 5 * STEP_TICKS) ? 3'd4 :
+      (after_boot < 6 * STEP_TICKS) ? 3'd5 : 3'd6;
+
+   reg [5:0] mask;
+   always @* begin
+      case (slot)
+         3'd0: mask = 6'h00;
+         3'd1: mask = 6'h01;
+         3'd2: mask = 6'h02;
+         3'd3: mask = 6'h04;
+         3'd4: mask = 6'h08;
+         3'd5: mask = 6'h10;
+         default: mask = 6'h20;
+      endcase
+   end
+
+   SB_IO #(.PIN_TYPE(6'b100101)) i_sclk (
+      .PACKAGE_PIN(sclk), .OUTPUT_CLK(clk),
+      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[0])
+   );
+   SB_IO #(.PIN_TYPE(6'b100101)) i_cs_n (
+      .PACKAGE_PIN(cs_n), .OUTPUT_CLK(clk),
+      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[1])
+   );
+   genvar w;
+   generate for (w=0; w<4; w=w+1) begin : w_io
+      SB_IO #(.PIN_TYPE(6'b100101)) iob (
+         .PACKAGE_PIN(io[w]), .OUTPUT_CLK(clk),
+         .OUTPUT_ENABLE(drive), .D_OUT_0(mask[w + 2])
+      );
+   end endgenerate
+endmodule
+
+module spi_pin_drive #(
+      parameter [5:0] MASK = 6'h00
+   ) (
+      output       cs_n,
+      output       sclk,
+      output [3:0] io
+   );
+   assign sclk  = MASK[0];
+   assign cs_n  = MASK[1];
+   assign io[0] = MASK[2];
+   assign io[1] = MASK[3];
+   assign io[2] = MASK[4];
+   assign io[3] = MASK[5];
+endmodule
+@
+
+<<spi_pin_walk.pcf>>=
+set_io clk     21
+set_io cs_n    56
+set_io sclk    45
+set_io io[0]   47
+set_io io[1]   44
+set_io io[2]   60
+set_io io[3]   48
+@
+
+=== UART debug top
+
+The `spi_debug` top is a diagnostic wrapper around the normal 1-lane
+SPI stream. It does not add any new drive behaviour on the shared SPI
+pins: `cs_n` and `sclk` are inputs from the MP135, and the data pins are
+driven only by the same `spi #(.LANES(1))` instance used by the regular
+bitstream. The only extra output is the iCEstick FTDI UART TX pin.
+
+During a selected frame, the wrapper synchronizes `sclk` and `io[1]`
+into the 12 MHz UART clock domain, counts all synchronized rising SCLK
+edges, and records the first 32 IO1 samples. When `cs_n` deasserts it
+prints:
+
+   SPI E=xxxx S=xxxxxxxx
+
+where `E` is the frame's synchronized rising-edge count and `S` is the
+first 32 sampled bits packed MSB-first. This is intended for a slow,
+long `p 203` peripheral read so the 12 MHz observer has several
+system-clock samples per SCLK period. For a 4096-byte 1-lane raw read,
+`E` should be `8000` and `S` should be `00010203` (bytes 0, 1, 2, 3).
+
+The UART transmitter is the existing `uart_tx` module from `uart.nw`;
+this wrapper only supplies a small fixed-format byte source.
+
+<<spi_debug.v>>=
+module spi_debug #(
+      parameter CLKS_PER_BIT = 104
+   ) (
+      input        clk,
+      input        cs_n,
+      input        sclk,
+      inout  [3:0] io,
+      output       tx
+   );
+   spi #(.LANES(1)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+
+   reg        cs_meta, cs_sync;
+   reg        selected_prev;
+   reg        sclk_meta, sclk_sync, sclk_prev;
+   reg        io1_meta, io1_sync;
+   reg [15:0] edge_count;
+   reg [15:0] last_edges;
+   reg [31:0] samples;
+   reg [31:0] last_samples;
+   reg [5:0]  sample_count;
+   reg        frame_done;
+   wire       selected = !cs_sync;
+   wire       sclk_rise = selected && sclk_sync && !sclk_prev;
+   wire       cs_start = selected && !selected_prev;
+   wire       cs_stop = !selected && selected_prev;
+
+   initial begin
+      cs_meta      = 1'b1;
+      cs_sync      = 1'b1;
+      selected_prev = 1'b0;
+      sclk_meta    = 1'b0;
+      sclk_sync    = 1'b0;
+      sclk_prev    = 1'b0;
+      io1_meta     = 1'b0;
+      io1_sync     = 1'b0;
+      edge_count   = 16'd0;
+      last_edges   = 16'd0;
+      samples      = 32'd0;
+      last_samples = 32'd0;
+      sample_count = 6'd0;
+      frame_done   = 1'b0;
+   end
+
+   always @(posedge clk) begin
+      cs_meta   <= cs_n;
+      cs_sync   <= cs_meta;
+      sclk_meta <= sclk;
+      sclk_sync <= sclk_meta;
+      sclk_prev <= sclk_sync;
+      io1_meta  <= io[1];
+      io1_sync  <= io1_meta;
+      selected_prev <= selected;
+
+      if (cs_start) begin
+         edge_count   <= 16'd0;
+         samples      <= 32'd0;
+         sample_count <= 6'd0;
+         frame_done   <= 1'b0;
+      end else if (sclk_rise) begin
+         edge_count <= edge_count + 16'd1;
+         if (sample_count < 6'd32) begin
+            samples <= {samples[30:0], io1_sync};
+            sample_count <= sample_count + 6'd1;
+         end
+      end else if (cs_stop) begin
+         last_edges <= edge_count;
+         last_samples <= samples;
+         frame_done <= 1'b1;
+      end
+   end
+
+   <<SPI debug UART reporter>>
+endmodule
+@
+
+The reporter walks a fixed 23-byte line into `uart_tx` once the observer
+has captured the first 32 selected SCLK rises.
+
+<<SPI debug UART reporter>>=
+reg pending;
+reg report_sent;
+reg [4:0] char_idx;
+reg tx_start;
+reg [7:0] tx_data;
+wire tx_busy;
+
+initial begin
+   pending    = 1'b0;
+   report_sent = 1'b0;
+   char_idx   = 5'd0;
+   tx_start   = 1'b0;
+   tx_data    = 8'h00;
+end
+
+always @(posedge clk) begin
+   tx_start   <= 1'b0;
+   if (cs_start)
+      report_sent <= 1'b0;
+   if (frame_done && !report_sent && !pending && char_idx == 5'd0)
+      pending <= 1'b1;
+   if (pending && !tx_busy && !tx_start) begin
+      tx_data  <= debug_char(char_idx);
+      tx_start <= 1'b1;
+      if (char_idx == 5'd22) begin
+         pending <= 1'b0;
+         report_sent <= 1'b1;
+         char_idx <= 5'd0;
+      end else begin
+         char_idx <= char_idx + 5'd1;
+      end
+   end
+end
+
+uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
+   .clk(clk),
+   .start(tx_start),
+   .data(tx_data),
+   .tx(tx),
+   .busy(tx_busy)
+);
+
+function [7:0] hex_digit;
+   input [3:0] n;
+   begin
+      hex_digit = (n < 4'd10) ? (8'h30 + {4'd0, n})
+                              : (8'h57 + {4'd0, n});
+   end
+endfunction
+
+function [7:0] debug_char;
+   input [4:0] idx;
+   begin
+      case (idx)
+         5'd0:  debug_char = "S";
+         5'd1:  debug_char = "P";
+         5'd2:  debug_char = "I";
+         5'd3:  debug_char = " ";
+         5'd4:  debug_char = "E";
+         5'd5:  debug_char = "=";
+         5'd6:  debug_char = hex_digit(last_edges[15:12]);
+         5'd7:  debug_char = hex_digit(last_edges[11:8]);
+         5'd8:  debug_char = hex_digit(last_edges[7:4]);
+         5'd9:  debug_char = hex_digit(last_edges[3:0]);
+         5'd10: debug_char = " ";
+         5'd11: debug_char = "S";
+         5'd12: debug_char = "=";
+         5'd13: debug_char = hex_digit(last_samples[31:28]);
+         5'd14: debug_char = hex_digit(last_samples[27:24]);
+         5'd15: debug_char = hex_digit(last_samples[23:20]);
+         5'd16: debug_char = hex_digit(last_samples[19:16]);
+         5'd17: debug_char = hex_digit(last_samples[15:12]);
+         5'd18: debug_char = hex_digit(last_samples[11:8]);
+         5'd19: debug_char = hex_digit(last_samples[7:4]);
+         5'd20: debug_char = hex_digit(last_samples[3:0]);
+         5'd21: debug_char = 8'h0d;
+         5'd22: debug_char = 8'h0a;
+         default: debug_char = 8'h00;
+      endcase
+   end
+endfunction
+@
+
+<<spi_debug.pcf>>=
+set_io clk     21
+set_io tx      8
+set_io cs_n    56
+set_io sclk    45
+set_io io[0]   47
+set_io io[1]   44
+set_io io[2]   60
+set_io io[3]   48
+@
+
+=== `SB_IO` simulation model
+
+yosys recognises `SB_IO` as a built-in iCE40 primitive and
+needs no help from us during synthesis. verilator does not, so
+the testbench is compiled against a stand-alone behavioural
+model that covers exactly the configuration our DUT uses
+(`PIN_TYPE = 6'b100101`, `NEG_TRIGGER = 1`). Any other
+configuration is rejected at elaboration so a future change to
+the DUT does not silently desync the sim from the synth path.
+
+The model owns one negedge-clocked register per pad and gates its
+output through `OUTPUT_ENABLE`. When the slave releases the bus the
+inout port is driven to `1'bz`, and the testbench attaches a
+`pullup` per lane to model the master-side MISO pull-up.
+
+<<SB_IO.v>>=
+module SB_IO #(
+      parameter [5:0] PIN_TYPE    = 6'b000000,
+      parameter [0:0] NEG_TRIGGER = 1'b0
+   ) (
+      inout  PACKAGE_PIN,
+      input  OUTPUT_CLK,
+      input  OUTPUT_ENABLE,
+      input  D_OUT_0
+   );
+   initial begin
+      if (PIN_TYPE !== 6'b100101 || NEG_TRIGGER !== 1'b1) begin
+         $display("ERROR SB_IO sim model only supports PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
+                  PIN_TYPE, NEG_TRIGGER);
+         $finish;
+      end
+   end
+   reg dout_reg;
+   initial dout_reg = 1'b0;
+   always @(negedge OUTPUT_CLK)
+      dout_reg <= D_OUT_0;
+   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_reg : 1'bz;
+endmodule
+@
+
 === Testbench
 
-Two testbenches, one per `LANES` variant, share the same
-stimulus shape: open CS, clock 256 SCLK rises, sample the
-slave's output on each rise (mode-0 sampling) and assert the
-reconstructed byte stream is `0, 1, 2, ... 255`. The 4-lane TB
-reassembles bytes as `{second_sample, first_sample}` to match
-the host-side QUADSPI assembly.
+Two testbenches, one per `LANES` variant, share the same shape:
+
+  - **CS-high quiet check.** Pulse SCLK twice while CS is high
+    and assert that all four `io` lanes read `4'b1111`. The
+    pull-ups must win because the slave's `OUTPUT_ENABLE` is
+    `~cs_n = 0` and every IOB is tri-stated. This is the
+    direct sim of the hardware failure mode --- if the slave
+    drives anything when it should not, this check fails.
+  - **256-byte frame from cold init.** Every distinct byte
+    value 0..255 appears once, master sampling each rise in
+    mode 0.
+  - **Long frame for byte-counter rollover.** A 4096-byte
+    frame wraps `data_byte[7:0]` sixteen times. The real bench
+    streams one megabyte per frame, so the sim has to prove
+    the counter rolls cleanly at every 256-byte boundary.
+  - **CS-high quiet check, again.** Re-asserts that the slave
+    releases the bus after the long frame closes.
+
+Each TB is built from named chunks: signals (with master-side
+pull-ups), a per-byte sampler that owns the mode-0 sample
+point, helpers (`frame` and `cs_high_quiet`), and the scenario
+sequencer.
 
 <<tb_spi_1lane.sv>>=
 `timescale 1ns/1ps
 
 module tb_spi_1lane;
-   reg       cs_n = 1'b1;
-   reg       sclk = 1'b0;
-   wire [3:0] io;
-
-   spi #(.LANES(1)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
-
-   integer  i, b;
-   reg [7:0] rx;
-   integer  errs;
-
-   initial begin
-      errs = 0;
-      #20 cs_n = 1'b0;
-      #5;
-      for (b = 0; b < 256; b = b + 1) begin
-         rx = 8'd0;
-         for (i = 0; i < 8; i = i + 1) begin
-            #5 sclk = 1'b1;
-            rx = {rx[6:0], io[1]};
-            #5 sclk = 1'b0;
-         end
-         if (rx !== b[7:0]) begin
-            $display("FAIL byte %0d: got %02x expected %02x", b, rx, b[7:0]);
-            errs = errs + 1;
-         end
-      end
-      #5 cs_n = 1'b1;
-      #20;
-      if (errs == 0) $display("PASS tb_spi_1lane: 256 bytes match");
-      else           $display("FAIL tb_spi_1lane: %0d byte mismatches", errs);
-      $finish;
-   end
+   <<tb_1lane: signals>>
+   <<tb_1lane: byte sampler>>
+   <<tb_1lane: helpers>>
+   <<tb_1lane: scenarios>>
 endmodule
 @
+
+The `pullup` instances model the master-side MISO pull-up that
+turns "slave does not drive" into a deterministic `4'b1111`
+read --- which is exactly what the hardware master sees when
+the IOB output enable never asserts.
+
+<<tb_1lane: signals>>=
+reg        cs_n = 1'b1;
+reg        sclk = 1'b0;
+wire [3:0] io;
+pullup pu0 (io[0]);
+pullup pu1 (io[1]);
+pullup pu2 (io[2]);
+pullup pu3 (io[3]);
+spi #(.LANES(1)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+integer   errs;
+reg [7:0] rx;
+@
+
+The byte sampler clocks eight SCLK rises and samples `io[1]`
+at each rise (mode 0). The slave drives strongly when CS is
+low, overriding the pull-up.
+
+<<tb_1lane: byte sampler>>=
+task automatic clock_byte(input integer expected);
+   integer i;
+   begin
+      rx = 8'd0;
+      for (i = 0; i < 8; i = i + 1) begin
+         #5 sclk = 1'b1;
+         rx = {rx[6:0], io[1]};
+         #5 sclk = 1'b0;
+      end
+      if (rx !== expected[7:0]) begin
+         $display("FAIL byte %0d: got %02x expected %02x",
+                  expected, rx, expected[7:0]);
+         errs = errs + 1;
+      end
+   end
+endtask
+@
+
+`frame` opens CS-low for `count` bytes; `cs_high_quiet` checks
+that with CS high every lane floats to the pull-up.
+
+<<tb_1lane: helpers>>=
+task automatic frame(input integer count);
+   integer k;
+   begin
+      #20 cs_n = 1'b0;
+      #5;
+      for (k = 0; k < count; k = k + 1)
+         clock_byte(k);
+      #5 cs_n = 1'b1;
+      #20;
+   end
+endtask
+task automatic cs_high_quiet;
+   begin
+      #5 sclk = 1'b1;
+      if (io !== 4'b1111) begin
+         $display("FAIL cs-high: io=%b expected 1111 (slave should release)",
+                  io);
+         errs = errs + 1;
+      end
+      #5 sclk = 1'b0;
+   end
+endtask
+@
+
+<<tb_1lane: scenarios>>=
+initial begin
+   errs = 0;
+   cs_high_quiet();
+   cs_high_quiet();
+   frame(256);
+   frame(4096);
+   cs_high_quiet();
+   cs_high_quiet();
+   if (errs == 0)
+      $display("PASS tb_spi_1lane: 4352 bytes plus CS-high checks match");
+   else
+      $display("FAIL tb_spi_1lane: %0d mismatches", errs);
+   $finish;
+end
+@
+
+The 4-lane TB mirrors the 1-lane shape exactly --- same four
+scenarios, same expected byte stream, same pull-up modelling,
+same `errs` accumulator --- but the sampler reads all four
+`io` lines on each rise and reassembles the byte as
+`{second_sample, first_sample}`.
 
 <<tb_spi_quad.sv>>=
 `timescale 1ns/1ps
 
 module tb_spi_quad;
-   reg       cs_n = 1'b1;
-   reg       sclk = 1'b0;
-   wire [3:0] io;
+   <<tb_quad: signals>>
+   <<tb_quad: byte sampler>>
+   <<tb_quad: helpers>>
+   <<tb_quad: scenarios>>
+endmodule
+@
 
-   spi #(.LANES(4)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+<<tb_quad: signals>>=
+reg        cs_n = 1'b1;
+reg        sclk = 1'b0;
+wire [3:0] io;
+pullup pu0 (io[0]);
+pullup pu1 (io[1]);
+pullup pu2 (io[2]);
+pullup pu3 (io[3]);
+spi #(.LANES(4)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+integer    errs;
+reg [3:0]  lo, hi;
+reg [7:0]  rx;
+@
 
-   integer    b;
-   reg [3:0]  lo, hi;
-   reg [7:0]  rx;
-   integer    errs;
+<<tb_quad: byte sampler>>=
+task automatic clock_byte(input integer expected);
+   begin
+      #5 sclk = 1'b1;
+      lo = io;
+      #5 sclk = 1'b0;
+      #5 sclk = 1'b1;
+      hi = io;
+      #5 sclk = 1'b0;
+      rx = {hi, lo};
+      if (rx !== expected[7:0]) begin
+         $display("FAIL byte %0d: got %02x expected %02x",
+                  expected, rx, expected[7:0]);
+         errs = errs + 1;
+      end
+   end
+endtask
+@
 
-   initial begin
-      errs = 0;
+<<tb_quad: helpers>>=
+task automatic frame(input integer count);
+   integer k;
+   begin
       #20 cs_n = 1'b0;
       #5;
-      for (b = 0; b < 256; b = b + 1) begin
-         #5 sclk = 1'b1;
-         lo = io;
-         #5 sclk = 1'b0;
-         #5 sclk = 1'b1;
-         hi = io;
-         #5 sclk = 1'b0;
-         rx = {hi, lo};
-         if (rx !== b[7:0]) begin
-            $display("FAIL byte %0d: got %02x expected %02x", b, rx, b[7:0]);
-            errs = errs + 1;
-         end
-      end
+      for (k = 0; k < count; k = k + 1)
+         clock_byte(k);
       #5 cs_n = 1'b1;
       #20;
-      if (errs == 0) $display("PASS tb_spi_quad: 256 bytes match");
-      else           $display("FAIL tb_spi_quad: %0d byte mismatches", errs);
-      $finish;
    end
-endmodule
+endtask
+task automatic cs_high_quiet;
+   begin
+      #5 sclk = 1'b1;
+      if (io !== 4'b1111) begin
+         $display("FAIL cs-high: io=%b expected 1111 (slave should release)",
+                  io);
+         errs = errs + 1;
+      end
+      #5 sclk = 1'b0;
+   end
+endtask
+@
+
+<<tb_quad: scenarios>>=
+initial begin
+   errs = 0;
+   cs_high_quiet();
+   cs_high_quiet();
+   frame(256);
+   frame(4096);
+   cs_high_quiet();
+   cs_high_quiet();
+   if (errs == 0)
+      $display("PASS tb_spi_quad: 4352 bytes plus CS-high checks match");
+   else
+      $display("FAIL tb_spi_quad: %0d mismatches", errs);
+   $finish;
+end
+@
+
+=== Synthesized netlist check
+
+The RTL benches catch the protocol-level "all pull-up" symptom if
+the behavioural `SB_IO` model is in the sim path, but they do not
+prove that the synthesized netlist still contains the IOB drivers
+that make that model relevant. The netlist checker closes that gap
+without trying to model board timing: after yosys, each variant must
+have exactly four explicit `SB_IO` pads, each pad must be tied to
+the matching `io[n]` port bit, each pad must use the direct-output
+configuration, and every output enable must be driven by the named
+`oe = ~cs_n` net. This is the structural condition the hardware
+failure violated when the lanes floated to the master pull-ups and
+the MP135 read `0xff`.
+
+<<check_spi_netlist.py>>=
+#!/usr/bin/env python3
+import json
+import sys
+
+
+def bits_of(module, netname):
+    try:
+        bits = module["netnames"][netname]["bits"]
+    except KeyError:
+        raise AssertionError(f"missing net {netname!r}")
+    if len(bits) != 1:
+        raise AssertionError(f"net {netname!r} is {len(bits)} bits, expected 1")
+    return bits[0]
+
+
+def check(path, lanes):
+    with open(path) as f:
+        design = json.load(f)
+    try:
+        module = design["modules"]["spi"]
+    except KeyError:
+        raise AssertionError(f"{path}: missing top module 'spi'")
+
+    ports = module["ports"]
+    io_bits = ports["io"]["bits"]
+    oe_bit = bits_of(module, "oe")
+
+    cells = module["cells"]
+    bad_tristates = [
+        name for name, cell in cells.items()
+        if "TBUF" in cell["type"].upper() or "TRIBUF" in cell["type"].upper()
+    ]
+    if bad_tristates:
+        raise AssertionError(f"{path}: inferred fabric tristates remain: {bad_tristates}")
+
+    pads = {
+        tuple(cell["connections"].get("PACKAGE_PIN", [])): (name, cell)
+        for name, cell in cells.items()
+        if cell["type"] == "SB_IO"
+    }
+    if len(pads) != 4:
+        raise AssertionError(f"{path}: found {len(pads)} SB_IO cells, expected 4")
+
+    for lane, io_bit in enumerate(io_bits):
+        key = (io_bit,)
+        if key not in pads:
+            raise AssertionError(f"{path}: missing SB_IO on io[{lane}]")
+        name, cell = pads[key]
+        params = cell.get("parameters", {})
+        conns = cell.get("connections", {})
+        if params.get("PIN_TYPE") != "100101":
+            raise AssertionError(f"{path}: {name} PIN_TYPE={params.get('PIN_TYPE')}, expected 100101")
+        if params.get("NEG_TRIGGER") != "1":
+            raise AssertionError(f"{path}: {name} NEG_TRIGGER={params.get('NEG_TRIGGER')}, expected 1")
+        if conns.get("OUTPUT_ENABLE") != [oe_bit]:
+            raise AssertionError(f"{path}: {name} OUTPUT_ENABLE is not oe")
+        if "OUTPUT_CLK" not in conns:
+            raise AssertionError(f"{path}: {name} missing OUTPUT_CLK")
+        dout = conns.get("D_OUT_0", [])
+        if lanes == 1:
+            should_drive_pattern = lane in (0, 1)
+        else:
+            should_drive_pattern = True
+        if should_drive_pattern and (not dout or isinstance(dout[0], str)):
+            raise AssertionError(f"{path}: {name} data input is constant on active lane {lane}")
+
+    print(f"PASS {path}: {lanes}-lane netlist has explicit SB_IO drivers on all pads")
+
+
+def main(argv):
+    if len(argv) < 2:
+        raise SystemExit("usage: check_spi_netlist.py json:lanes [json:lanes ...]")
+    for spec in argv[1:]:
+        path, lanes_s = spec.rsplit(":", 1)
+        check(path, int(lanes_s))
+
+
+if __name__ == "__main__":
+    main(sys.argv)
 @
 
 === Build fragment
 
-Two synthesis runs over the single `verilog/spi.v` source, each
-overriding the `LANES` macro on the yosys command line. The
-shared `verilog/spi.pcf` feeds nextpnr-ice40 for both. The two
-sims and two bitstreams hang off the top-level `sim` and
-`bitstream` aggregates so a bare `make` builds everything.
+Two synthesis runs over `verilog/spi.v`, each overriding the
+`LANES` macro on the yosys command line. yosys treats `SB_IO`
+as an iCE40 primitive so no extra cell library needs to be
+read. The two simulator builds add the local `SB_IO` model
+(`verilog/SB_IO.v`) to the verilator command alongside
+the testbench and the DUT source. The `sim` aggregate also runs
+the synthesized-netlist structural check because the pull-up
+failure is fundamentally an output-driver presence problem.
 
 <<spi.mk>>=
 SPI_VS := verilog/spi.v
+SPI_SIM_LIB := verilog/SB_IO.v
+SPI_PIN_MASKS := 00 01 02 04 08 10 20
 
 build/spi/spi_1lane.json: $(SPI_VS) | build/spi
 	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 1 spi; synth_ice40 -top spi -json spi_1lane.json"
 
 build/spi/spi_quad.json: $(SPI_VS) | build/spi
 	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 spi; synth_ice40 -top spi -json spi_quad.json"
+
+verilog/spi_pin_drive.v: src/spi.nw | verilog
+	cd verilog && tangle spi_pin_drive.v < ../$<
+
+build/spi/spi_pin_hiz.json: verilog/spi_pin_drive.v | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi_pin_drive.v; synth_ice40 -top spi_pin_hiz -json spi_pin_hiz.json"
+
+build/spi/spi_pin_walk.json: verilog/spi_pin_drive.v | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi_pin_drive.v; synth_ice40 -top spi_pin_walk -json spi_pin_walk.json"
+
+build/spi/spi_pin_%.json: verilog/spi_pin_drive.v | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi_pin_drive.v; chparam -set MASK 6'h$* spi_pin_drive; synth_ice40 -top spi_pin_drive -json spi_pin_$*.json"
+
+build/spi/spi_pin_hiz.asc: build/spi/spi_pin_hiz.json verilog/spi.pcf
+	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_pin_hiz.json --pcf ../../verilog/spi.pcf --asc spi_pin_hiz.asc --freq 12 -q
+
+verilog/spi_pin_walk.pcf: src/spi.nw | verilog
+	cd verilog && tangle spi_pin_walk.pcf < ../$<
+
+build/spi/spi_pin_walk.asc: build/spi/spi_pin_walk.json verilog/spi_pin_walk.pcf
+	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_pin_walk.json --pcf ../../verilog/spi_pin_walk.pcf --asc spi_pin_walk.asc --freq 12 -q
+
+build/spi/spi_pin_%.asc: build/spi/spi_pin_%.json verilog/spi.pcf
+	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_pin_$*.json --pcf ../../verilog/spi.pcf --asc spi_pin_$*.asc --freq 12 -q
+
+build/spi/spi_pin_hiz.bin: build/spi/spi_pin_hiz.asc
+	cd build/spi && icepack spi_pin_hiz.asc spi_pin_hiz.bin
+
+build/spi/spi_pin_walk.bin: build/spi/spi_pin_walk.asc
+	cd build/spi && icepack spi_pin_walk.asc spi_pin_walk.bin
+
+build/spi/spi_pin_%.bin: build/spi/spi_pin_%.asc
+	cd build/spi && icepack spi_pin_$*.asc spi_pin_$*.bin
 
 build/spi/spi_1lane.asc: build/spi/spi_1lane.json verilog/spi.pcf
 	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_1lane.json --pcf ../../verilog/spi.pcf --asc spi_1lane.asc --freq 100 -q
@@ -291,24 +915,169 @@ build/spi/spi_1lane.bin: build/spi/spi_1lane.asc
 build/spi/spi_quad.bin: build/spi/spi_quad.asc
 	cd build/spi && icepack spi_quad.asc spi_quad.bin
 
+build/spi/gpio.bin: build/gpio/gpio.bin | build/spi
+	cp $< $@
+
+build/spi/pin_preflight: build/spi/spi_pin_walk.bin
+	@touch $@
+
+verilog/spi_debug.v: src/spi.nw | verilog
+	cd verilog && tangle spi_debug.v < ../$<
+
+verilog/spi_debug.pcf: src/spi.nw | verilog
+	cd verilog && tangle spi_debug.pcf < ../$<
+
+build/spi/spi_debug.json: verilog/spi_debug.v $(SPI_VS) verilog/uart_tx.v | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v ../../verilog/spi_debug.v ../../verilog/uart_tx.v; hierarchy -top spi_debug; flatten; synth_ice40 -top spi_debug -json spi_debug.json"
+
+build/spi/spi_debug.asc: build/spi/spi_debug.json verilog/spi_debug.pcf
+	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_debug.json --pcf ../../verilog/spi_debug.pcf --asc spi_debug.asc --freq 12 -q
+
+build/spi/spi_debug.bin: build/spi/spi_debug.asc
+	cd build/spi && icepack spi_debug.asc spi_debug.bin
+
+verilog/SB_IO.v: src/spi.nw | verilog
+	cd verilog && tangle SB_IO.v < ../$<
+
 tb/tb_spi_1lane.sv: src/spi.nw | tb
 	cd tb && tangle tb_spi_1lane.sv < ../$<
 
 tb/tb_spi_quad.sv: src/spi.nw | tb
 	cd tb && tangle tb_spi_quad.sv < ../$<
 
-build/spi/sim_1lane: tb/tb_spi_1lane.sv $(SPI_VS) | build/spi
-	cd build/spi && verilator --Mdir obj_1lane -Wall --binary --top-module tb_spi_1lane ../../tb/tb_spi_1lane.sv ../../verilog/spi.v
+build/spi/check_spi_netlist.py: src/spi.nw | build/spi
+	cd build/spi && tangle check_spi_netlist.py < ../../$<
+
+build/spi/sim_1lane: tb/tb_spi_1lane.sv $(SPI_VS) $(SPI_SIM_LIB) | build/spi
+	cd build/spi && verilator --Mdir obj_1lane -Wall --binary --top-module tb_spi_1lane ../../tb/tb_spi_1lane.sv ../../verilog/spi.v ../../verilog/SB_IO.v
 	cd build/spi && obj_1lane/Vtb_spi_1lane
 	@touch $@
 
-build/spi/sim_quad: tb/tb_spi_quad.sv $(SPI_VS) | build/spi
-	cd build/spi && verilator --Mdir obj_quad -Wall --binary --top-module tb_spi_quad ../../tb/tb_spi_quad.sv ../../verilog/spi.v
+build/spi/sim_quad: tb/tb_spi_quad.sv $(SPI_VS) $(SPI_SIM_LIB) | build/spi
+	cd build/spi && verilator --Mdir obj_quad -Wall --binary --top-module tb_spi_quad ../../tb/tb_spi_quad.sv ../../verilog/spi.v ../../verilog/SB_IO.v
 	cd build/spi && obj_quad/Vtb_spi_quad
 	@touch $@
 
+build/spi/netlist_check: build/spi/check_spi_netlist.py build/spi/spi_1lane.json build/spi/spi_quad.json
+	cd build/spi && python3 check_spi_netlist.py spi_1lane.json:1 spi_quad.json:4
+	@touch $@
+
 bitstream: build/spi/spi_1lane.bin build/spi/spi_quad.bin
-sim: build/spi/sim_1lane build/spi/sim_quad
+sim: build/spi/sim_1lane build/spi/sim_quad build/spi/netlist_check
+@
+
+=== Hardware wiring preflight
+
+The streaming SPI tests prove protocol behaviour only after the
+master can already see the slave. They do not, by themselves, prove
+that `spi.pcf` matches the actual harness wiring. The preflight uses
+two existing fixtures to make that explicit:
+
+  - a walking-pin FPGA bitstream starts with the QSPI pins
+    high-impedance so the MP135 boots without any external driver;
+  - the MP135 firmware's `G` command disables QUADSPI and switches
+    `CLK/NCS/IO0/IO1/IO2/IO3` to GPIO inputs;
+  - the same FPGA bitstream then drives `00, 01, 02, 04, 08, 10, 20`
+    on those six pins while the MP135 reads them back.
+
+This keeps the preflight useful when the iCEstick UART channel is not
+available: the observed evidence is the MP135 UART log alone, and every
+programmed FPGA drive pattern is checked from the MPU side.
+
+<<TEST.md>>=
+Preflight -- MP135 QSPI pins reach the expected iCE40 pins.
+
+```
+fpga:program bin=@spi_pin_walk.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+mp135:uart_write data="G\r"
+delay ms=1800
+mp135:uart_write data="G\r"
+delay ms=2100
+mp135:uart_write data="G\r"
+delay ms=2100
+mp135:uart_write data="G\r"
+delay ms=2100
+mp135:uart_write data="G\r"
+delay ms=2100
+mp135:uart_write data="G\r"
+delay ms=2100
+mp135:uart_write data="G\r"
+delay ms=2100
+mp135:uart_write data="G\r"
+delay ms=100
+mp135:uart_close
+```
+
+- Check SPI header wiring via GPIO preflight
+
+@
+
+=== Software bit-bang data preflight
+
+Before the high-speed QUADSPI bench runs, the MP135 `k` command
+clocks the same FPGA bitstreams slowly from GPIO. These blocks prove
+that the FPGA is driving the expected incrementing byte stream on the
+same physical lanes that the peripheral bench later uses. Unlike the
+raw GPIO wiring preflight, these checks assert the received data bytes:
+`00 01 02 ... 0f`.
+
+<<TEST.md>>=
+Preflight -- 1-lane software bit-bang reads the SPI stream.
+
+```
+fpga:program bin=@spi_1lane.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="k 16 0 1\r"
+mp135:uart_expect sentinel="bb read 16 (1lane io=1)" timeout_ms=5000
+mp135:uart_close
+```
+
+- Check 1lane bit-bang read returns incrementing pattern
+
+Preflight -- 1-lane peripheral raw read returns the SPI stream.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 203 0\r"
+delay ms=100
+mp135:uart_write data="j 1024 0\r"
+mp135:uart_expect sentinel="raw read 1024 (1lane)" timeout_ms=5000
+delay ms=1000
+mp135:uart_close
+```
+
+- Check 1lane peripheral raw read returns 1024-byte incrementing pattern
+
+Preflight -- 1-lane peripheral raw read at presc=5.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5 1\r"
+delay ms=100
+mp135:uart_write data="j 512 0\r"
+mp135:uart_expect sentinel="raw read 512 (1lane)" timeout_ms=5000
+delay ms=700
+mp135:uart_close
+```
+
+- Check 1lane peripheral raw read at presc=5 returns 512-byte incrementing pattern
+
 @
 
 === Hardware test plan
@@ -316,8 +1085,10 @@ sim: build/spi/sim_1lane build/spi/sim_quad
 Two phases, each one fenced block per `(mode, prescaler)` so a
 failure pins down exactly which (lane-count, SCLK) pair broke.
 Every block reflashes the MP135 firmware from `flash.tsv`,
-loads the matching bitstream, opens the MP135 console, sets the
-prescaler, and issues the raw bench command. The success
+opens the MP135 console, sets the prescaler, and issues the raw bench
+command. The 1-lane phase reuses the `spi_1lane.bin` image already
+loaded by the 1-lane preflight block, avoiding repeated FPGA
+reprogramming while the iCEstick USB side is recovering. The success
 sentinel is `firsterr` --- it appears in the bench summary line
 only after the whole megabyte has been validated against the
 incrementing pattern.
@@ -333,7 +1104,6 @@ Phase 1 -- 1-lane sweep at presc=203.
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_1lane.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -351,7 +1121,6 @@ Phase 1 -- 1-lane sweep at presc=63.
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_1lane.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -369,7 +1138,6 @@ Phase 1 -- 1-lane sweep at presc=15.
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_1lane.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -387,11 +1155,10 @@ Phase 1 -- 1-lane sweep at presc=5.
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_1lane.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 5\r"
+mp135:uart_write data="p 5 1\r"
 delay ms=100
 mp135:uart_write data="b 1048576 0 1\r"
 mp135:uart_expect sentinel="firsterr" timeout_ms=6000
@@ -405,7 +1172,6 @@ Phase 1 -- 1-lane sweep at presc=2.
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_1lane.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -423,7 +1189,6 @@ Phase 1 -- 1-lane sweep at presc=1.
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_1lane.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -439,9 +1204,9 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=203.
 
 ```
+fpga:program bin=@spi_quad.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_quad.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -457,9 +1222,9 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=63.
 
 ```
+fpga:program bin=@spi_quad.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_quad.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -475,9 +1240,9 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=15.
 
 ```
+fpga:program bin=@spi_quad.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_quad.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -493,9 +1258,9 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=5.
 
 ```
+fpga:program bin=@spi_quad.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_quad.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -511,9 +1276,9 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=2.
 
 ```
+fpga:program bin=@spi_quad.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_quad.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -529,9 +1294,9 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=1.
 
 ```
+fpga:program bin=@spi_quad.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
-fpga:program bin=@spi_quad.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
@@ -567,11 +1332,15 @@ import verify_lib as v
 
 
 UART = "streams/mp135.uart.bin"
+FPGA_UART = "streams/fpga.uart.bin"
 
 BENCH_RE = re.compile(
     rb"bench\s+(\d+)\s+B\s+(1lane|quad)\s+@\s+presc=(\d+)\s+in\s+"
     rb"\d+\s+ms,\s+\d+\.\d+\s+Mbps,\s+crc32=[0-9a-f]+,\s+"
     rb"firsterr=(-?\d+)")
+DEBUG_RE = re.compile(rb"SPI E=([0-9a-f]{4}) S=([0-9a-f]{8})")
+HEXLINE_RE = re.compile(rb"[0-9a-f]{8}:(?:\s+[0-9a-f]{2}){1,16}")
+HEXBYTE_RE = re.compile(rb"\b([0-9a-f]{2})\b")
 
 CHECK_RE = re.compile(r"Check\s+(1lane|quad)\s+@\s+presc=(\d+)\s+"
                       r"pattern correct")
@@ -583,6 +1352,161 @@ def _read_uart():
         return None
     with open(UART, "rb") as f:
         return f.read()
+
+
+def _read_fpga_uart():
+    if not os.path.isfile(FPGA_UART):
+        sys.stderr.write(f"{FPGA_UART} missing\n")
+        return None
+    with open(FPGA_UART, "rb") as f:
+        return f.read()
+
+
+GPIO_READ_RE = re.compile(
+    rb"gpio read:\s+CLK=(\d)\s+NCS=(\d)\s+IO0=(\d)\s+IO1=(\d)\s+"
+    rb"IO2=(\d)\s+IO3=(\d)")
+
+
+def _parse_gpio_reads(raw):
+    out = []
+    for m in GPIO_READ_RE.finditer(raw):
+        bits = [int(x) for x in m.groups()]
+        mask = 0
+        for i, bit in enumerate(bits):
+            mask |= (bit & 1) << i
+        out.append(mask)
+    return out
+
+
+def _last_debug_line():
+    raw = _read_fpga_uart()
+    if raw is None:
+        return None
+    last = None
+    for m in DEBUG_RE.finditer(raw):
+        last = (int(m.group(1), 16), int(m.group(2), 16))
+    if last is None:
+        sys.stderr.write("no FPGA debug line matching SPI E=xxxx S=xxxxxxxx\n")
+        sys.stderr.write("--- FPGA UART tail ---\n")
+        sys.stderr.write(raw[-1024:].decode("ascii", "replace"))
+        sys.stderr.write("\n")
+    return last
+
+
+def check_gpio_wiring():
+    if not v.check_no_errors():
+        return False
+    raw = _read_uart()
+    if raw is None:
+        return False
+    reads = _parse_gpio_reads(raw)
+    expect = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20]
+    if reads[-len(expect):] != expect:
+        sys.stderr.write(
+            "GPIO preflight readback mismatch; expected trailing masks "
+            + " ".join(f"0x{x:02x}" for x in expect) + "\n")
+        sys.stderr.write("--- observed GPIO read masks ---\n")
+        sys.stderr.write(" ".join(f"0x{x:02x}" for x in reads[-16:]))
+        sys.stderr.write("\n--- MP135 UART tail ---\n")
+        sys.stderr.write(raw[-2048:].decode("ascii", "replace"))
+        sys.stderr.write("\n")
+        return False
+    return True
+
+
+def _bytes_after(header):
+    raw = _read_uart()
+    if raw is None:
+        return None
+    pos = raw.find(header)
+    if pos < 0:
+        sys.stderr.write(f"missing header {header!r}\n")
+        sys.stderr.write("--- last 1024 bytes of UART ---\n")
+        sys.stderr.write(raw[-1024:].decode("ascii", "replace"))
+        sys.stderr.write("\n")
+        return None
+    out = []
+    for line in raw[pos + len(header):].splitlines():
+        if not HEXLINE_RE.match(line):
+            if out:
+                break
+            continue
+        payload = line.split(b":", 1)[1]
+        for m in HEXBYTE_RE.finditer(payload):
+            out.append(int(m.group(1), 16))
+    return out
+
+
+def check_bitbang_pattern(mode):
+    if not v.check_no_errors():
+        return False
+    if mode == "quad":
+        header = b"bb read 16 (quad)"
+    else:
+        header = b"bb read 16 (1lane io=1)"
+    got = _bytes_after(header)
+    if got is None:
+        return False
+    expect = list(range(16))
+    sys.stdout.write(
+        f"{mode} bit-bang got: {' '.join(f'{b:02x}' for b in got[:16])}\n")
+    if got[:16] != expect:
+        sys.stderr.write(
+            f"{mode} bit-bang pattern mismatch; expected "
+            f"{' '.join(f'{b:02x}' for b in expect)}\n")
+        return False
+    return True
+
+
+def check_raw_read_pattern(mode, count):
+    if not v.check_no_errors():
+        return False
+    if mode == "quad":
+        header = f"raw read {count} (quad)".encode("ascii")
+    else:
+        header = f"raw read {count} (1lane)".encode("ascii")
+    got = _bytes_after(header)
+    if got is None:
+        return False
+    expect = [i & 0xff for i in range(count)]
+    sys.stdout.write(
+        f"{mode} raw got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+    if len(got) < count:
+        sys.stderr.write(
+            f"{mode} raw short capture: got {len(got)} bytes, "
+            f"expected {count}\n")
+        return False
+    if got[:count] != expect:
+        for i, (g, e) in enumerate(zip(got[:count], expect)):
+            if g != e:
+                sys.stderr.write(
+                    f"{mode} raw mismatch at {i}: got {g:02x}, "
+                    f"expected {e:02x}\n")
+                break
+        return False
+    return True
+
+
+def check_debug_edges():
+    if not v.check_no_errors():
+        return False
+    got = _last_debug_line()
+    if got is None:
+        return False
+    edges, samples = got
+    sys.stdout.write(f"FPGA debug: edges={edges} samples=0x{samples:08x}\n")
+    return edges == 0x8000
+
+
+def check_debug_samples():
+    if not v.check_no_errors():
+        return False
+    got = _last_debug_line()
+    if got is None:
+        return False
+    edges, samples = got
+    sys.stdout.write(f"FPGA debug: edges={edges} samples=0x{samples:08x}\n")
+    return samples == 0x00010203
 
 
 def _bench_pick(mode, presc):
@@ -597,6 +1521,8 @@ def _bench_pick(mode, presc):
 
 
 def check_pattern(mode, presc):
+    if not v.check_no_errors():
+        return False
     m = _bench_pick(mode, presc)
     if m is None:
         sys.stderr.write(
@@ -624,6 +1550,19 @@ def _make_dispatch():
     the hardware test plan. Keys exactly match the TEST.md bullets."""
     presc_steps = [203, 63, 15, 5, 2, 1]
     out = {}
+    out["Check SPI header wiring via GPIO preflight"] = check_gpio_wiring
+    out["Check 1lane bit-bang read returns incrementing pattern"] = (
+        lambda: check_bitbang_pattern("1lane"))
+    out["Check 1lane peripheral raw read returns 1024-byte incrementing pattern"] = (
+        lambda: check_raw_read_pattern("1lane", 1024))
+    out["Check 1lane peripheral raw read at presc=5 returns 512-byte incrementing pattern"] = (
+        lambda: check_raw_read_pattern("1lane", 512))
+    out["Check quad bit-bang read returns incrementing pattern"] = (
+        lambda: check_bitbang_pattern("quad"))
+    out["Check FPGA UART debug reports first 32 SCLK edges"] = (
+        check_debug_edges)
+    out["Check FPGA UART debug first 32 IO1 samples are 00 01 02 03"] = (
+        check_debug_samples)
     for mode in ("1lane", "quad"):
         for p in presc_steps:
             key = f"Check {mode} @ presc={p} pattern correct"
@@ -651,15 +1590,185 @@ without invoking the parent.
 <<Makefile>>=
 NW := ../../src/spi.nw
 
-.PHONY: all test
-all: TEST.md verify.py
+.PHONY: all test bitstreams
+all: TEST.md verify.py run_full_with_ledger.py
 
-test: all
-	python3 $$TEST_SERV/run_md.py
+test: all bitstreams
+	python3 run_full_with_ledger.py
+
+bitstreams:
+	$(MAKE) -C ../.. build/spi/pin_preflight build/spi/spi_1lane.bin build/spi/spi_quad.bin
 
 TEST.md: $(NW)
 	tangle TEST.md < $<
 
 verify.py: $(NW)
 	tangle verify.py < $<
+
+run_full_with_ledger.py: $(NW)
+	tangle run_full_with_ledger.py < $<
+@
+
+The hardware regression wrapper is the default `make test` entry point
+for this chapter. It follows the normal `run_md.py` behavior: run
+blocks in order and stop at the first failing block. Before each run it
+archives stale `test_out` so hardware is exercised again after edits.
+It appends a compact text row to `ledger.txt` with datetime,
+`example:test-hash`, and the number of checks that passed.
+
+<<run_full_with_ledger.py>>=
+#!/usr/bin/env python3
+import datetime as _dt
+import hashlib
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _git(args):
+    try:
+        return subprocess.check_output(
+            ["git"] + args, text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _archive_old_test_out(run_id):
+    if not os.path.exists("test_out"):
+        return None
+    os.makedirs("test_runs", exist_ok=True)
+    dst = os.path.join("test_runs", f"{run_id}_previous")
+    suffix = 0
+    final = dst
+    while os.path.exists(final):
+        suffix += 1
+        final = f"{dst}_{suffix}"
+    shutil.move("test_out", final)
+    return final
+
+
+def _ts():
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _append_line(path, text):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+
+
+def _stream_command(cmd, log_path, mode, phase, tee_paths=None):
+    tee_paths = tee_paths or []
+    print(f"+ {' '.join(cmd)}")
+    start = _dt.datetime.now(_dt.timezone.utc)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1)
+    output = []
+    with open(log_path, mode, encoding="utf-8") as log:
+        header = f"{_ts()} + {' '.join(cmd)}\n"
+        log.write(f"+ {' '.join(cmd)}\n")
+        log.flush()
+        for path in tee_paths:
+            _append_line(path, header)
+        while True:
+            ready, _, _ = select.select([proc.stdout], [], [], 10.0)
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                now = _dt.datetime.now(_dt.timezone.utc)
+                elapsed = int((now - start).total_seconds())
+                detail = f"{phase}; elapsed={elapsed}s; cmd={' '.join(cmd)}"
+                if tee_paths:
+                    detail += "; live log=run_md.log"
+                line = f"{_ts()} still running: {detail}\n"
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log.write(line)
+                log.flush()
+                for path in tee_paths:
+                    _append_line(path, line)
+                continue
+            line = proc.stdout.readline()
+            if line == "":
+                break
+            stamped = f"{_ts()} {line}"
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            log.write(line)
+            log.flush()
+            for path in tee_paths:
+                _append_line(path, stamped)
+            output.append(line)
+    return proc.wait(), "".join(output)
+
+
+def _build_bitstreams(log_path):
+    cmd = ["make", "-C", "../..",
+           "build/spi/pin_preflight",
+           "build/spi/spi_1lane.bin",
+           "build/spi/spi_quad.bin"]
+    return _stream_command(cmd, log_path, "w", "building SPI bitstreams")
+
+
+def _run_regression(log_path):
+    cmd = [sys.executable, os.path.join(os.environ["TEST_SERV"], "run_md.py")]
+    return _stream_command(
+        cmd, log_path, "a", "waiting for hardware regression", ["run_md.log"])
+
+
+def _summarize(output):
+    clean = ANSI_RE.sub("", output)
+    return {
+        "check_pass": len(re.findall(r"\[PASS\]", clean)),
+        "check_fail": len(re.findall(r"\[FAIL\]", clean)),
+        "block_success": len(re.findall(r"--- block [^:]+: SUCCESS ---", clean)),
+        "block_fail": len(re.findall(r"--- block [^:]+: FAIL ---", clean)),
+        "summary": clean.strip().splitlines()[-1] if clean.strip() else "",
+    }
+
+
+def main():
+    if "TEST_SERV" not in os.environ:
+        sys.stderr.write("TEST_SERV is not set\n")
+        return 2
+    run_id = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    test_hash = _sha256("TEST.md")
+    os.makedirs("test_logs", exist_ok=True)
+    log_path = os.path.join("test_logs", f"{run_id}_{test_hash[:12]}.log")
+
+    build_rc, build_output = _build_bitstreams(log_path)
+    archived = None
+    output = build_output
+    if build_rc == 0:
+        archived = _archive_old_test_out(run_id)
+        rc, run_output = _run_regression(log_path)
+        output += run_output
+    else:
+        rc = build_rc
+    stats = _summarize(output)
+    row = f"{run_id} spi:{test_hash} {stats['check_pass']}\n"
+    with open("ledger.txt", "a", encoding="utf-8") as f:
+        f.write(row)
+    print(f"ledger: {row.strip()}")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 @
