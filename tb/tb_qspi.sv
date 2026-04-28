@@ -161,27 +161,35 @@ module tb_qspi;
    endtask
 
    // 0x6B data byte: master tri-states all four IO lines and
-   // samples IO[3:0] on each SCLK rise. Two rises per data byte;
-   // first rise = upper nibble, second rise = lower nibble. The
-   // returned byte is assembled from the JEDEC mapping
-   //   {IO3_hi, IO2_hi, IO1_hi, IO0_hi, IO3_lo, IO2_lo, IO1_lo, IO0_lo}.
+   // samples IO[3:0] on each SCLK rise. Two rises per data byte.
+   // STM32MP1 QUADSPI indirect-read assembles each byte as
+   // {second_sample, first_sample} -- the slave drives LOWER
+   // nibble on the first negedge and UPPER on the second.
+   //
+   // Sampling cadence matches a real QSPI master: the bus value
+   // is captured AT THE END of the high pulse, after `t_h` of
+   // slave-side hold time has elapsed since the previous negedge
+   // drive. Sampling earlier (immediately at the rising edge)
+   // hides off-by-one slave cadence bugs that show up only once
+   // the master demands stable data through the full clock-high
+   // window.
    task automatic spi_quad_data_byte(output [7:0] got);
-      reg [3:0] hi_nib, lo_nib;
+      reg [3:0] first_nib, second_nib;
       begin
          tb_io_oe  = 4'b0000;
          tb_io_out = 4'b0000;
          #(t_q);
          sclk = 1;
-         hi_nib = io[3:0];
          #(t_h);
+         first_nib = io[3:0];   // LOWER nibble of the byte
          sclk = 0;
          #(t_q);
          sclk = 1;
-         lo_nib = io[3:0];
          #(t_h);
+         second_nib = io[3:0];  // UPPER nibble of the byte
          sclk = 0;
          #(t_q);
-         got = {hi_nib, lo_nib};
+         got = {second_nib, first_nib};
       end
    endtask
 
@@ -655,11 +663,12 @@ module tb_qspi;
       end
 
       // Frame 16b: 0x6B quad-output readback at addr 0 -- expect
-      // pattern 0x00..0x0F. This is the step-15 nibble-alignment
-      // regression test: prior cadence presented
-      // `{byte_N_upper, byte_{N+1}_lower}` for every pair; the
-      // `quad_byte_phase` toggle re-aligns so
-      // `{byte_N_upper, byte_N_lower}` is delivered.
+      // pattern 0x00..0x0F. Nibble-alignment regression: the
+      // negedge presenter must drive `{byte_N_upper, byte_N_lower}`
+      // for byte N (not the silicon-observed
+      // `{byte_N_lower, byte_N_upper}` swap of the first revision,
+      // which was caused by a phase-shift between the prefetch
+      // mirror and the negedge slice).
       begin : frame16b
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -1065,6 +1074,80 @@ module tb_qspi;
                $fatal(1, "FAIL: stream-03-1k data[%0d]=%02h want %02h",
                       k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=4", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 30/31: ULTRA-high SCLK (~91 MHz) streaming stress on
+      // both single-lane fast read and quad-output read. Mimics
+      // the timing pressure that exposed the data_byte mux bug on
+      // hardware: a 41 MHz silicon SCLK saw `data_byte` increment
+      // twice between consecutive single-lane bytes because the
+      // dispatch case-chain composed a deep adder+mux into the
+      // pattern flop. Pulling the increment out of the chain into
+      // its own gated assignment shortens the path; this frame
+      // runs the resulting design at simulator's t_q = 3 ns,
+      // t_h = 5 ns (period 11 ns => ~91 MHz), well into the
+      // sclk-domain Fmax envelope.
+      t_q = 3;
+      t_h = 5;
+
+      // Frame 30: 0x0B Fast Read, 256 data bytes from addr 0x000
+      // at ~91 MHz SCLK. The deterministic pattern (k & 0xFF)
+      // catches single-lane data_byte cadence faults that the
+      // 50 MHz frames above run too slowly to provoke.
+      begin : stream_0b_ultra
+         reg [7:0] got_dummy;
+         reg [7:0] got_arr [0:255];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h0B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_byte(8'h00, 1'b0, got_dummy);
+         for (k = 0; k < 256; k = k + 1)
+            spi_byte(8'h00, 1'b0, got_arr[k]);
+         #200 cs_n = 1;
+         if (got_dummy !== 8'h00)
+            $fatal(1, "FAIL: stream-0B-ultra dummy MISO = %02h, want 00", got_dummy);
+         for (k = 0; k < 256; k = k + 1)
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: stream-0B-ultra data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
+         // 1 + 3 + 1 + 256 = 261 bytes; printer renders mod 256 = 5.
+         expect_line("op=0b bytes=5", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 31: 0x6B Quad Output Read, 256 data bytes from addr 0
+      // at ~91 MHz SCLK. The tightened spi_quad_data_byte sample
+      // window (sample at end of high time, not at the rising
+      // edge) makes any remaining slave-side cadence skew between
+      // the negedge nibble drive and the master's sample show up
+      // as a per-byte data error.
+      begin : stream_6b_ultra
+         reg [7:0] got_arr [0:255];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         release_io();
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_dummy_quad();
+         for (k = 0; k < 256; k = k + 1)
+            spi_quad_data_byte(got_arr[k]);
+         #200 cs_n = 1;
+         for (k = 0; k < 256; k = k + 1)
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: stream-6B-ultra data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
+         // 1 + 3 + 1 + 256/4 = 69 bytes; mod 256 = 69.
+         expect_line("op=6b bytes=69", oracle_crc ^ 32'hFFFFFFFF);
       end
 
       $display("PASS");

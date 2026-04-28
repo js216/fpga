@@ -187,25 +187,46 @@ always @(posedge sclk or posedge cs_async_rst) begin
       <<SPI: RAM write at boundaries>>
       <<SPI: quad input data phase>>
       <<SPI: quad output pattern increment>>
+      <<SPI: single-lane data-phase increment>>
       <<SPI: byte boundary actions>>
    end
 end
 @
 
+The single-lane reads (0x03 and 0x0B) emit one pattern byte per
+single-lane SCLK byte. The increment is pulled out of the
+opcode-dispatch case-chain into its own chunk so the
+`data_byte` flop is fed by a shallow LUT rather than by a deep
+priority encoder threading through every dispatch arm. The
+preload at the phase-3 boundary (capturing the address LSB,
+optionally plus 1 for 0x03's same-boundary first response byte)
+remains in the dispatch chunk because it is mutually exclusive
+with the data-phase increment: the increment fires only at
+phase counts STRICTLY past the preload phase.
+
+<<SPI: single-lane data-phase increment>>=
+if (byte_done && (   (opcode == 8'h03 && phase_cnt >  3'd3)
+                  || (opcode == 8'h0B && phase_cnt >= 3'd4)))
+   data_byte <= data_byte + 8'd1;
+@
+
 For 0x6B Quad Output Read the slave emits one pattern byte every
 two sclk rises (one rise per nibble). The pattern counter
-`data_byte` therefore must increment on `quad_advance` --- the
-same edge on which the quad-output engine refreshes its
-`quad_byte` register --- not at the eight-rise byte boundary
-that gates single-lane reads. Putting the increment in its own
-chunk inside the shift engine's posedge process keeps a single
-writer to `data_byte`: the dispatch chunk loads it on the
-address boundary for both read families and increments it on
-single-lane byte boundaries; this chunk handles the quad
-cadence. The two conditions are mutually exclusive (single-lane
-byte boundaries occur only when `quad_data` is low for the
-relevant opcodes, and `quad_advance` only fires inside the 0x6B
-data phase).
+`data_byte` therefore must increment once per quad byte ---
+specifically on the rise that completes a byte's lower-nibble
+sample (the second of the byte's two rises), so that the next
+negedge drives the upper nibble of the new byte. `bit_cnt[0]`
+in the data phase is high on exactly those rises (the second,
+fourth, sixth, eighth rise of every 8-rise span maps cleanly to
+the second rise of each two-rise quad byte), so it doubles as
+both the increment trigger and the negedge presenter's
+nibble-select. Putting the increment in its own chunk inside
+the shift engine's posedge process keeps a single writer site
+for the quad cadence: the dispatch chunk loads `data_byte` on
+the address boundary; this chunk advances it during the data
+phase. The conditions are mutually exclusive --- the dispatch
+phase-3 load and the data-phase increment share `byte_done` but
+gate on different `phase_cnt` values.
 
 <<SPI: quad output pattern increment>>=
 if (quad_advance) data_byte <= data_byte + 8'd1;
@@ -341,15 +362,10 @@ end else if (opcode == 8'h03 && phase_cnt == 3'd3) begin
    data_byte <= byte_captured + 8'd1;
 end else if (opcode == 8'h03 && phase_cnt > 3'd3) begin
    shift_out <= data_byte;
-   data_byte <= data_byte + 8'd1;
 end else if (opcode == 8'h0B && phase_cnt == 3'd3) begin
    data_byte <= byte_captured;
-end else if (opcode == 8'h0B && phase_cnt == 3'd4) begin
+end else if (opcode == 8'h0B && phase_cnt >= 3'd4) begin
    shift_out <= data_byte;
-   data_byte <= data_byte + 8'd1;
-end else if (opcode == 8'h0B && phase_cnt > 3'd4) begin
-   shift_out <= data_byte;
-   data_byte <= data_byte + 8'd1;
 end else if (opcode == 8'h02 && phase_cnt == 3'd3) begin
    addr_low <= new_low;
 end else if (opcode == 8'h02 && phase_cnt > 3'd3 && wel) begin
@@ -360,10 +376,7 @@ end else if (opcode == 8'h6B && phase_cnt == 3'd3) begin
    data_byte <= byte_captured;
 end else if (opcode == 8'h5A && phase_cnt == 3'd3) begin
    sfdp_idx <= byte_captured[6:0];
-end else if (opcode == 8'h5A && phase_cnt == 3'd4) begin
-   shift_out <= sfdp_rd;
-   sfdp_idx  <= sfdp_idx + 7'd1;
-end else if (opcode == 8'h5A && phase_cnt > 3'd4) begin
+end else if (opcode == 8'h5A && phase_cnt >= 3'd4) begin
    shift_out <= sfdp_rd;
    sfdp_idx  <= sfdp_idx + 7'd1;
 end
@@ -565,125 +578,135 @@ end
 @
 
 For 0x6B Quad Output Read the FPGA drives all four IO pins during
-the data phase at one nibble per SCLK cycle: upper nibble on the
-first cycle of a data byte, lower nibble on the second. Each
-nibble is presented on the preceding SCLK falling edge so the
-master samples stable data on the rising edge (mode 0). Each data
-byte therefore takes 2 SCLK cycles = 2 `bit_cnt` increments = a
-quarter of a single-lane byte period; `byte_cnt` still counts
-single-lane SCLK-bytes, so sixteen quad data bytes show up as
-four `byte_cnt` increments in the printer's `bytes=` field.
+the data phase at one nibble per SCLK cycle: LOWER nibble on the
+first cycle of a data byte, UPPER nibble on the second. The
+STM32MP1 QUADSPI peripheral in indirect-read quad mode assembles
+each byte as `{second_sample, first_sample}`, which makes
+"lower-first" the correct slave drive order; driving "upper-first"
+(the default JEDEC assumption) appears on the master as a per-byte
+nibble swap (`0x01` shows up as `0x10`). Each nibble is presented
+on the preceding SCLK falling edge so the master samples stable
+data on the rising edge (mode 0). Each data byte therefore takes
+2 SCLK cycles = 2 `bit_cnt` increments = a quarter of a
+single-lane byte period; `byte_cnt` still counts single-lane
+SCLK-bytes, so sixteen quad data bytes show up as four `byte_cnt`
+increments in the printer's `bytes=` field.
 
 The engine partitions into state, the data-phase qualifier
-`quad_data`, an sclk-domain pointer-and-fetch process that
-straddles the byte boundary, and a negedge presenter that slices
-the prefetched byte into nibbles.
+`quad_data`, and a negedge presenter that slices `data_byte`
+directly into nibbles. There is no separate `quad_byte` mirror
+register: `data_byte` (which already holds the running pattern
+value as a single sclk-domain register written by the shift
+engine) is sliced live by the presenter on each negedge.
+Eliminating the mirror also eliminates the off-by-one byte that
+arose when the mirror's load edge and the presenter's slice
+edge were not phase-locked, which the iCE40 silicon exposed as
+a `{byte_N_lower, byte_N_upper}` nibble swap on every
+post-first byte of a streamed 0x6B read.
 
 <<SPI: quad output engine>>=
 <<SPI: quad output state>>
 <<SPI: quad output qualifiers>>
-<<SPI: quad output sclk process>>
+<<SPI: quad output nibble precompute>>
 <<SPI: quad output negedge presenter>>
 @
 
-`quad_phase` is the negedge presenter's nibble-select (0 = upper
-next, 1 = lower next). `quad_byte` is the prefetched pattern
-byte the presenter slices into nibbles. It is loaded from the
-shift engine's `data_byte` pattern counter, which holds the
-address LSB at the start of the data phase and is incremented
-on every `quad_advance` edge.
+`quad_out` is the registered nibble the presenter places on
+`io[3:0]` each negedge of the data phase. No additional state
+is needed: the upper-vs-lower nibble select reads `bit_cnt[0]`
+(the same per-rise counter the shift engine already maintains)
+and the byte being driven is the live `data_byte` value.
 
 <<SPI: quad output state>>=
 reg [3:0] quad_out;
-reg       quad_phase;
-reg [7:0] quad_byte;
-
+reg [3:0] quad_next_nibble;
 initial begin
-   quad_out   = 0;
-   quad_phase = 0;
-   quad_byte  = 0;
+   quad_out         = 0;
+   quad_next_nibble = 0;
 end
 @
 
-`quad_data` is high during the 0x6B data phase only --- after the
-opcode, three address bytes, and dummy byte (five single-lane
-SCLK-bytes). `phase_cnt` saturates at 7, which still satisfies
-`>= 5` for every subsequent byte, so the qualifier needs no
-additional latch.
+`quad_data` is high during the 0x6B data phase only --- after
+the opcode, three address bytes, and dummy byte (five
+single-lane SCLK-bytes). `phase_cnt` saturates at 7, which
+still satisfies `>= 5` for every subsequent byte, so the
+qualifier needs no additional latch.
 
-`quad_advance` fires the byte fetch in the sclk process. The
-data phase uses two negedges per RAM byte, so `quad_byte` must
-stay stable across both negedges of a pair and refresh before
-the third. The cadence is set by a dedicated sclk-domain toggle
-`quad_byte_phase` that starts at 0 the cycle the data phase
-begins (the `!quad_data` branch in the process below resets it)
-and flips on every subsequent rise; the advance fires on the
-posedge after two negedges have consumed the current byte.
-`bit_cnt[0]` is the wrong reference --- it phases off the
-upper-nibble negedge by one cycle and reassembles
-`{byte_N_upper, byte_{N+1}_lower}` for every pair.
+`quad_advance` fires once per quad byte at the rise that
+completes the byte's lower-nibble sample (the rise immediately
+after the negedge that drove the lower nibble). With the data
+phase aligned to a single-lane byte boundary --- both
+`bit_cnt` and `phase_cnt` advance in lockstep with the
+single-lane shift engine --- `bit_cnt[0]` is high on rises 1,
+3, 5, 7 of the eight-rise span, which are exactly the second
+rises of consecutive two-rise quad bytes. Using `bit_cnt[0]`
+directly removes the dedicated `quad_byte_phase` toggle and
+collapses the increment trigger and the negedge nibble-select
+onto the same well-defined sclk-domain bit.
 
 <<SPI: quad output qualifiers>>=
-wire quad_data = (opcode == 8'h6B) && (phase_cnt >= 3'd5);
-
-reg        quad_byte_phase;
-initial    quad_byte_phase = 0;
-wire       quad_advance = quad_data && quad_byte_phase;
+wire quad_data    = (opcode == 8'h6B) && (phase_cnt >= 3'd5);
+wire quad_advance = quad_data && bit_cnt[0];
 @
 
-The sclk process samples the shift engine's `data_byte` pattern
-counter at every rise during the data phase. The `!quad_data`
-branch (re-entered each cycle the data phase has not yet
-started) latches `quad_byte` directly from `data_byte` and
-zeroes the cadence toggle. Inside the data phase the toggle
-flips every rise; on each `quad_advance` cycle the shift engine
-increments `data_byte` and the quad block latches the
-post-increment value (`data_byte + 1`) into `quad_byte` so both
-registers stay in lockstep with the running pattern. Reading
-`data_byte` here is a same-domain read (both processes are on
-`posedge sclk`) and only one block writes the register, so
-there is no multi-driver and no extra pipeline stage.
+The negedge presenter is split into a posedge precompute and
+a half-cycle-later registered drive. The precompute runs in
+the sclk-posedge process and produces `quad_next_nibble` ---
+the 4-bit value the next negedge will place on `io[3:0]`. By
+the time the next negedge fires, the value is already a stable
+posedge-domain register output; the negedge presenter is a
+trivial `quad_out <= quad_next_nibble`, which keeps the
+posedge-to-negedge path (the half-period-budget critical path)
+down to a single flop hop.
 
-<<SPI: quad output sclk process>>=
+The precompute decides upper-vs-lower from `~bit_cnt[0]`
+(the value `bit_cnt[0]` will have post-rise: the upcoming
+negedge sees that). It selects the nibble out of `data_byte`,
+biased by an unconditional advance increment when `quad_advance`
+is asserted on this same edge --- so the byte index used by
+the precompute matches the byte index `data_byte` will hold
+post-rise, eliminating the off-by-one byte that any
+non-coherent prefetch arrangement leaks.
+
+<<SPI: quad output nibble precompute>>=
+// `data_byte_next_quad` is the value `data_byte` will hold
+// after this posedge (which `quad_next_nibble` must slice
+// from, so the negedge half a cycle later drives a value
+// consistent with the new byte index).
+wire [7:0] data_byte_next_quad =
+   data_byte + (quad_advance ? 8'd1 : 8'd0);
+
+// `quad_data_post` is the post-rise value of `quad_data`. It
+// is needed to prime `quad_next_nibble` on the rise that ENDS
+// the dummy byte (where `quad_data` is still 0 pre-rise but 1
+// post-rise) so the very first negedge of the data phase has
+// a valid upper-nibble of byte 0 already loaded into the
+// presenter's source register.
+wire quad_data_post = quad_data
+   || (byte_done && phase_cnt == 3'd4 && opcode == 8'h6B);
+
 always @(posedge sclk or posedge cs_async_rst) begin
    if (cs_async_rst) begin
-      quad_byte       <= 0;
-      quad_byte_phase <= 0;
-   end else begin
-      if (!quad_data) begin
-         quad_byte       <= data_byte;
-         quad_byte_phase <= 1'b0;
-      end else begin
-         quad_byte_phase <= ~quad_byte_phase;
-         if (quad_advance) begin
-            quad_byte <= data_byte + 8'd1;
-         end
-      end
+      quad_next_nibble <= 4'b0;
+   end else if (quad_data_post) begin
+      // STM32MP1 QUADSPI indirect-read assembles each byte as
+      // {second_sample[3:0], first_sample[3:0]} -- the FIRST
+      // negedge of a byte cycle drives the LOWER nibble and the
+      // second drives the UPPER. Post-rise bit_cnt[0] is the
+      // inverse of the pre-rise value: pre-rise 1 (the rise that
+      // completes the dummy byte or a quad-byte cycle) gives
+      // post-rise 0, which is the "first negedge of the next
+      // byte" slot, and the lower nibble is what we drive there.
+      if (bit_cnt[0] == 1'b1) quad_next_nibble <= data_byte_next_quad[3:0];
+      else                    quad_next_nibble <= data_byte_next_quad[7:4];
    end
 end
 @
-
-The negedge presenter is a pure registered slice of `quad_byte`
-into `quad_out`. It does not touch RAM; just a 4-bit mux into a
-flop, alternating upper and lower nibble each negedge of the
-data phase.
 
 <<SPI: quad output negedge presenter>>=
 always @(negedge sclk or posedge cs_async_rst) begin
-   if (cs_async_rst) begin
-      quad_out   <= 0;
-      quad_phase <= 0;
-   end else if (quad_data) begin
-      if (quad_phase == 1'b0) begin
-         quad_out   <= quad_byte[7:4];
-         quad_phase <= 1'b1;
-      end else begin
-         quad_out   <= quad_byte[3:0];
-         quad_phase <= 1'b0;
-      end
-   end else begin
-      quad_phase <= 1'b0;
-   end
+   if (cs_async_rst) quad_out <= 4'b0;
+   else if (quad_data) quad_out <= quad_next_nibble;
 end
 @
 
@@ -1386,27 +1409,35 @@ module tb_qspi;
    endtask
 
    // 0x6B data byte: master tri-states all four IO lines and
-   // samples IO[3:0] on each SCLK rise. Two rises per data byte;
-   // first rise = upper nibble, second rise = lower nibble. The
-   // returned byte is assembled from the JEDEC mapping
-   //   {IO3_hi, IO2_hi, IO1_hi, IO0_hi, IO3_lo, IO2_lo, IO1_lo, IO0_lo}.
+   // samples IO[3:0] on each SCLK rise. Two rises per data byte.
+   // STM32MP1 QUADSPI indirect-read assembles each byte as
+   // {second_sample, first_sample} -- the slave drives LOWER
+   // nibble on the first negedge and UPPER on the second.
+   //
+   // Sampling cadence matches a real QSPI master: the bus value
+   // is captured AT THE END of the high pulse, after `t_h` of
+   // slave-side hold time has elapsed since the previous negedge
+   // drive. Sampling earlier (immediately at the rising edge)
+   // hides off-by-one slave cadence bugs that show up only once
+   // the master demands stable data through the full clock-high
+   // window.
    task automatic spi_quad_data_byte(output [7:0] got);
-      reg [3:0] hi_nib, lo_nib;
+      reg [3:0] first_nib, second_nib;
       begin
          tb_io_oe  = 4'b0000;
          tb_io_out = 4'b0000;
          #(t_q);
          sclk = 1;
-         hi_nib = io[3:0];
          #(t_h);
+         first_nib = io[3:0];   // LOWER nibble of the byte
          sclk = 0;
          #(t_q);
          sclk = 1;
-         lo_nib = io[3:0];
          #(t_h);
+         second_nib = io[3:0];  // UPPER nibble of the byte
          sclk = 0;
          #(t_q);
-         got = {hi_nib, lo_nib};
+         got = {second_nib, first_nib};
       end
    endtask
 
@@ -1880,11 +1911,12 @@ module tb_qspi;
       end
 
       // Frame 16b: 0x6B quad-output readback at addr 0 -- expect
-      // pattern 0x00..0x0F. This is the step-15 nibble-alignment
-      // regression test: prior cadence presented
-      // `{byte_N_upper, byte_{N+1}_lower}` for every pair; the
-      // `quad_byte_phase` toggle re-aligns so
-      // `{byte_N_upper, byte_N_lower}` is delivered.
+      // pattern 0x00..0x0F. Nibble-alignment regression: the
+      // negedge presenter must drive `{byte_N_upper, byte_N_lower}`
+      // for byte N (not the silicon-observed
+      // `{byte_N_lower, byte_N_upper}` swap of the first revision,
+      // which was caused by a phase-shift between the prefetch
+      // mirror and the negedge slice).
       begin : frame16b
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -2290,6 +2322,80 @@ module tb_qspi;
                $fatal(1, "FAIL: stream-03-1k data[%0d]=%02h want %02h",
                       k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=4", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 30/31: ULTRA-high SCLK (~91 MHz) streaming stress on
+      // both single-lane fast read and quad-output read. Mimics
+      // the timing pressure that exposed the data_byte mux bug on
+      // hardware: a 41 MHz silicon SCLK saw `data_byte` increment
+      // twice between consecutive single-lane bytes because the
+      // dispatch case-chain composed a deep adder+mux into the
+      // pattern flop. Pulling the increment out of the chain into
+      // its own gated assignment shortens the path; this frame
+      // runs the resulting design at simulator's t_q = 3 ns,
+      // t_h = 5 ns (period 11 ns => ~91 MHz), well into the
+      // sclk-domain Fmax envelope.
+      t_q = 3;
+      t_h = 5;
+
+      // Frame 30: 0x0B Fast Read, 256 data bytes from addr 0x000
+      // at ~91 MHz SCLK. The deterministic pattern (k & 0xFF)
+      // catches single-lane data_byte cadence faults that the
+      // 50 MHz frames above run too slowly to provoke.
+      begin : stream_0b_ultra
+         reg [7:0] got_dummy;
+         reg [7:0] got_arr [0:255];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h0B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_byte(8'h00, 1'b0, got_dummy);
+         for (k = 0; k < 256; k = k + 1)
+            spi_byte(8'h00, 1'b0, got_arr[k]);
+         #200 cs_n = 1;
+         if (got_dummy !== 8'h00)
+            $fatal(1, "FAIL: stream-0B-ultra dummy MISO = %02h, want 00", got_dummy);
+         for (k = 0; k < 256; k = k + 1)
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: stream-0B-ultra data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
+         // 1 + 3 + 1 + 256 = 261 bytes; printer renders mod 256 = 5.
+         expect_line("op=0b bytes=5", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 31: 0x6B Quad Output Read, 256 data bytes from addr 0
+      // at ~91 MHz SCLK. The tightened spi_quad_data_byte sample
+      // window (sample at end of high time, not at the rising
+      // edge) makes any remaining slave-side cadence skew between
+      // the negedge nibble drive and the master's sample show up
+      // as a per-byte data error.
+      begin : stream_6b_ultra
+         reg [7:0] got_arr [0:255];
+         integer   k;
+         oracle_crc = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+         release_io();
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_dummy_quad();
+         for (k = 0; k < 256; k = k + 1)
+            spi_quad_data_byte(got_arr[k]);
+         #200 cs_n = 1;
+         for (k = 0; k < 256; k = k + 1)
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: stream-6B-ultra data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
+         // 1 + 3 + 1 + 256/4 = 69 bytes; mod 256 = 69.
+         expect_line("op=6b bytes=69", oracle_crc ^ 32'hFFFFFFFF);
       end
 
       $display("PASS");

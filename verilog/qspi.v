@@ -64,6 +64,9 @@ module qspi (
             end
          end
          if (quad_advance) data_byte <= data_byte + 8'd1;
+         if (byte_done && (   (opcode == 8'h03 && phase_cnt >  3'd3)
+                           || (opcode == 8'h0B && phase_cnt >= 3'd4)))
+            data_byte <= data_byte + 8'd1;
          if (byte_done) begin
             byte_cnt  <= byte_cnt  + 16'd1;
             if (phase_cnt != 3'd7) phase_cnt <= phase_cnt + 3'd1;
@@ -80,15 +83,10 @@ module qspi (
                data_byte <= byte_captured + 8'd1;
             end else if (opcode == 8'h03 && phase_cnt > 3'd3) begin
                shift_out <= data_byte;
-               data_byte <= data_byte + 8'd1;
             end else if (opcode == 8'h0B && phase_cnt == 3'd3) begin
                data_byte <= byte_captured;
-            end else if (opcode == 8'h0B && phase_cnt == 3'd4) begin
+            end else if (opcode == 8'h0B && phase_cnt >= 3'd4) begin
                shift_out <= data_byte;
-               data_byte <= data_byte + 8'd1;
-            end else if (opcode == 8'h0B && phase_cnt > 3'd4) begin
-               shift_out <= data_byte;
-               data_byte <= data_byte + 8'd1;
             end else if (opcode == 8'h02 && phase_cnt == 3'd3) begin
                addr_low <= new_low;
             end else if (opcode == 8'h02 && phase_cnt > 3'd3 && wel) begin
@@ -99,10 +97,7 @@ module qspi (
                data_byte <= byte_captured;
             end else if (opcode == 8'h5A && phase_cnt == 3'd3) begin
                sfdp_idx <= byte_captured[6:0];
-            end else if (opcode == 8'h5A && phase_cnt == 3'd4) begin
-               shift_out <= sfdp_rd;
-               sfdp_idx  <= sfdp_idx + 7'd1;
-            end else if (opcode == 8'h5A && phase_cnt > 3'd4) begin
+            end else if (opcode == 8'h5A && phase_cnt >= 3'd4) begin
                shift_out <= sfdp_rd;
                sfdp_idx  <= sfdp_idx + 7'd1;
             end
@@ -158,50 +153,48 @@ module qspi (
    end
    wire [7:0] sfdp_rd = sfdp_rom[sfdp_idx];
    reg [3:0] quad_out;
-   reg       quad_phase;
-   reg [7:0] quad_byte;
-   
+   reg [3:0] quad_next_nibble;
    initial begin
-      quad_out   = 0;
-      quad_phase = 0;
-      quad_byte  = 0;
+      quad_out         = 0;
+      quad_next_nibble = 0;
    end
-   wire quad_data = (opcode == 8'h6B) && (phase_cnt >= 3'd5);
+   wire quad_data    = (opcode == 8'h6B) && (phase_cnt >= 3'd5);
+   wire quad_advance = quad_data && bit_cnt[0];
+   // `data_byte_next_quad` is the value `data_byte` will hold
+   // after this posedge (which `quad_next_nibble` must slice
+   // from, so the negedge half a cycle later drives a value
+   // consistent with the new byte index).
+   wire [7:0] data_byte_next_quad =
+      data_byte + (quad_advance ? 8'd1 : 8'd0);
    
-   reg        quad_byte_phase;
-   initial    quad_byte_phase = 0;
-   wire       quad_advance = quad_data && quad_byte_phase;
+   // `quad_data_post` is the post-rise value of `quad_data`. It
+   // is needed to prime `quad_next_nibble` on the rise that ENDS
+   // the dummy byte (where `quad_data` is still 0 pre-rise but 1
+   // post-rise) so the very first negedge of the data phase has
+   // a valid upper-nibble of byte 0 already loaded into the
+   // presenter's source register.
+   wire quad_data_post = quad_data
+      || (byte_done && phase_cnt == 3'd4 && opcode == 8'h6B);
+   
    always @(posedge sclk or posedge cs_async_rst) begin
       if (cs_async_rst) begin
-         quad_byte       <= 0;
-         quad_byte_phase <= 0;
-      end else begin
-         if (!quad_data) begin
-            quad_byte       <= data_byte;
-            quad_byte_phase <= 1'b0;
-         end else begin
-            quad_byte_phase <= ~quad_byte_phase;
-            if (quad_advance) begin
-               quad_byte <= data_byte + 8'd1;
-            end
-         end
+         quad_next_nibble <= 4'b0;
+      end else if (quad_data_post) begin
+         // STM32MP1 QUADSPI indirect-read assembles each byte as
+         // {second_sample[3:0], first_sample[3:0]} -- the FIRST
+         // negedge of a byte cycle drives the LOWER nibble and the
+         // second drives the UPPER. Post-rise bit_cnt[0] is the
+         // inverse of the pre-rise value: pre-rise 1 (the rise that
+         // completes the dummy byte or a quad-byte cycle) gives
+         // post-rise 0, which is the "first negedge of the next
+         // byte" slot, and the lower nibble is what we drive there.
+         if (bit_cnt[0] == 1'b1) quad_next_nibble <= data_byte_next_quad[3:0];
+         else                    quad_next_nibble <= data_byte_next_quad[7:4];
       end
    end
    always @(negedge sclk or posedge cs_async_rst) begin
-      if (cs_async_rst) begin
-         quad_out   <= 0;
-         quad_phase <= 0;
-      end else if (quad_data) begin
-         if (quad_phase == 1'b0) begin
-            quad_out   <= quad_byte[7:4];
-            quad_phase <= 1'b1;
-         end else begin
-            quad_out   <= quad_byte[3:0];
-            quad_phase <= 1'b0;
-         end
-      end else begin
-         quad_phase <= 1'b0;
-      end
+      if (cs_async_rst) quad_out <= 4'b0;
+      else if (quad_data) quad_out <= quad_next_nibble;
    end
    wire resp_window = (!cs_n)
                    && ( ((opcode == 8'h9F) && (phase_cnt >= 3'd1) && (phase_cnt <= 3'd3))
