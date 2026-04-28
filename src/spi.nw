@@ -1613,22 +1613,19 @@ The hardware regression wrapper is the default `make test` entry point
 for this chapter. It follows the normal `run_md.py` behavior: run
 blocks in order and stop at the first failing block. Before each run it
 archives stale `test_out` so hardware is exercised again after edits.
-It appends a compact text row to `ledger.txt` with datetime,
-`example:test-hash`, and the number of checks that passed.
+The shared runner appends a compact text row to `ledger.txt` with
+datetime, module, and the number of checks that passed across all
+executed blocks.
 
 <<run_full_with_ledger.py>>=
 #!/usr/bin/env python3
 import datetime as _dt
 import hashlib
 import os
-import re
 import select
 import shutil
 import subprocess
 import sys
-
-
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _sha256(path):
@@ -1727,20 +1724,12 @@ def _build_bitstreams(log_path):
 
 
 def _run_regression(log_path):
-    cmd = [sys.executable, os.path.join(os.environ["TEST_SERV"], "run_md.py")]
+    cmd = [sys.executable, "-u",
+           os.path.join(os.environ["TEST_SERV"], "run_md.py"),
+           "--ledger", "ledger.txt",
+           "--module", "spi"]
     return _stream_command(
         cmd, log_path, "a", "waiting for hardware regression", ["run_md.log"])
-
-
-def _summarize(output):
-    clean = ANSI_RE.sub("", output)
-    return {
-        "check_pass": len(re.findall(r"\[PASS\]", clean)),
-        "check_fail": len(re.findall(r"\[FAIL\]", clean)),
-        "block_success": len(re.findall(r"--- block [^:]+: SUCCESS ---", clean)),
-        "block_fail": len(re.findall(r"--- block [^:]+: FAIL ---", clean)),
-        "summary": clean.strip().splitlines()[-1] if clean.strip() else "",
-    }
 
 
 def main():
@@ -1752,20 +1741,13 @@ def main():
     os.makedirs("test_logs", exist_ok=True)
     log_path = os.path.join("test_logs", f"{run_id}_{test_hash[:12]}.log")
 
-    build_rc, build_output = _build_bitstreams(log_path)
+    build_rc, _build_output = _build_bitstreams(log_path)
     archived = None
-    output = build_output
     if build_rc == 0:
         archived = _archive_old_test_out(run_id)
-        rc, run_output = _run_regression(log_path)
-        output += run_output
+        rc, _run_output = _run_regression(log_path)
     else:
         rc = build_rc
-    stats = _summarize(output)
-    row = f"{run_id} spi:{test_hash} {stats['check_pass']}\n"
-    with open("ledger.txt", "a", encoding="utf-8") as f:
-        f.write(row)
-    print(f"ledger: {row.strip()}")
     return rc
 
 
