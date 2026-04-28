@@ -305,6 +305,47 @@ module tb_qspi;
       $display("MISO trace (05): byte0=%02h byte1=%02h", got0, got1);
       if (got1 !== 8'h00) $fatal(1, "FAIL: RDSR MISO byte1 = %02h", got1);
       expect_line("op=05 bytes=2", oracle_crc ^ 32'hFFFFFFFF);
+
+      // Frame 3b: WREN, then RDSR -- expect SR bit1 (WEL) = 1.
+      oracle_crc = 32'hFFFFFFFF;
+      repeat (200) @(posedge clk);
+      @(posedge clk);
+      cs_n = 0; #200;
+      spi_byte(8'h06, 1'b1, got0);
+      #200 cs_n = 1;
+      expect_line("op=06 bytes=1", oracle_crc ^ 32'hFFFFFFFF);
+      oracle_crc = 32'hFFFFFFFF;
+      repeat (200) @(posedge clk);
+      @(posedge clk);
+      cs_n = 0; #200;
+      spi_byte(8'h05, 1'b1, got0);
+      spi_byte(8'h00, 1'b0, got1);
+      #200 cs_n = 1;
+      $display("MISO trace (05 post-WREN): byte0=%02h byte1=%02h", got0, got1);
+      if (got1 !== 8'h02)
+         $fatal(1, "FAIL: RDSR after WREN expected 0x02, got %02h", got1);
+      expect_line("op=05 bytes=2", oracle_crc ^ 32'hFFFFFFFF);
+
+      // Frame 3c: WRDI, then RDSR -- expect SR bit1 (WEL) = 0.
+      oracle_crc = 32'hFFFFFFFF;
+      repeat (200) @(posedge clk);
+      @(posedge clk);
+      cs_n = 0; #200;
+      spi_byte(8'h04, 1'b1, got0);
+      #200 cs_n = 1;
+      expect_line("op=04 bytes=1", oracle_crc ^ 32'hFFFFFFFF);
+      oracle_crc = 32'hFFFFFFFF;
+      repeat (200) @(posedge clk);
+      @(posedge clk);
+      cs_n = 0; #200;
+      spi_byte(8'h05, 1'b1, got0);
+      spi_byte(8'h00, 1'b0, got1);
+      #200 cs_n = 1;
+      $display("MISO trace (05 post-WRDI): byte0=%02h byte1=%02h", got0, got1);
+      if (got1 !== 8'h00)
+         $fatal(1, "FAIL: RDSR after WRDI expected 0x00, got %02h", got1);
+      expect_line("op=05 bytes=2", oracle_crc ^ 32'hFFFFFFFF);
+
       // Slave drives 16 data bytes of 0x00.
       begin : frame4
          reg [7:0] got_arr [0:15];

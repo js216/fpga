@@ -67,7 +67,7 @@ module qspi (
             if (phase_cnt == 3'd0) begin
                opcode <= byte_captured;
                if (byte_captured == 8'h9F) shift_out <= 8'h20;
-               else if (byte_captured == 8'h05) shift_out <= 8'h00;
+               else if (byte_captured == 8'h05) shift_out <= {6'b0, wel_s, 1'b0};
             end else if (phase_cnt == 3'd1 && opcode == 8'h9F) begin
                shift_out <= 8'h20;
             end else if (phase_cnt == 3'd2 && opcode == 8'h9F) begin
@@ -295,6 +295,8 @@ module qspi (
       if (cs_rise_pulse) begin
          if (snap_op == 8'h06 && snap_byte_cnt == 8'd1)
             wel <= 1'b1;
+         else if (snap_op == 8'h04 && snap_byte_cnt == 8'd1)
+            wel <= 1'b0;
          else if (snap_op == 8'h02 || snap_op == 8'h32)
             wel <= 1'b0;
       end
