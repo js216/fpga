@@ -81,6 +81,22 @@ endef
 
 $(foreach c,$(CHAPTERS),$(eval $(call CHAP_RULES,$(c))))
 
+# ---- stage ----
+#
+# Cross-repo bitstream handoff. The MP135 baremetal test fixtures
+# resolve `fpga:program bin=@<chap>.bin` against their own
+# build/ directory; we own the artifact, so expose it via a
+# symlink they can read. Re-run after `make bitstream` if either
+# side's `clean` was invoked.
+
+MP135_QSPI_DIR := /home/claude/stm32mp135_test_board/baremetal/qspi/build
+
+stage: bitstream
+	@mkdir -p $(MP135_QSPI_DIR)
+	ln -sf $(CURDIR)/build/qspi/qspi.bin $(MP135_QSPI_DIR)/qspi.bin
+
+.PHONY: stage
+
 # ---- clean ----
 
 clean:

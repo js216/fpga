@@ -1,0 +1,6 @@
+set_io cs_n    56
+set_io sclk    45
+set_io io[0]   47
+set_io io[1]   44
+set_io io[2]   60
+set_io io[3]   48

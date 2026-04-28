@@ -1,0 +1,532 @@
+== SPI streaming slave (raw)
+
+A deliberately minimal SPI slave that exists for one purpose: pin
+down the maximum SCLK frequency the iCE40-HX1K can sustain when
+the wire protocol is stripped of every framing byte. The MP135
+host drives a raw indirect read --- IMODE=0, ADMODE=0, no dummy
+--- so every SCLK cycle inside CS-low carries useful payload.
+The slave's job is to put the next byte of an incrementing
+`A[7:0]` pattern on the bus, in lockstep with SCLK, with no
+opcode latch, address capture, or dummy-cycle counter in the
+critical path.
+
+Two synthesis variants are produced from one source. `LANES=1`
+drives the single-lane MISO line `io[1]` on `negedge sclk`,
+MSB-first; the bench command on the host side is `b <len> 0 1`.
+`LANES=4` drives all four lanes on `negedge sclk`; the bench
+command is `b <len> 1 1`. The 4-lane case follows the convention
+the rest of this codebase has settled on: the STM32MP1 QUADSPI
+indirect-read engine assembles each byte as
+`{second_sample, first_sample}`, so the FIRST negedge of a byte
+cycle carries the LOWER nibble and the SECOND negedge carries
+the UPPER. This matches the
+`<<SPI: quad output negedge presenter>>` / nibble precompute in
+the `qspi` chapter --- byte-swap-on-the-wire is a host-side
+post-process there too.
+
+Reset is asynchronous off `cs_n`: while CS is high (frame idle)
+all sclk-domain state is held cleared, and the falling edge of
+CS releases the reset cleanly before the master's first SCLK
+rise. Mode 0 says SCLK idles low and the slave sets up data on
+each negedge for the master to sample on the following posedge,
+so the very first negedge of the data phase needs valid output
+already in `q`. We get that by precomputing the nibble (or bit)
+on the rising edge that immediately precedes the negedge and
+registering the result one half-cycle later; the rise that
+"completes" byte K-1 primes the negedge that opens byte K.
+
+<<spi.v>>=
+module spi #(
+      parameter LANES = 1
+   ) (
+      input        cs_n,
+      input        sclk,
+      inout  [3:0] io
+   );
+   <<SPI streaming: state>>
+   <<SPI streaming: sclk processes>>
+   <<SPI streaming: io drivers>>
+endmodule
+@
+
+The state lives in the sclk domain. `data_byte` is the running
+pattern counter (advances at byte boundaries) and is shared
+across both LANES variants. The `phase` counter and the output
+register `q` are declared inside the active generate branch so
+each variant carries only the bits it actually uses --- 3 bits
+of phase plus 1 bit of `q` for 1-lane (eight rises per byte,
+MSB-first), and 1 bit of phase plus 4 bits of `q` for 4-lane
+(two rises per byte, lower nibble first then upper).
+
+The presented output is a `negedge`-clocked register `q`,
+declared inside whichever generate branch is active so the
+4-lane case has a 4-bit register and the 1-lane case has a
+single-bit register --- letting the linter see every bit
+reach a pin.
+
+<<SPI streaming: state>>=
+reg [7:0] data_byte;
+initial data_byte = 8'd0;
+@
+
+The posedge process advances `phase` and schedules the
+byte-pattern increment at the rise that closes the current
+byte. The negedge process registers the next slice of
+`data_byte` onto `q`. `cs_n` is the asynchronous reset for
+both. The "`data_byte` increment fires on the rise that ends
+byte K" arrangement lets the negedge process drive byte K+1's
+first slice immediately, without any extra prefetch register:
+the negedge that follows sees the post-increment `data_byte`
+directly.
+
+For 4-lane the negedge picks the lower nibble when
+`phase[0] == 0` and the upper nibble when `phase[0] == 1` ---
+matching the STM32MP1 QUADSPI indirect-read assembly of
+`{second_sample, first_sample}`. For 1-lane the negedge picks
+bit `7 - phase`, MSB-first.
+
+<<SPI streaming: sclk processes>>=
+generate if (LANES == 4) begin : g_quad
+   reg       phase;
+   reg [3:0] q;
+   initial begin phase = 1'b0; q = 4'd0; end
+   always @(posedge sclk or posedge cs_n) begin
+      if (cs_n) begin
+         data_byte <= 8'd0;
+         phase     <= 1'b0;
+      end else begin
+         phase <= ~phase;
+         if (phase) data_byte <= data_byte + 8'd1;
+      end
+   end
+   always @(negedge sclk or posedge cs_n) begin
+      if (cs_n) q <= 4'd0;
+      else      q <= phase ? data_byte[7:4] : data_byte[3:0];
+   end
+end else begin : g_one
+   reg [2:0] phase;
+   reg       q;
+   initial begin phase = 3'd0; q = 1'b0; end
+   always @(posedge sclk or posedge cs_n) begin
+      if (cs_n) begin
+         data_byte <= 8'd0;
+         phase     <= 3'd0;
+      end else begin
+         phase <= phase + 3'd1;
+         if (phase == 3'd7) data_byte <= data_byte + 8'd1;
+      end
+   end
+   always @(negedge sclk or posedge cs_n) begin
+      if (cs_n) q <= 1'b0;
+      else      q <= data_byte[7 - phase];
+   end
+end endgenerate
+@
+
+Tri-state drivers. 4-lane drives all four IO pins from `q[3:0]`;
+1-lane drives only `io[1]` (MISO) from `q[0]` and leaves the
+other three lanes Hi-Z. Output enable is held high while CS is
+low.
+
+<<SPI streaming: io drivers>>=
+wire oe = ~cs_n;
+generate if (LANES == 4) begin : g_io_quad
+   assign io[0] = oe ? g_quad.q[0] : 1'bz;
+   assign io[1] = oe ? g_quad.q[1] : 1'bz;
+   assign io[2] = oe ? g_quad.q[2] : 1'bz;
+   assign io[3] = oe ? g_quad.q[3] : 1'bz;
+end else begin : g_io_one
+   assign io[0] = 1'bz;
+   assign io[1] = oe ? g_one.q : 1'bz;
+   assign io[2] = 1'bz;
+   assign io[3] = 1'bz;
+end endgenerate
+@
+
+=== Pin map
+
+iCEstick pin numbers, mirroring the `qspi` chapter so the same
+physical wires reach the MP135 `CN8` connector --- only the SPI
+pins are used here; there is no UART TX in this minimum-logic
+slave.
+
+<<spi.pcf>>=
+set_io cs_n    56
+set_io sclk    45
+set_io io[0]   47
+set_io io[1]   44
+set_io io[2]   60
+set_io io[3]   48
+@
+
+=== Testbench
+
+Two testbenches, one per `LANES` variant, share the same
+stimulus shape: open CS, clock 256 SCLK rises, sample the
+slave's output on each rise (mode-0 sampling) and assert the
+reconstructed byte stream is `0, 1, 2, ... 255`. The 4-lane TB
+reassembles bytes as `{second_sample, first_sample}` to match
+the host-side QUADSPI assembly.
+
+<<tb_spi_1lane.sv>>=
+`timescale 1ns/1ps
+
+module tb_spi_1lane;
+   reg       cs_n = 1'b1;
+   reg       sclk = 1'b0;
+   wire [3:0] io;
+
+   spi #(.LANES(1)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+
+   integer  i, b;
+   reg [7:0] rx;
+   integer  errs;
+
+   initial begin
+      errs = 0;
+      #20 cs_n = 1'b0;
+      #5;
+      for (b = 0; b < 256; b = b + 1) begin
+         rx = 8'd0;
+         for (i = 0; i < 8; i = i + 1) begin
+            #5 sclk = 1'b1;
+            rx = {rx[6:0], io[1]};
+            #5 sclk = 1'b0;
+         end
+         if (rx !== b[7:0]) begin
+            $display("FAIL byte %0d: got %02x expected %02x", b, rx, b[7:0]);
+            errs = errs + 1;
+         end
+      end
+      #5 cs_n = 1'b1;
+      #20;
+      if (errs == 0) $display("PASS tb_spi_1lane: 256 bytes match");
+      else           $display("FAIL tb_spi_1lane: %0d byte mismatches", errs);
+      $finish;
+   end
+endmodule
+@
+
+<<tb_spi_quad.sv>>=
+`timescale 1ns/1ps
+
+module tb_spi_quad;
+   reg       cs_n = 1'b1;
+   reg       sclk = 1'b0;
+   wire [3:0] io;
+
+   spi #(.LANES(4)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+
+   integer    b;
+   reg [3:0]  lo, hi;
+   reg [7:0]  rx;
+   integer    errs;
+
+   initial begin
+      errs = 0;
+      #20 cs_n = 1'b0;
+      #5;
+      for (b = 0; b < 256; b = b + 1) begin
+         #5 sclk = 1'b1;
+         lo = io;
+         #5 sclk = 1'b0;
+         #5 sclk = 1'b1;
+         hi = io;
+         #5 sclk = 1'b0;
+         rx = {hi, lo};
+         if (rx !== b[7:0]) begin
+            $display("FAIL byte %0d: got %02x expected %02x", b, rx, b[7:0]);
+            errs = errs + 1;
+         end
+      end
+      #5 cs_n = 1'b1;
+      #20;
+      if (errs == 0) $display("PASS tb_spi_quad: 256 bytes match");
+      else           $display("FAIL tb_spi_quad: %0d byte mismatches", errs);
+      $finish;
+   end
+endmodule
+@
+
+=== Build fragment
+
+Two synthesis runs over the single `verilog/spi.v` source, each
+overriding the `LANES` macro on the yosys command line. The
+shared `verilog/spi.pcf` feeds nextpnr-ice40 for both. The two
+sims and two bitstreams hang off the top-level `sim` and
+`bitstream` aggregates so a bare `make` builds everything.
+
+<<spi.mk>>=
+SPI_VS := verilog/spi.v
+
+build/spi/spi_1lane.json: $(SPI_VS) | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 1 spi; synth_ice40 -top spi -json spi_1lane.json"
+
+build/spi/spi_quad.json: $(SPI_VS) | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 spi; synth_ice40 -top spi -json spi_quad.json"
+
+build/spi/spi_1lane.asc: build/spi/spi_1lane.json verilog/spi.pcf
+	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_1lane.json --pcf ../../verilog/spi.pcf --asc spi_1lane.asc --freq 100 -q
+
+build/spi/spi_quad.asc: build/spi/spi_quad.json verilog/spi.pcf
+	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_quad.json --pcf ../../verilog/spi.pcf --asc spi_quad.asc --freq 100 -q
+
+build/spi/spi_1lane.bin: build/spi/spi_1lane.asc
+	cd build/spi && icepack spi_1lane.asc spi_1lane.bin
+
+build/spi/spi_quad.bin: build/spi/spi_quad.asc
+	cd build/spi && icepack spi_quad.asc spi_quad.bin
+
+tb/tb_spi_1lane.sv: src/spi.nw | tb
+	cd tb && tangle tb_spi_1lane.sv < ../$<
+
+tb/tb_spi_quad.sv: src/spi.nw | tb
+	cd tb && tangle tb_spi_quad.sv < ../$<
+
+build/spi/sim_1lane: tb/tb_spi_1lane.sv $(SPI_VS) | build/spi
+	cd build/spi && verilator --Mdir obj_1lane -Wall --binary --top-module tb_spi_1lane ../../tb/tb_spi_1lane.sv ../../verilog/spi.v
+	cd build/spi && obj_1lane/Vtb_spi_1lane
+	@touch $@
+
+build/spi/sim_quad: tb/tb_spi_quad.sv $(SPI_VS) | build/spi
+	cd build/spi && verilator --Mdir obj_quad -Wall --binary --top-module tb_spi_quad ../../tb/tb_spi_quad.sv ../../verilog/spi.v
+	cd build/spi && obj_quad/Vtb_spi_quad
+	@touch $@
+
+bitstream: build/spi/spi_1lane.bin build/spi/spi_quad.bin
+sim: build/spi/sim_1lane build/spi/sim_quad
+@
+
+=== Hardware test plan
+
+Two phases, each one fenced block per `(mode, prescaler)` so a
+failure pins down exactly which (lane-count, SCLK) pair broke.
+Every block reflashes the MP135 firmware from `flash.tsv`,
+loads the matching bitstream, opens the MP135 console, sets the
+prescaler, and issues the raw bench command. The success
+sentinel is `firsterr` --- it appears in the bench summary line
+only after the whole megabyte has been validated against the
+incrementing pattern.
+
+The prescaler sweep covers 203 (~3.25 MHz wire), 63 (~10 MHz),
+15 (~41.5 MHz), 5 (~83 MHz), 2 (~166 MHz), and 1 (~332 MHz);
+timeouts shrink with prescaler since the bench finishes faster
+at higher SCLK.
+
+<<TEST.md>>=
+Phase 1 -- 1-lane sweep at presc=203.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_1lane.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 203\r"
+delay ms=100
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=15000
+mp135:uart_close
+```
+
+- Check 1lane @ presc=203 pattern correct
+
+Phase 1 -- 1-lane sweep at presc=63.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_1lane.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 63\r"
+delay ms=100
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=10000
+mp135:uart_close
+```
+
+- Check 1lane @ presc=63 pattern correct
+
+Phase 1 -- 1-lane sweep at presc=15.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_1lane.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 15\r"
+delay ms=100
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=8000
+mp135:uart_close
+```
+
+- Check 1lane @ presc=15 pattern correct
+
+Phase 1 -- 1-lane sweep at presc=5.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_1lane.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5\r"
+delay ms=100
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mp135:uart_close
+```
+
+- Check 1lane @ presc=5 pattern correct
+
+Phase 1 -- 1-lane sweep at presc=2.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_1lane.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 2\r"
+delay ms=100
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mp135:uart_close
+```
+
+- Check 1lane @ presc=2 pattern correct
+
+Phase 1 -- 1-lane sweep at presc=1.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_1lane.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 1\r"
+delay ms=100
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mp135:uart_close
+```
+
+- Check 1lane @ presc=1 pattern correct
+
+Phase 2 -- 4-lane sweep at presc=203.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_quad.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 203\r"
+delay ms=100
+mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=15000
+mp135:uart_close
+```
+
+- Check quad @ presc=203 pattern correct
+
+Phase 2 -- 4-lane sweep at presc=63.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_quad.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 63\r"
+delay ms=100
+mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=8000
+mp135:uart_close
+```
+
+- Check quad @ presc=63 pattern correct
+
+Phase 2 -- 4-lane sweep at presc=15.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_quad.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 15\r"
+delay ms=100
+mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mp135:uart_close
+```
+
+- Check quad @ presc=15 pattern correct
+
+Phase 2 -- 4-lane sweep at presc=5.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_quad.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5\r"
+delay ms=100
+mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mp135:uart_close
+```
+
+- Check quad @ presc=5 pattern correct
+
+Phase 2 -- 4-lane sweep at presc=2.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_quad.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 2\r"
+delay ms=100
+mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mp135:uart_close
+```
+
+- Check quad @ presc=2 pattern correct
+
+Phase 2 -- 4-lane sweep at presc=1.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_quad.bin
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 1\r"
+delay ms=100
+mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mp135:uart_close
+```
+
+- Check quad @ presc=1 pattern correct
+@
