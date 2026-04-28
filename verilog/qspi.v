@@ -12,6 +12,7 @@ module qspi (
    reg [2:0]  phase_cnt;
    reg [15:0] byte_cnt;
    reg [3:0]  addr_low;
+   reg [7:0]  data_byte;
    reg [19:0] quad_in_cnt;
    reg [3:0]  nibble_buf;
    reg        qin_phase;
@@ -25,6 +26,7 @@ module qspi (
       phase_cnt   = 0;
       byte_cnt    = 0;
       addr_low    = 0;
+      data_byte   = 0;
       quad_in_cnt = 0;
       nibble_buf  = 0;
       qin_phase   = 0;
@@ -43,6 +45,7 @@ module qspi (
          shift_in    <= 0;
          shift_out   <= 0;
          addr_low    <= 0;
+         data_byte   <= 0;
          qin_phase   <= 0;
          quad_in_cnt <= 0;
          nibble_buf  <= 0;
@@ -51,7 +54,6 @@ module qspi (
          shift_in <= {shift_in[5:0], io_d_in[0]};
          bit_cnt  <= bit_cnt + 3'd1;
          shift_out <= {shift_out[6:0], 1'b0};
-         if (ram_we) ram[ram_waddr] <= ram_wdata;
          if (quad_in_phase) begin
             qin_phase <= ~qin_phase;
             if (qin_phase == 1'b0) begin
@@ -61,6 +63,7 @@ module qspi (
                quad_in_cnt <= quad_in_cnt + 20'd1;
             end
          end
+         if (quad_advance) data_byte <= data_byte + 8'd1;
          if (byte_done) begin
             byte_cnt  <= byte_cnt  + 16'd1;
             if (phase_cnt != 3'd7) phase_cnt <= phase_cnt + 3'd1;
@@ -73,19 +76,19 @@ module qspi (
             end else if (phase_cnt == 3'd2 && opcode == 8'h9F) begin
                shift_out <= 8'h14;
             end else if (opcode == 8'h03 && phase_cnt == 3'd3) begin
-               addr_low  <= new_low + 4'd1;
-               shift_out <= ram_rd;
+               shift_out <= byte_captured;
+               data_byte <= byte_captured + 8'd1;
             end else if (opcode == 8'h03 && phase_cnt > 3'd3) begin
-               addr_low  <= addr_low + 4'd1;
-               shift_out <= ram_rd;
+               shift_out <= data_byte;
+               data_byte <= data_byte + 8'd1;
             end else if (opcode == 8'h0B && phase_cnt == 3'd3) begin
-               addr_low <= new_low;
+               data_byte <= byte_captured;
             end else if (opcode == 8'h0B && phase_cnt == 3'd4) begin
-               shift_out <= ram_rd;
-               addr_low  <= addr_low + 4'd1;
+               shift_out <= data_byte;
+               data_byte <= data_byte + 8'd1;
             end else if (opcode == 8'h0B && phase_cnt > 3'd4) begin
-               shift_out <= ram_rd;
-               addr_low  <= addr_low + 4'd1;
+               shift_out <= data_byte;
+               data_byte <= data_byte + 8'd1;
             end else if (opcode == 8'h02 && phase_cnt == 3'd3) begin
                addr_low <= new_low;
             end else if (opcode == 8'h02 && phase_cnt > 3'd3 && wel) begin
@@ -93,7 +96,7 @@ module qspi (
             end else if (opcode == 8'h32 && phase_cnt == 3'd3) begin
                addr_low <= new_low;
             end else if (opcode == 8'h6B && phase_cnt == 3'd3) begin
-               addr_low <= new_low;
+               data_byte <= byte_captured;
             end else if (opcode == 8'h5A && phase_cnt == 3'd3) begin
                sfdp_idx <= byte_captured[6:0];
             end else if (opcode == 8'h5A && phase_cnt == 3'd4) begin
@@ -112,20 +115,6 @@ module qspi (
       if (cs_async_rst) wel_s <= 1'b0;
       else      wel_s <= wel;
    end
-   wire ram_we = (opcode == 8'h02 && phase_cnt > 3'd3 && byte_done && wel_s)
-              || (opcode == 8'h32 && quad_in_phase && qin_phase == 1'b1 && wel_s);
-   wire [3:0] ram_waddr = addr_low;
-   wire [7:0] ram_wdata = (opcode == 8'h32) ? {nibble_buf, io_d_in}
-                                            : byte_captured;
-   
-   wire [3:0] ram_raddr = quad_data
-                        ? (quad_advance ? (data_ptr + 4'd1) : data_ptr)
-                        : (byte_done
-                           && (   (opcode == 8'h03 && phase_cnt == 3'd3)
-                               || (opcode == 8'h0B && phase_cnt == 3'd3))
-                           ? new_low
-                           : addr_low);
-   wire [7:0] ram_rd = ram[ram_raddr];
    reg [7:0] sfdp_rom [0:127];
    integer   _sfdp_i;
    initial begin
@@ -170,13 +159,11 @@ module qspi (
    wire [7:0] sfdp_rd = sfdp_rom[sfdp_idx];
    reg [3:0] quad_out;
    reg       quad_phase;
-   reg [3:0] data_ptr;
    reg [7:0] quad_byte;
    
    initial begin
       quad_out   = 0;
       quad_phase = 0;
-      data_ptr   = 0;
       quad_byte  = 0;
    end
    wire quad_data = (opcode == 8'h6B) && (phase_cnt >= 3'd5);
@@ -186,19 +173,16 @@ module qspi (
    wire       quad_advance = quad_data && quad_byte_phase;
    always @(posedge sclk or posedge cs_async_rst) begin
       if (cs_async_rst) begin
-         data_ptr        <= 0;
          quad_byte       <= 0;
          quad_byte_phase <= 0;
       end else begin
          if (!quad_data) begin
-            data_ptr        <= addr_low;
-            quad_byte       <= ram_rd;
+            quad_byte       <= data_byte;
             quad_byte_phase <= 1'b0;
          end else begin
             quad_byte_phase <= ~quad_byte_phase;
             if (quad_advance) begin
-               data_ptr  <= data_ptr + 4'd1;
-               quad_byte <= ram_rd;
+               quad_byte <= data_byte + 8'd1;
             end
          end
       end
@@ -273,11 +257,8 @@ module qspi (
          crc_reg <= crc32_byte(crc_reg, {nibble_buf, io_d_in});
       end
    end
-   reg [7:0] ram [0:15];
-   reg       wel;
-   integer   _i;
+   reg wel;
    initial begin
-      for (_i = 0; _i < 16; _i = _i + 1) ram[_i] = 8'h00;
       wel = 0;
    end
    reg [1:0] cs_sync;

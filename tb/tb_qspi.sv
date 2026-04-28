@@ -346,7 +346,7 @@ module tb_qspi;
          $fatal(1, "FAIL: RDSR after WRDI expected 0x00, got %02h", got1);
       expect_line("op=05 bytes=2", oracle_crc ^ 32'hFFFFFFFF);
 
-      // Slave drives 16 data bytes of 0x00.
+      // Slave drives 16 pattern bytes starting at addr 0: 0,1,...,15.
       begin : frame4
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -364,12 +364,13 @@ module tb_qspi;
             end
          #200 cs_n = 1;
 
-         $write("MISO trace (03 pre-write):");
+         $write("MISO trace (03 pattern at addr 0):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== 8'h00)
-               $fatal(1, "FAIL: 03 pre-write data[%0d]=%02h", k, got_arr[k]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: 03 pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -385,6 +386,9 @@ module tb_qspi;
       spi_byte(8'hAA, 1'b1, got0);
       #200 cs_n = 1;
       expect_line("op=02 bytes=5", oracle_crc ^ 32'hFFFFFFFF);
+      // Frame 6: 0x03 read at addr 0 -- pattern reads are
+      // independent of the page buffer, so this just confirms the
+      // pattern source is unaffected by a prior no-WEL 0x02 frame.
       begin : frame6
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
@@ -398,7 +402,7 @@ module tb_qspi;
          #200 cs_n = 1;
          $display("MISO trace (03 after no-WEL 02): %02h", got0);
          if (got0 !== 8'h00)
-            $fatal(1, "FAIL: no-WEL write leaked: got %02h", got0);
+            $fatal(1, "FAIL: 03 pattern at addr 0: got %02h, want 00", got0);
          expect_line("op=03 bytes=5", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -426,7 +430,9 @@ module tb_qspi;
          expect_line("op=02 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 9: 0x03 read back -- expect 0x50..0x5F.
+      // Frame 9: 0x03 read at addr 0x000010 -- expect pattern
+      // 0x10..0x1F. Confirms the address LSB is captured into
+      // the pattern counter.
       begin : frame9
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -435,20 +441,20 @@ module tb_qspi;
          @(posedge clk);
          cs_n = 0; #200;
          spi_send(8'h03, 1'b1);  // opcode
-         spi_send(8'h00, 1'b1);  // addr
-         spi_send(8'h00, 1'b1);  // addr
-         spi_send(8'h00, 1'b1);  // addr
+         spi_send(8'h00, 1'b1);  // addr [23:16]
+         spi_send(8'h00, 1'b1);  // addr [15:8]
+         spi_send(8'h10, 1'b1);  // addr [7:0]
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
          #200 cs_n = 1;
-         $write("MISO trace (03 after write):");
+         $write("MISO trace (03 pattern at addr 0x10):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'h50 + k[7:0]))
-               $fatal(1, "FAIL: read-after-write data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'h50 + k[7:0]);
+            if (got_arr[k] !== (8'h10 + k[7:0]))
+               $fatal(1, "FAIL: 03 pattern at 0x10 data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'h10 + k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -464,7 +470,7 @@ module tb_qspi;
          spi_send(8'h0B, 1'b1);
          spi_send(8'h00, 1'b1);
          spi_send(8'h00, 1'b1);
-         spi_send(8'h00, 1'b1);
+         spi_send(8'h80, 1'b1);  // addr LSB = 0x80
          spi_byte(8'h00, 1'b0, got_dummy);  // not slave-driven
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
@@ -473,17 +479,19 @@ module tb_qspi;
          $display("MISO during 0x0B dummy byte: %02h", got_dummy);
          if (got_dummy !== 8'h00)
             $fatal(1, "FAIL: 0x0B dummy MISO = %02h, want 00", got_dummy);
-         $write("MISO trace (0B):");
+         $write("MISO trace (0B pattern at addr 0x80):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'h50 + k[7:0]))
-               $fatal(1, "FAIL: 0B data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'h50 + k[7:0]);
+            if (got_arr[k] !== (8'h80 + k[7:0]))
+               $fatal(1, "FAIL: 0B pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'h80 + k[7:0]);
          expect_line("op=0b bytes=21", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 11: 0x6B Quad Output Read -- slave drives 16 quad data bytes.
+      // Frame 11: 0x6B Quad Output Read -- slave drives 16 quad
+      // pattern bytes starting at addr 0xFE so the wrap from 0xFF
+      // back to 0x00 is exercised on the quad path.
       begin : frame11
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -499,7 +507,7 @@ module tb_qspi;
          spi_send(8'h6B, 1'b1);
          spi_send(8'h00, 1'b1);
          spi_send(8'h00, 1'b1);
-         spi_send(8'h00, 1'b1);
+         spi_send(8'hFE, 1'b1);  // addr LSB = 0xFE -- exercises wrap
          // Probe the DUT's per-lane output enable: must be 0 during
          // the dummy byte (master tri-states all four lanes), and
          // must turn on for all four lanes once the data phase
@@ -528,13 +536,13 @@ module tb_qspi;
             $fatal(1, "FAIL: 6B io_oe must drop after CS rise: %b",
                    dut.io_oe);
 
-         $write("QUAD trace (6B):");
+         $write("QUAD trace (6B pattern at addr 0xFE):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'h50 + k[7:0]))
-               $fatal(1, "FAIL: 6B data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'h50 + k[7:0]);
+            if (got_arr[k] !== (8'hFE + k[7:0]))
+               $fatal(1, "FAIL: 6B pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'hFE + k[7:0]);
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -559,7 +567,10 @@ module tb_qspi;
          expect_line("op=32 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 13: 0x03 readback after no-WEL 32 -- buffer still 0x50..
+      // Frame 13: 0x03 readback after no-WEL 32 -- pattern source
+      // is independent of the page buffer, so the response must
+      // be the addr-0 pattern (0x00..0x0F) regardless of what the
+      // (rejected) write tried to do.
       begin : frame13
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -579,9 +590,9 @@ module tb_qspi;
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'h50 + k[7:0]))
-               $fatal(1, "FAIL: no-WEL 32 leaked: data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'h50 + k[7:0]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: 03 pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -616,7 +627,8 @@ module tb_qspi;
          expect_line("op=32 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 16: 0x03 readback -- expect 0xC0..0xCF.
+      // Frame 16: 0x03 readback after WEL+quad-32 -- pattern at
+      // addr 0 is 0x00..0x0F, independent of any prior writes.
       begin : frame16
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -632,21 +644,22 @@ module tb_qspi;
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
          #200 cs_n = 1;
-         $write("MISO trace (03 after quad-32):");
+         $write("MISO trace (03 after quad-32, pattern):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hC0 + k[7:0]))
-               $fatal(1, "FAIL: quad-32 write missing: data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hC0 + k[7:0]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: 03 pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 16b: 0x6B quad-output readback -- expect 0xC0..0xCF.
-      // This is the step-15 regression test: the step-12 pointer
-      // cadence presented `{byte_N_upper, byte_{N+1}_lower}` for
-      // every pair; the step-15 `quad_byte_phase` toggle re-aligns
-      // so `{byte_N_upper, byte_N_lower}` is delivered.
+      // Frame 16b: 0x6B quad-output readback at addr 0 -- expect
+      // pattern 0x00..0x0F. This is the step-15 nibble-alignment
+      // regression test: prior cadence presented
+      // `{byte_N_upper, byte_{N+1}_lower}` for every pair; the
+      // `quad_byte_phase` toggle re-aligns so
+      // `{byte_N_upper, byte_N_lower}` is delivered.
       begin : frame16b
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -675,13 +688,13 @@ module tb_qspi;
          #50;
          if (dut.io_oe !== 4'b0000)
             $fatal(1, "FAIL: 6B/CF post-CS io_oe=%b", dut.io_oe);
-         $write("QUAD trace (6B after quad-32):");
+         $write("QUAD trace (6B pattern at addr 0):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hC0 + k[7:0]))
-               $fatal(1, "FAIL: 6B/CF quad-read data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hC0 + k[7:0]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: 6B pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -737,7 +750,7 @@ module tb_qspi;
          expect_line("op=02 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 20: 0x03 readback at high rate, expect 0xA0..0xAF.
+      // Frame 20: 0x03 readback at high rate, addr=0 pattern.
       begin : hs_rd
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -752,22 +765,22 @@ module tb_qspi;
          for (k = 0; k < 16; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
-         $write("HS 03 rd:");
+         $write("HS 03 rd pattern:");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hA0 + k[7:0]))
+            if (got_arr[k] !== k[7:0])
                $fatal(1, "FAIL: high-rate 03 data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hA0 + k[7:0]);
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 20b: long single-lane 0x03 read (40 data bytes =
-      // 2.5x the 16-byte RAM) to cross the `addr_low` wrap
-      // boundary and exercise the `phase_cnt == 7` saturation +
-      // addr_low++ path. The hardware bench reports a byte-1
-      // regression on 1MB single-lane reads; this test pins the
-      // cross-boundary behaviour in sim.
+      // Frame 20b: long single-lane 0x03 read (40 data bytes)
+      // starting at addr LSB 0xF0 so the 8-bit pattern counter
+      // wraps from 0xFF back to 0x00 mid-frame. This is the
+      // headline streaming integrity check: every emitted byte
+      // must equal `(0xF0 + k) mod 256` so any framing or CDC
+      // glitch in the long stream is caught byte-by-byte.
       begin : hs_rd_long
          reg [7:0] got_arr [0:39];
          integer   k;
@@ -778,17 +791,17 @@ module tb_qspi;
          spi_send(8'h03, 1'b1);
          spi_send(8'h00, 1'b1);
          spi_send(8'h00, 1'b1);
-         spi_send(8'h00, 1'b1);
+         spi_send(8'hF0, 1'b1);
          for (k = 0; k < 40; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
-         $write("HS 03 long:");
+         $write("HS 03 long pattern from 0xF0:");
          for (k = 0; k < 40; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 40; k = k + 1)
-            if (got_arr[k] !== (8'hA0 + (k[7:0] & 8'h0F)))
-               $fatal(1, "FAIL: long-03 data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hA0 + (k[7:0] & 8'h0F));
+            if (got_arr[k] !== (8'hF0 + k[7:0]))
+               $fatal(1, "FAIL: long-03 pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'hF0 + k[7:0]);
          // Total SCLK-bytes = 1 opcode + 3 addr + 40 data = 44.
          // Printer shows modulo 100 => "44".
          expect_line("op=03 bytes=44", oracle_crc ^ 32'hFFFFFFFF);
@@ -821,7 +834,7 @@ module tb_qspi;
          expect_line("op=32 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 22: 0x03 readback, expect 0xE0..0xEF.
+      // Frame 22: 0x03 readback at high rate, addr=0 pattern.
       begin : hs_qrd
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -836,17 +849,18 @@ module tb_qspi;
          for (k = 0; k < 16; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
-         $write("HS 03 quad-rd:");
+         $write("HS 03 pattern after quad-32:");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hE0 + k[7:0]))
-               $fatal(1, "FAIL: high-rate quad-32 data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hE0 + k[7:0]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: high-rate 03 data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 23: 0x6B Quad Output Read at high rate.
+      // Frame 23: 0x6B Quad Output Read at high rate, addr LSB
+      // 0x40 -- pattern starts at 0x40, increments through 0x4F.
       begin : hs_qor
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -858,18 +872,18 @@ module tb_qspi;
          spi_send(8'h6B, 1'b1);
          spi_send(8'h00, 1'b1);
          spi_send(8'h00, 1'b1);
-         spi_send(8'h00, 1'b1);
+         spi_send(8'h40, 1'b1);
          spi_dummy_quad();
          for (k = 0; k < 16; k = k + 1)
             spi_quad_data_byte(got_arr[k]);
          #200 cs_n = 1;
-         $write("HS 6B:");
+         $write("HS 6B pattern from 0x40:");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hE0 + k[7:0]))
+            if (got_arr[k] !== (8'h40 + k[7:0]))
                $fatal(1, "FAIL: high-rate 6B data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hE0 + k[7:0]);
+                      k, got_arr[k], 8'h40 + k[7:0]);
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
       end
 

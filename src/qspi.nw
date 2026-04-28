@@ -9,6 +9,21 @@ rising edge) the module prints one UART line
 `op=<hh> bytes=<K> mosi_crc=<8hex>\r\n` through the reused `uart_tx`
 from the UART chapter.
 
+The headline product feature this slave must support is
+high-throughput streaming reads. The MP135 host issues 0x0B (Fast
+Read, single-lane) and 0x6B (Quad Output Read) frames that span
+the full 24-bit address space at SCLK rates up to 102 MHz (chip
+maximum: quadspi_ker_ck / 2 = 204 MHz / 2). To make the integrity
+of those reads testable end-to-end without a real flash array
+behind the slave, the read data is a deterministic incrementing
+pattern: byte at flash address A returns A[7:0]. The host can
+therefore stream a megabyte and assert byte K of the response
+equals (start_addr + K) mod 256, catching any framing, CDC, or
+nibble-pairing glitch byte-by-byte. The 16-byte page buffer is
+retained for Page Program (0x02) and Quad Page Program (0x32)
+verification only --- read opcodes ignore it and stream the
+pattern instead.
+
 The four SPI data pins are exposed as an `inout [3:0] io` port so the
 FPGA can drive all four lines during the 0x6B data phase and leave
 them Hi-Z otherwise. MOSI (single-lane) is `io[0]` sampled as an
@@ -55,9 +70,13 @@ The clock-domain partition:
   `miso_out`, `quad_out`) are clocked on `negedge sclk` so data is
   stable on the wire before the master's next rising-edge sample
   (mode 0).
-- The 16-byte page buffer `ram` is async-read LUT RAM
-  (combinationally indexed), written on `posedge sclk` at byte
-  boundaries.
+- There is no flash-data backing store: read responses come
+  from the `data_byte` pattern counter described in the
+  streaming-pattern section below. Page Program (0x02) and Quad
+  Page Program (0x32) frames still run end-to-end (opcode +
+  address + WEL gating + byte count + CRC), but the data they
+  carry is not written into any storage --- the printer's
+  per-frame log line is the observable outcome.
 - WEL update happens in the fclk domain on the cs-rise pulse.
 - Two CDC points feed the fclk domain: `cs_n` is two-flop
   synchronised into `cs_sync` (rising edge produces the
@@ -92,7 +111,15 @@ printer displays as the `bytes=` field and a narrower saturating
 the FSM. Keeping the wide comparator out of the per-arm logic
 shortens the sclk-domain critical path; sixteen bits of `byte_cnt`
 are still wide enough for the printer's modulo-100 display.
-`addr_low` indexes the 16-byte page buffer; `quad_in_cnt`,
+`addr_low` indexes the 16-byte page buffer (still used by 0x02
+and 0x32 page-program writes). `data_byte` is the 8-bit pattern
+counter that drives 0x03 / 0x0B / 0x6B response data: it is
+loaded with the captured low byte of the 24-bit address on the
+phase 3 boundary and increments once per emitted output byte,
+giving the deterministic `byte = address[7:0]` pattern. A single
+register serves both the single-lane (0x03 / 0x0B) and
+quad-lane (0x6B) read paths so the increment cadence is
+unambiguously owned by one always block. `quad_in_cnt`,
 `nibble_buf`, and `qin_phase` are state owned by the 0x32 quad
 page-program data phase but declared here because the same
 `always @(posedge sclk)` block writes them.
@@ -105,6 +132,7 @@ reg [7:0]  opcode;
 reg [2:0]  phase_cnt;
 reg [15:0] byte_cnt;
 reg [3:0]  addr_low;
+reg [7:0]  data_byte;
 reg [19:0] quad_in_cnt;
 reg [3:0]  nibble_buf;
 reg        qin_phase;
@@ -118,6 +146,7 @@ initial begin
    phase_cnt   = 0;
    byte_cnt    = 0;
    addr_low    = 0;
+   data_byte   = 0;
    quad_in_cnt = 0;
    nibble_buf  = 0;
    qin_phase   = 0;
@@ -157,9 +186,29 @@ always @(posedge sclk or posedge cs_async_rst) begin
       <<SPI: shift out default>>
       <<SPI: RAM write at boundaries>>
       <<SPI: quad input data phase>>
+      <<SPI: quad output pattern increment>>
       <<SPI: byte boundary actions>>
    end
 end
+@
+
+For 0x6B Quad Output Read the slave emits one pattern byte every
+two sclk rises (one rise per nibble). The pattern counter
+`data_byte` therefore must increment on `quad_advance` --- the
+same edge on which the quad-output engine refreshes its
+`quad_byte` register --- not at the eight-rise byte boundary
+that gates single-lane reads. Putting the increment in its own
+chunk inside the shift engine's posedge process keeps a single
+writer to `data_byte`: the dispatch chunk loads it on the
+address boundary for both read families and increments it on
+single-lane byte boundaries; this chunk handles the quad
+cadence. The two conditions are mutually exclusive (single-lane
+byte boundaries occur only when `quad_data` is low for the
+relevant opcodes, and `quad_advance` only fires inside the 0x6B
+data phase).
+
+<<SPI: quad output pattern increment>>=
+if (quad_advance) data_byte <= data_byte + 8'd1;
 @
 
 <<SPI: shift engine reset>>=
@@ -170,6 +219,7 @@ opcode      <= 0;
 shift_in    <= 0;
 shift_out   <= 0;
 addr_low    <= 0;
+data_byte   <= 0;
 qin_phase   <= 0;
 quad_in_cnt <= 0;
 nibble_buf  <= 0;
@@ -194,14 +244,17 @@ on the same cycle.
 shift_out <= {shift_out[6:0], 1'b0};
 @
 
-A single RAM write statement keeps yosys's memory inference
-clean: one write port, one read port, mapped to a 16x8 distributed
-LUT RAM (~8 LUTs) instead of sixteen flops plus a wide read mux
-(~200 LCs). The write enable, address, and data are computed
-combinationally in the RAM-ports chunk further down.
+With the streaming pattern source replacing the page buffer as
+the read data source, there is no observable consumer of write
+data: the response-data path is `data_byte`, not `ram`. The
+RAM-write statement is therefore intentionally empty in the
+shift-engine process. WEL gating, address handling, and the
+quad-input nibble pairing for 0x32 still run as before --- only
+the storage step has been elided. The named chunk is kept so
+the shift-engine process structure remains literate; tangling
+emits no Verilog.
 
 <<SPI: RAM write at boundaries>>=
-if (ram_we) ram[ram_waddr] <= ram_wdata;
 @
 
 For 0x32 Quad Page Program the master drives all four IO pins
@@ -240,20 +293,39 @@ end
 
 The opcode dispatch handles, in order: byte 0 of any frame
 (latch opcode, load any single-cycle response constant); the
-0x9F JEDEC ID continuation bytes; 0x03 Normal Read (capture
-address on byte 3 and load the first response from `ram_rd` in
-one cycle, then increment for each subsequent byte); 0x0B Fast
-Read (same pattern with the extra dummy byte); 0x02 Page Program
-(latch address, increment under WEL gating); 0x32 Quad Page
-Program (only the address latch lives here; the data-phase
+0x9F JEDEC ID continuation bytes; 0x03 Normal Read (capture the
+low byte of the 24-bit address on phase 3 and load the first
+response byte directly from `byte_captured`, preloading
+`data_byte` with the next pattern value; subsequent bytes
+present `data_byte` and post-increment); 0x0B Fast Read (latch
+the address LSB on phase 3 into `data_byte`; phase 4 boundary
+loads the first data byte from `data_byte` and post-increments
+because the dummy byte sits between the address phase and the
+first response byte); 0x02 Page Program (latch RAM-buffer
+address, increment under WEL gating); 0x32 Quad Page Program
+(only the RAM-buffer address latch lives here; the data-phase
 write is the quad-input chunk above); 0x6B Quad Output Read
-(latch address; the data presenter is the quad-output engine);
-and 0x5A SFDP Read (latch the low 7 bits of the 24-bit address
-into `sfdp_idx` on byte 3, then on byte 4 onwards present
-`sfdp_rom[sfdp_idx]` as the next response byte and post-increment
-`sfdp_idx` so the catch-all arm streams the table out
-sequentially; bytes 4 and >4 mirror the 0x0B fast-read cadence
-because the dummy byte advances the same way).
+(latch the address LSB into `data_byte` --- the quad-output
+engine consumes it directly, and the per-rise quad pattern
+increment chunk advances it during the data phase); and 0x5A
+SFDP Read (latch the low 7 bits of the 24-bit address into
+`sfdp_idx` on byte 3, then on byte 4 onwards present
+`sfdp_rom[sfdp_idx]` as the next response byte and
+post-increment `sfdp_idx` so the catch-all arm streams the
+table out sequentially; bytes 4 and >4 mirror the 0x0B
+fast-read cadence because the dummy byte advances the same
+way).
+
+The `data_byte` register holds the running pattern value. Only
+the address LSB matters for the pattern start (the high two
+address bytes are accepted but unused since the pattern is
+mod-256). For 0x03 the response data starts in the same byte
+slot that latches the address LSB --- shift_out on that
+boundary takes `byte_captured` directly, and `data_byte` is
+preloaded to `byte_captured + 1` so that subsequent boundaries
+see the next pattern value already sitting in the register. For
+0x0B the dummy byte gives one extra slot, so the first response
+byte is loaded from `data_byte` on the phase 4 boundary.
 
 <<SPI: byte boundary opcode dispatch>>=
 if (phase_cnt == 3'd0) begin
@@ -265,19 +337,19 @@ end else if (phase_cnt == 3'd1 && opcode == 8'h9F) begin
 end else if (phase_cnt == 3'd2 && opcode == 8'h9F) begin
    shift_out <= 8'h14;
 end else if (opcode == 8'h03 && phase_cnt == 3'd3) begin
-   addr_low  <= new_low + 4'd1;
-   shift_out <= ram_rd;
+   shift_out <= byte_captured;
+   data_byte <= byte_captured + 8'd1;
 end else if (opcode == 8'h03 && phase_cnt > 3'd3) begin
-   addr_low  <= addr_low + 4'd1;
-   shift_out <= ram_rd;
+   shift_out <= data_byte;
+   data_byte <= data_byte + 8'd1;
 end else if (opcode == 8'h0B && phase_cnt == 3'd3) begin
-   addr_low <= new_low;
+   data_byte <= byte_captured;
 end else if (opcode == 8'h0B && phase_cnt == 3'd4) begin
-   shift_out <= ram_rd;
-   addr_low  <= addr_low + 4'd1;
+   shift_out <= data_byte;
+   data_byte <= data_byte + 8'd1;
 end else if (opcode == 8'h0B && phase_cnt > 3'd4) begin
-   shift_out <= ram_rd;
-   addr_low  <= addr_low + 4'd1;
+   shift_out <= data_byte;
+   data_byte <= data_byte + 8'd1;
 end else if (opcode == 8'h02 && phase_cnt == 3'd3) begin
    addr_low <= new_low;
 end else if (opcode == 8'h02 && phase_cnt > 3'd3 && wel) begin
@@ -285,7 +357,7 @@ end else if (opcode == 8'h02 && phase_cnt > 3'd3 && wel) begin
 end else if (opcode == 8'h32 && phase_cnt == 3'd3) begin
    addr_low <= new_low;
 end else if (opcode == 8'h6B && phase_cnt == 3'd3) begin
-   addr_low <= new_low;
+   data_byte <= byte_captured;
 end else if (opcode == 8'h5A && phase_cnt == 3'd3) begin
    sfdp_idx <= byte_captured[6:0];
 end else if (opcode == 8'h5A && phase_cnt == 3'd4) begin
@@ -312,31 +384,11 @@ always @(posedge sclk or posedge cs_async_rst) begin
 end
 @
 
-The RAM has one write port and one combinational read port. The
-write enable fires on 0x02 byte boundaries and on the lower
-nibble of every 0x32 data byte, both gated by `wel_s`. The read
-address is a single mux: during the 0x6B data phase it tracks
-`data_ptr` (or `data_ptr + 1` on an advance posedge so the byte
-we register into `quad_byte` is the NEXT byte); for 0x03/0x0B
-boundary reads it picks `new_low` so the first response byte
-hits the same cycle the address is captured; otherwise it
-follows `addr_low`.
+The shift engine no longer owns any RAM ports. The chunk
+remains in the structure for documentation and to keep the
+shift-engine block diagram intact; tangling produces no Verilog.
 
 <<SPI: shift engine RAM ports>>=
-wire ram_we = (opcode == 8'h02 && phase_cnt > 3'd3 && byte_done && wel_s)
-           || (opcode == 8'h32 && quad_in_phase && qin_phase == 1'b1 && wel_s);
-wire [3:0] ram_waddr = addr_low;
-wire [7:0] ram_wdata = (opcode == 8'h32) ? {nibble_buf, io_d_in}
-                                         : byte_captured;
-
-wire [3:0] ram_raddr = quad_data
-                     ? (quad_advance ? (data_ptr + 4'd1) : data_ptr)
-                     : (byte_done
-                        && (   (opcode == 8'h03 && phase_cnt == 3'd3)
-                            || (opcode == 8'h0B && phase_cnt == 3'd3))
-                        ? new_low
-                        : addr_low);
-wire [7:0] ram_rd = ram[ram_raddr];
 @
 
 The 128-byte SFDP (Serial Flash Discoverable Parameters, JESD216)
@@ -442,13 +494,13 @@ within a half-period at the iCE40 IO speeds we care about (under
 100 MHz SCLK).
 @
 
-Page buffer and Write Enable Latch (WEL). The 16-byte RAM is
-declared here and written from the sclk-domain shift engine; reads
-are async (LUT RAM) so `shift_out <= ram[...]` in the shift engine
-captures the byte combinationally on the loading rise. WEL is
-updated in the fclk domain on the CS-rise pulse: set on a 1-byte
-0x06 (WREN) frame, cleared on a 1-byte 0x04 (WRDI) frame, and
-cleared again as a side effect of any 0x02 / 0x32 program frame.
+Write Enable Latch (WEL). With the streaming pattern source in
+place there is no page-buffer storage; this block reduces to
+the WEL flop and the `cs_n` CDC chain that the rest of the
+fclk-domain logic shares. WEL is updated in the fclk domain on
+the CS-rise pulse: set on a 1-byte 0x06 (WREN) frame, cleared
+on a 1-byte 0x04 (WRDI) frame, and cleared again as a side
+effect of any 0x02 / 0x32 program frame.
 
 The status register exposed by 0x05 (RDSR) is synthesised from
 this latch alone: bit 0 is WIP (write-in-progress) and is hard-
@@ -479,11 +531,8 @@ rates this slave targets.
 @
 
 <<SPI: page buffer storage>>=
-reg [7:0] ram [0:15];
-reg       wel;
-integer   _i;
+reg wel;
 initial begin
-   for (_i = 0; _i < 16; _i = _i + 1) ram[_i] = 8'h00;
    wel = 0;
 end
 @
@@ -538,21 +587,20 @@ the prefetched byte into nibbles.
 @
 
 `quad_phase` is the negedge presenter's nibble-select (0 = upper
-next, 1 = lower next). `data_ptr` indexes the page buffer for the
-data phase, separate from the shift engine's `addr_low` so a
-read does not perturb the latched start address. `quad_byte` is
-the prefetched RAM byte the presenter slices.
+next, 1 = lower next). `quad_byte` is the prefetched pattern
+byte the presenter slices into nibbles. It is loaded from the
+shift engine's `data_byte` pattern counter, which holds the
+address LSB at the start of the data phase and is incremented
+on every `quad_advance` edge.
 
 <<SPI: quad output state>>=
 reg [3:0] quad_out;
 reg       quad_phase;
-reg [3:0] data_ptr;
 reg [7:0] quad_byte;
 
 initial begin
    quad_out   = 0;
    quad_phase = 0;
-   data_ptr   = 0;
    quad_byte  = 0;
 end
 @
@@ -583,30 +631,32 @@ initial    quad_byte_phase = 0;
 wire       quad_advance = quad_data && quad_byte_phase;
 @
 
-The sclk process samples the shared RAM read port at every rise
-during the data phase. The `!quad_data` branch (re-entered each
-cycle the data phase has not yet started) latches `data_ptr`
-from the shift engine's `addr_low`, prefetches the first byte,
-and zeroes the cadence toggle. Inside the data phase the toggle
-flips every rise; on each `quad_advance` cycle the pointer
-increments and the next byte is prefetched.
+The sclk process samples the shift engine's `data_byte` pattern
+counter at every rise during the data phase. The `!quad_data`
+branch (re-entered each cycle the data phase has not yet
+started) latches `quad_byte` directly from `data_byte` and
+zeroes the cadence toggle. Inside the data phase the toggle
+flips every rise; on each `quad_advance` cycle the shift engine
+increments `data_byte` and the quad block latches the
+post-increment value (`data_byte + 1`) into `quad_byte` so both
+registers stay in lockstep with the running pattern. Reading
+`data_byte` here is a same-domain read (both processes are on
+`posedge sclk`) and only one block writes the register, so
+there is no multi-driver and no extra pipeline stage.
 
 <<SPI: quad output sclk process>>=
 always @(posedge sclk or posedge cs_async_rst) begin
    if (cs_async_rst) begin
-      data_ptr        <= 0;
       quad_byte       <= 0;
       quad_byte_phase <= 0;
    end else begin
       if (!quad_data) begin
-         data_ptr        <= addr_low;
-         quad_byte       <= ram_rd;
+         quad_byte       <= data_byte;
          quad_byte_phase <= 1'b0;
       end else begin
          quad_byte_phase <= ~quad_byte_phase;
          if (quad_advance) begin
-            data_ptr  <= data_ptr + 4'd1;
-            quad_byte <= ram_rd;
+            quad_byte <= data_byte + 8'd1;
          end
       end
    end
@@ -1521,7 +1571,7 @@ module tb_qspi;
          $fatal(1, "FAIL: RDSR after WRDI expected 0x00, got %02h", got1);
       expect_line("op=05 bytes=2", oracle_crc ^ 32'hFFFFFFFF);
 
-      // Slave drives 16 data bytes of 0x00.
+      // Slave drives 16 pattern bytes starting at addr 0: 0,1,...,15.
       begin : frame4
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -1539,12 +1589,13 @@ module tb_qspi;
             end
          #200 cs_n = 1;
 
-         $write("MISO trace (03 pre-write):");
+         $write("MISO trace (03 pattern at addr 0):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== 8'h00)
-               $fatal(1, "FAIL: 03 pre-write data[%0d]=%02h", k, got_arr[k]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: 03 pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -1560,6 +1611,9 @@ module tb_qspi;
       spi_byte(8'hAA, 1'b1, got0);
       #200 cs_n = 1;
       expect_line("op=02 bytes=5", oracle_crc ^ 32'hFFFFFFFF);
+      // Frame 6: 0x03 read at addr 0 -- pattern reads are
+      // independent of the page buffer, so this just confirms the
+      // pattern source is unaffected by a prior no-WEL 0x02 frame.
       begin : frame6
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
@@ -1573,7 +1627,7 @@ module tb_qspi;
          #200 cs_n = 1;
          $display("MISO trace (03 after no-WEL 02): %02h", got0);
          if (got0 !== 8'h00)
-            $fatal(1, "FAIL: no-WEL write leaked: got %02h", got0);
+            $fatal(1, "FAIL: 03 pattern at addr 0: got %02h, want 00", got0);
          expect_line("op=03 bytes=5", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -1601,7 +1655,9 @@ module tb_qspi;
          expect_line("op=02 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 9: 0x03 read back -- expect 0x50..0x5F.
+      // Frame 9: 0x03 read at addr 0x000010 -- expect pattern
+      // 0x10..0x1F. Confirms the address LSB is captured into
+      // the pattern counter.
       begin : frame9
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -1610,20 +1666,20 @@ module tb_qspi;
          @(posedge clk);
          cs_n = 0; #200;
          spi_send(8'h03, 1'b1);  // opcode
-         spi_send(8'h00, 1'b1);  // addr
-         spi_send(8'h00, 1'b1);  // addr
-         spi_send(8'h00, 1'b1);  // addr
+         spi_send(8'h00, 1'b1);  // addr [23:16]
+         spi_send(8'h00, 1'b1);  // addr [15:8]
+         spi_send(8'h10, 1'b1);  // addr [7:0]
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
          #200 cs_n = 1;
-         $write("MISO trace (03 after write):");
+         $write("MISO trace (03 pattern at addr 0x10):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'h50 + k[7:0]))
-               $fatal(1, "FAIL: read-after-write data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'h50 + k[7:0]);
+            if (got_arr[k] !== (8'h10 + k[7:0]))
+               $fatal(1, "FAIL: 03 pattern at 0x10 data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'h10 + k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -1639,7 +1695,7 @@ module tb_qspi;
          spi_send(8'h0B, 1'b1);
          spi_send(8'h00, 1'b1);
          spi_send(8'h00, 1'b1);
-         spi_send(8'h00, 1'b1);
+         spi_send(8'h80, 1'b1);  // addr LSB = 0x80
          spi_byte(8'h00, 1'b0, got_dummy);  // not slave-driven
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
@@ -1648,17 +1704,19 @@ module tb_qspi;
          $display("MISO during 0x0B dummy byte: %02h", got_dummy);
          if (got_dummy !== 8'h00)
             $fatal(1, "FAIL: 0x0B dummy MISO = %02h, want 00", got_dummy);
-         $write("MISO trace (0B):");
+         $write("MISO trace (0B pattern at addr 0x80):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'h50 + k[7:0]))
-               $fatal(1, "FAIL: 0B data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'h50 + k[7:0]);
+            if (got_arr[k] !== (8'h80 + k[7:0]))
+               $fatal(1, "FAIL: 0B pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'h80 + k[7:0]);
          expect_line("op=0b bytes=21", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 11: 0x6B Quad Output Read -- slave drives 16 quad data bytes.
+      // Frame 11: 0x6B Quad Output Read -- slave drives 16 quad
+      // pattern bytes starting at addr 0xFE so the wrap from 0xFF
+      // back to 0x00 is exercised on the quad path.
       begin : frame11
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -1674,7 +1732,7 @@ module tb_qspi;
          spi_send(8'h6B, 1'b1);
          spi_send(8'h00, 1'b1);
          spi_send(8'h00, 1'b1);
-         spi_send(8'h00, 1'b1);
+         spi_send(8'hFE, 1'b1);  // addr LSB = 0xFE -- exercises wrap
          // Probe the DUT's per-lane output enable: must be 0 during
          // the dummy byte (master tri-states all four lanes), and
          // must turn on for all four lanes once the data phase
@@ -1703,13 +1761,13 @@ module tb_qspi;
             $fatal(1, "FAIL: 6B io_oe must drop after CS rise: %b",
                    dut.io_oe);
 
-         $write("QUAD trace (6B):");
+         $write("QUAD trace (6B pattern at addr 0xFE):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'h50 + k[7:0]))
-               $fatal(1, "FAIL: 6B data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'h50 + k[7:0]);
+            if (got_arr[k] !== (8'hFE + k[7:0]))
+               $fatal(1, "FAIL: 6B pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'hFE + k[7:0]);
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -1734,7 +1792,10 @@ module tb_qspi;
          expect_line("op=32 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 13: 0x03 readback after no-WEL 32 -- buffer still 0x50..
+      // Frame 13: 0x03 readback after no-WEL 32 -- pattern source
+      // is independent of the page buffer, so the response must
+      // be the addr-0 pattern (0x00..0x0F) regardless of what the
+      // (rejected) write tried to do.
       begin : frame13
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -1754,9 +1815,9 @@ module tb_qspi;
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'h50 + k[7:0]))
-               $fatal(1, "FAIL: no-WEL 32 leaked: data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'h50 + k[7:0]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: 03 pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -1791,7 +1852,8 @@ module tb_qspi;
          expect_line("op=32 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 16: 0x03 readback -- expect 0xC0..0xCF.
+      // Frame 16: 0x03 readback after WEL+quad-32 -- pattern at
+      // addr 0 is 0x00..0x0F, independent of any prior writes.
       begin : frame16
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -1807,21 +1869,22 @@ module tb_qspi;
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
          #200 cs_n = 1;
-         $write("MISO trace (03 after quad-32):");
+         $write("MISO trace (03 after quad-32, pattern):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hC0 + k[7:0]))
-               $fatal(1, "FAIL: quad-32 write missing: data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hC0 + k[7:0]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: 03 pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 16b: 0x6B quad-output readback -- expect 0xC0..0xCF.
-      // This is the step-15 regression test: the step-12 pointer
-      // cadence presented `{byte_N_upper, byte_{N+1}_lower}` for
-      // every pair; the step-15 `quad_byte_phase` toggle re-aligns
-      // so `{byte_N_upper, byte_N_lower}` is delivered.
+      // Frame 16b: 0x6B quad-output readback at addr 0 -- expect
+      // pattern 0x00..0x0F. This is the step-15 nibble-alignment
+      // regression test: prior cadence presented
+      // `{byte_N_upper, byte_{N+1}_lower}` for every pair; the
+      // `quad_byte_phase` toggle re-aligns so
+      // `{byte_N_upper, byte_N_lower}` is delivered.
       begin : frame16b
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -1850,13 +1913,13 @@ module tb_qspi;
          #50;
          if (dut.io_oe !== 4'b0000)
             $fatal(1, "FAIL: 6B/CF post-CS io_oe=%b", dut.io_oe);
-         $write("QUAD trace (6B after quad-32):");
+         $write("QUAD trace (6B pattern at addr 0):");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hC0 + k[7:0]))
-               $fatal(1, "FAIL: 6B/CF quad-read data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hC0 + k[7:0]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: 6B pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
       end
 
@@ -1912,7 +1975,7 @@ module tb_qspi;
          expect_line("op=02 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 20: 0x03 readback at high rate, expect 0xA0..0xAF.
+      // Frame 20: 0x03 readback at high rate, addr=0 pattern.
       begin : hs_rd
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -1927,22 +1990,22 @@ module tb_qspi;
          for (k = 0; k < 16; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
-         $write("HS 03 rd:");
+         $write("HS 03 rd pattern:");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hA0 + k[7:0]))
+            if (got_arr[k] !== k[7:0])
                $fatal(1, "FAIL: high-rate 03 data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hA0 + k[7:0]);
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 20b: long single-lane 0x03 read (40 data bytes =
-      // 2.5x the 16-byte RAM) to cross the `addr_low` wrap
-      // boundary and exercise the `phase_cnt == 7` saturation +
-      // addr_low++ path. The hardware bench reports a byte-1
-      // regression on 1MB single-lane reads; this test pins the
-      // cross-boundary behaviour in sim.
+      // Frame 20b: long single-lane 0x03 read (40 data bytes)
+      // starting at addr LSB 0xF0 so the 8-bit pattern counter
+      // wraps from 0xFF back to 0x00 mid-frame. This is the
+      // headline streaming integrity check: every emitted byte
+      // must equal `(0xF0 + k) mod 256` so any framing or CDC
+      // glitch in the long stream is caught byte-by-byte.
       begin : hs_rd_long
          reg [7:0] got_arr [0:39];
          integer   k;
@@ -1953,17 +2016,17 @@ module tb_qspi;
          spi_send(8'h03, 1'b1);
          spi_send(8'h00, 1'b1);
          spi_send(8'h00, 1'b1);
-         spi_send(8'h00, 1'b1);
+         spi_send(8'hF0, 1'b1);
          for (k = 0; k < 40; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
-         $write("HS 03 long:");
+         $write("HS 03 long pattern from 0xF0:");
          for (k = 0; k < 40; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 40; k = k + 1)
-            if (got_arr[k] !== (8'hA0 + (k[7:0] & 8'h0F)))
-               $fatal(1, "FAIL: long-03 data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hA0 + (k[7:0] & 8'h0F));
+            if (got_arr[k] !== (8'hF0 + k[7:0]))
+               $fatal(1, "FAIL: long-03 pattern data[%0d]=%02h want %02h",
+                      k, got_arr[k], 8'hF0 + k[7:0]);
          // Total SCLK-bytes = 1 opcode + 3 addr + 40 data = 44.
          // Printer shows modulo 100 => "44".
          expect_line("op=03 bytes=44", oracle_crc ^ 32'hFFFFFFFF);
@@ -1996,7 +2059,7 @@ module tb_qspi;
          expect_line("op=32 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 22: 0x03 readback, expect 0xE0..0xEF.
+      // Frame 22: 0x03 readback at high rate, addr=0 pattern.
       begin : hs_qrd
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -2011,17 +2074,18 @@ module tb_qspi;
          for (k = 0; k < 16; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
-         $write("HS 03 quad-rd:");
+         $write("HS 03 pattern after quad-32:");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hE0 + k[7:0]))
-               $fatal(1, "FAIL: high-rate quad-32 data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hE0 + k[7:0]);
+            if (got_arr[k] !== k[7:0])
+               $fatal(1, "FAIL: high-rate 03 data[%0d]=%02h want %02h",
+                      k, got_arr[k], k[7:0]);
          expect_line("op=03 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
 
-      // Frame 23: 0x6B Quad Output Read at high rate.
+      // Frame 23: 0x6B Quad Output Read at high rate, addr LSB
+      // 0x40 -- pattern starts at 0x40, increments through 0x4F.
       begin : hs_qor
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -2033,18 +2097,18 @@ module tb_qspi;
          spi_send(8'h6B, 1'b1);
          spi_send(8'h00, 1'b1);
          spi_send(8'h00, 1'b1);
-         spi_send(8'h00, 1'b1);
+         spi_send(8'h40, 1'b1);
          spi_dummy_quad();
          for (k = 0; k < 16; k = k + 1)
             spi_quad_data_byte(got_arr[k]);
          #200 cs_n = 1;
-         $write("HS 6B:");
+         $write("HS 6B pattern from 0x40:");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
          $display("");
          for (k = 0; k < 16; k = k + 1)
-            if (got_arr[k] !== (8'hE0 + k[7:0]))
+            if (got_arr[k] !== (8'h40 + k[7:0]))
                $fatal(1, "FAIL: high-rate 6B data[%0d]=%02h want %02h",
-                      k, got_arr[k], 8'hE0 + k[7:0]);
+                      k, got_arr[k], 8'h40 + k[7:0]);
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
       end
 
