@@ -1176,6 +1176,25 @@ mp135:uart_close
 
 - Check 1lane @ presc=5 pattern correct
 
+Phase 1 -- 1-lane MDMA read at presc=203.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 203\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="m 1048576 0 1\r"
+mp135:uart_expect sentinel="firsterr" timeout_ms=10000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane MDMA @ presc=203 pattern correct
+
 Phase 1 -- 1-lane sweep at presc=4.
 
 ```
@@ -1405,6 +1424,10 @@ BENCH_RE = re.compile(
     rb"bench\s+(\d+)\s+B\s+(1lane|quad)\s+@\s+presc=(\d+)\s+in\s+"
     rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=[0-9a-f]+,\s+"
     rb"firsterr=(-?\d+)")
+MDMA_RE = re.compile(
+    rb"mdma\s+(\d+)\s+B\s+(1lane|quad)\s+in\s+"
+    rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=[0-9a-f]+,\s+"
+    rb"firsterr=(-?\d+)")
 DEBUG_RE = re.compile(rb"SPI E=([0-9a-f]{4}) S=([0-9a-f]{8})")
 HEXLINE_RE = re.compile(rb"[0-9a-f]{8}:(?:\s+[0-9a-f]{2}){1,16}")
 HEXBYTE_RE = re.compile(rb"\b([0-9a-f]{2})\b")
@@ -1595,6 +1618,17 @@ def _bench_pick(mode, presc):
     return last
 
 
+def _mdma_pick(mode):
+    raw = _read_uart()
+    if raw is None:
+        return None
+    last = None
+    for m in MDMA_RE.finditer(raw):
+        if int(m.group(1)) == 1048576 and m.group(2).decode() == mode:
+            last = m
+    return last
+
+
 def _sclk_mhz(presc):
     return QSPI_KER_HZ / (presc + 1) / 1_000_000
 
@@ -1626,6 +1660,16 @@ def _bench_rate_text(mode, presc, match):
             f"bench={ms}ms{wall}")
 
 
+def _mdma_rate_text(mode, presc, match):
+    ms = int(match.group(3))
+    mbps = match.group(4).decode("ascii")
+    wall_ms = _bench_wall_ms()
+    wall = f" wall={wall_ms:.0f}ms" if wall_ms is not None else " wall=unknown"
+    return (f"{mode} MDMA @ presc={presc} "
+            f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
+            f"bench={ms}ms{wall}")
+
+
 def check_pattern(mode, presc):
     if not v.check_no_errors():
         return False
@@ -1653,6 +1697,27 @@ def check_pattern(mode, presc):
     return True
 
 
+def check_mdma_pattern(mode, presc):
+    if not v.check_no_errors():
+        return False
+    m = _mdma_pick(mode)
+    if m is None:
+        sys.stderr.write(f"no {mode} mdma line\n")
+        raw = _read_uart()
+        if raw:
+            sys.stderr.write("--- last 512 bytes of UART ---\n")
+            sys.stderr.write(raw[-512:].decode("ascii", "replace"))
+            sys.stderr.write("\n")
+        return False
+    fe = int(m.group(5))
+    rate = _mdma_rate_text(mode, presc, m)
+    if fe != -1:
+        sys.stderr.write(f"{rate}: firsterr={fe} (expected -1)\n")
+        return False
+    sys.stdout.write(rate + "\n")
+    return True
+
+
 def _make_dispatch():
     """Generate one DISPATCH entry per (mode, presc) pair declared in
     the hardware test plan. Keys exactly match the TEST.md bullets."""
@@ -1665,6 +1730,8 @@ def _make_dispatch():
         lambda: check_raw_read_pattern("1lane", 1024))
     out["Check 1lane peripheral raw read at presc=5 returns 512-byte incrementing pattern"] = (
         lambda: check_raw_read_pattern("1lane", 512))
+    out["Check 1lane MDMA @ presc=203 pattern correct"] = (
+        lambda: check_mdma_pattern("1lane", 203))
     out["Check quad bit-bang read returns incrementing pattern"] = (
         lambda: check_bitbang_pattern("quad"))
     out["Check FPGA UART debug reports first 32 SCLK edges"] = (
@@ -1702,7 +1769,7 @@ NW := ../../src/spi.nw
 all: TEST.md verify.py
 
 test: all bitstreams
-	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi
+	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi --log run_md.log
 
 bitstreams:
 	$(MAKE) -C ../.. build/spi/pin_preflight build/spi/spi_1lane.bin build/spi/spi_quad.bin
