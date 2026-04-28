@@ -15,7 +15,7 @@ input; MISO (single-lane) is `io[1]` driven as an output when a
 single-lane opcode is in its response window.
 
 <<qspi.v>>=
-module qspi_slave (
+module qspi (
       input        clk,
       input        cs_n,
       input        sclk,
@@ -34,19 +34,22 @@ module qspi_slave (
 endmodule
 @
 
-Step 12 reorganises the entire RX/TX path so that capture is
-clocked directly on `sclk` (no fclk synchroniser chain). The earlier
-two-flop syncs limited usable SCLK to a fraction of `clk` (12 MHz);
-running flops directly off `sclk` lets us push SCLK toward the iCE40
-HX1K's input-flop fmax (>250 MHz) and well past the STM32MP135's
-SDR ceiling.
+Capture is clocked directly on `sclk` with no fclk synchroniser
+chain on the data path. A two-flop sync would limit usable SCLK to
+a fraction of `clk` (12 MHz); flops driven directly off `sclk`
+reach the iCE40 HX1K's input-flop fmax (>250 MHz), well past the
+STM32MP135's SDR ceiling.
 
-The new partition:
+The clock-domain partition:
 
 - All capture state (`bit_cnt`, `shift_in`, `byte_cnt`, `opcode`,
   `addr_low`, RAM writes, CRC, `qin_phase`, `nibble_buf`,
-  `quad_in_cnt`) is clocked on `posedge sclk` with `cs_n` as an
-  asynchronous clear so the first frame after CS-fall starts cleanly.
+  `quad_in_cnt`) is clocked on `posedge sclk` with `cs_async_rst`
+  as an asynchronous clear so the first frame after CS-fall starts
+  cleanly. `cs_async_rst` is `cs_n` reclocked once in the fclk
+  domain; this keeps `cs_n` itself off any async-edge sensitivity
+  list so its sync usage in the cs_sync chain does not collide
+  with its reset role.
 - All slave-driven outputs (`shift_out` shift-register tap into
   `miso_out`, `quad_out`) are clocked on `negedge sclk` so data is
   stable on the wire before the master's next rising-edge sample
@@ -55,68 +58,48 @@ The new partition:
   (combinationally indexed), written on `posedge sclk` at byte
   boundaries.
 - WEL update happens in the fclk domain on the cs-rise pulse.
-- A single CDC point: `cs_n` is two-flop synchronised into the fclk
-  domain; the rising edge produces `cs_rise_pulse` consumed by the
-  WEL update and the UART printer FSM. By the time that pulse fires,
-  the `sclk`-domain registers have been quiescent for at least one
-  fclk cycle (no more sclk edges will arrive until the next CS-fall),
-  so `frame_op` / `frame_cnt` / `frame_crc` snapshot reads are safe.
+- Two CDC points feed the fclk domain: `cs_n` is two-flop
+  synchronised into `cs_sync` (rising edge produces the
+  `cs_rise_pulse` consumed by the WEL update and the UART printer
+  FSM) and one-flop reclocked into `cs_async_rst` (the dedicated
+  async-reset network for the sclk domain). By the time
+  `cs_rise_pulse` fires, the sclk-domain registers have been
+  quiescent for at least one fclk cycle (no more sclk edges will
+  arrive until the next CS-fall), so `frame_op` / `frame_cnt` /
+  `frame_crc` snapshot reads are safe.
 
 @
 
-Shift engine. On each SCLK rising edge with CS low, shift MOSI into
-`shift_in` MSB-first and increment the bit counter. When the counter
-wraps (was 7 and becomes 0) a byte has completed: record it as the
-opcode on the first byte, bump `byte_cnt`, and, for opcodes that
-respond, load the next response byte into `shift_out` on the SAME
-rising edge that completed the byte boundary.
-
-For 0x02 Page Program the shift engine also drives the page-buffer
-write: on each data-phase byte boundary it writes the just-captured
-byte to `ram[addr_low]` and increments `addr_low`, gated by the WEL
-latch. For 0x03 Normal Read the engine loads `shift_out` from
-`ram[addr_low]` each boundary and likewise advances `addr_low`.
-`addr_low` is itself captured from the low nibble of the third
-(last) address byte on the byte_cnt==3 boundary.
-
-Shift engine, sclk-domain. Capture state lives in flops clocked
-directly by `sclk` with `cs_n` as an asynchronous active-high reset.
-Every `posedge sclk`:
-
-- Shift `mosi` (= `io[0]`) into `shift_in` MSB-first; increment
-  `bit_cnt`.
-- For 0x32 data phase: toggle `qin_phase`, latch upper nibble into
-  `nibble_buf` on phase 0, write `{nibble_buf, io[3:0]}` to RAM and
-  bump `addr_low`/`quad_in_cnt` on phase 1 (gated by WEL).
-- On `bit_cnt == 7` (a byte just completed): increment `byte_cnt`,
-  capture opcode if this was byte 0, capture the address-low nibble
-  on byte 3 of address-bearing opcodes, write the just-captured byte
-  to RAM for 0x02 (gated by WEL), and load `shift_out` from either a
-  fixed response constant or `ram[addr_low]` for 0x9F/0x05/0x03/0x0B.
-
-Note: `shift_out` is also clocked on `posedge sclk`. On the rise that
-completes a byte, a load takes precedence; on every other rise we
-shift left by one. The negedge block then taps `shift_out[7]` into
-`miso_out` so the master sees stable data on the next rise (mode 0).
-This eliminates the previous `just_loaded` interlock entirely.
-
-`cs_n` async reset: when CS goes high mid-frame or between frames
-the capture state snaps to zero on the rising edge of `cs_n`. While
-CS is high there are no `sclk` edges that matter (or, more
-precisely, any spurious edges are masked by the reset). When CS
-falls, the reset releases combinationally with the line; the next
-`sclk` rise begins a fresh frame.
+The shift engine lives entirely in the `sclk` domain. Its
+responsibilities split into five named pieces: capture-state
+declarations, the boundary-derived combinational signals, the
+synchronous `posedge sclk` process, the WEL CDC flop, and the
+RAM-port wiring.
 
 <<SPI: shift engine>>=
+<<SPI: shift engine state>>
+<<SPI: shift engine boundary signals>>
+<<SPI: shift engine sclk process>>
+<<SPI: shift engine WEL synchroniser>>
+<<SPI: shift engine RAM ports>>
+@
+
+The capture state is split between a wide `byte_cnt` that the
+printer displays as the `bytes=` field and a narrower saturating
+`phase_cnt` (0..7) that drives every per-byte control decision in
+the FSM. Keeping the wide comparator out of the per-arm logic
+shortens the sclk-domain critical path; sixteen bits of `byte_cnt`
+are still wide enough for the printer's modulo-100 display.
+`addr_low` indexes the 16-byte page buffer; `quad_in_cnt`,
+`nibble_buf`, and `qin_phase` are state owned by the 0x32 quad
+page-program data phase but declared here because the same
+`always @(posedge sclk)` block writes them.
+
+<<SPI: shift engine state>>=
 reg [2:0]  bit_cnt;
-reg [7:0]  shift_in;
+reg [6:0]  shift_in;
 reg [7:0]  shift_out;
 reg [7:0]  opcode;
-// `byte_cnt` is split: a small saturating `phase_cnt` (0..7) drives
-// all per-byte control logic, and a 16-bit `byte_cnt` only serves
-// the printer's `bytes=` field. The printer displays modulo 100 so
-// 16 bits is plenty; saturating phase keeps the wide comparator out
-// of the sclk-domain critical path.
 reg [2:0]  phase_cnt;
 reg [15:0] byte_cnt;
 reg [3:0]  addr_low;
@@ -136,128 +119,197 @@ initial begin
    nibble_buf  = 0;
    qin_phase   = 0;
 end
+@
 
-// just-completed byte and its low nibble.
+`byte_captured` is the value of the byte that has just finished
+shifting in: bits 6..0 already in `shift_in` plus the bit currently
+arriving on `io[0]`. `new_low` is its bottom nibble, used by
+opcodes that latch the address-low. `byte_done` strobes for one
+sclk on each byte boundary. `quad_in_phase` is high during the
+0x32 data phase only.
+
+<<SPI: shift engine boundary signals>>=
 wire [7:0] byte_captured = {shift_in[6:0], io_d_in[0]};
 wire [3:0] new_low       = byte_captured[3:0];
 wire       byte_done     = (bit_cnt == 3'd7);
 wire       quad_in_phase = (opcode == 8'h32) && (phase_cnt >= 3'd4);
+@
 
-always @(posedge sclk or posedge cs_n) begin
-   if (cs_n) begin
-      bit_cnt     <= 0;
-      phase_cnt   <= 0;
-      byte_cnt    <= 0;
-      opcode      <= 0;
-      shift_in    <= 0;
-      shift_out   <= 0;
-      addr_low    <= 0;
-      qin_phase   <= 0;
-      quad_in_cnt <= 0;
-      nibble_buf  <= 0;
+The `posedge sclk` process gates everything off the
+`cs_async_rst` asynchronous clear so each frame starts from a
+clean slate the moment CS falls; while CS is high any spurious
+sclk edges are masked by the held reset. The body splits into a reset arm and a per-rise
+arm; the per-rise arm itself decomposes into the byte-rate shift
+input, the default left-shift of `shift_out` between byte loads,
+the inferred-RAM write statement, the 0x32 quad-input data phase,
+and the byte-boundary opcode dispatch.
+
+<<SPI: shift engine sclk process>>=
+always @(posedge sclk or posedge cs_async_rst) begin
+   if (cs_async_rst) begin
+      <<SPI: shift engine reset>>
    end else begin
-      shift_in <= {shift_in[6:0], io_d_in[0]};
-      bit_cnt  <= bit_cnt + 3'd1;
-
-      // Default: shift `shift_out` left by 1 each SCLK rise so the
-      // negedge block sees the correct bit on tap[7]. A byte-boundary
-      // load below overrides this.
-      shift_out <= {shift_out[6:0], 1'b0};
-
-      // RAM writes happen in a single statement with combinationally
-      // computed write enable / address / data. This keeps the
-      // memory inference clean: yosys sees one write port and one
-      // read port -> 16x8 distributed LUT RAM (~8 LUTs) instead of
-      // 16 flops + a wide read mux (~200 LCs).
-      if (ram_we) ram[ram_waddr] <= ram_wdata;
-
-      // 0x32 Quad Page Program data phase: sample io[3:0] every
-      // rise, pair into bytes; the actual RAM write happens above.
-      if (quad_in_phase) begin
-         qin_phase <= ~qin_phase;
-         if (qin_phase == 1'b0) begin
-            nibble_buf <= io_d_in;
-         end else begin
-            addr_low    <= addr_low + 4'd1;
-            quad_in_cnt <= quad_in_cnt + 20'd1;
-         end
-      end
-
-      if (byte_done) begin
-         byte_cnt  <= byte_cnt  + 16'd1;
-         // Saturate phase_cnt at 7 so the 8th-and-beyond byte of a
-         // long write/read keeps falling into the catch-all `> 4`
-         // arms below.
-         if (phase_cnt != 3'd7) phase_cnt <= phase_cnt + 3'd1;
-
-         if (phase_cnt == 3'd0) begin
-            opcode <= byte_captured;
-            if (byte_captured == 8'h9F) shift_out <= 8'hAA;
-            else if (byte_captured == 8'h05) shift_out <= 8'h00;
-         end else if (phase_cnt == 3'd1 && opcode == 8'h9F) begin
-            shift_out <= 8'h55;
-         end else if (phase_cnt == 3'd2 && opcode == 8'h9F) begin
-            shift_out <= 8'h01;
-         end else if (opcode == 8'h03 && phase_cnt == 3'd3) begin
-            addr_low  <= new_low + 4'd1;
-            shift_out <= ram_rd;
-         end else if (opcode == 8'h03 && phase_cnt > 3'd3) begin
-            addr_low  <= addr_low + 4'd1;
-            shift_out <= ram_rd;
-         end else if (opcode == 8'h0B && phase_cnt == 3'd3) begin
-            addr_low <= new_low;
-         end else if (opcode == 8'h0B && phase_cnt == 3'd4) begin
-            shift_out <= ram_rd;
-            addr_low  <= addr_low + 4'd1;
-         end else if (opcode == 8'h0B && phase_cnt > 3'd4) begin
-            shift_out <= ram_rd;
-            addr_low  <= addr_low + 4'd1;
-         end else if (opcode == 8'h02 && phase_cnt == 3'd3) begin
-            addr_low <= new_low;
-         end else if (opcode == 8'h02 && phase_cnt > 3'd3 && wel) begin
-            addr_low <= addr_low + 4'd1;
-         end else if (opcode == 8'h32 && phase_cnt == 3'd3) begin
-            addr_low <= new_low;
-         end else if (opcode == 8'h6B && phase_cnt == 3'd3) begin
-            // Capture the address-low nibble so 0x6B respects the
-            // master's requested offset. The original step-11 code
-            // omitted this; tests that read from address 0 worked
-            // by accident because addr_low was 0 from cs_n reset.
-            addr_low <= new_low;
-         end
-      end
+      <<SPI: shift in and bit counter>>
+      <<SPI: shift out default>>
+      <<SPI: RAM write at boundaries>>
+      <<SPI: quad input data phase>>
+      <<SPI: byte boundary actions>>
    end
 end
+@
 
-// RAM port logic. One write port, one combinational read port.
-// `ram_waddr` / `ram_wdata` / `ram_we` are derived combinationally
-// from the same conditions the shift engine uses, so the actual
-// write statement above is a clean infer-as-RAM construct.
-//
-// `wel_s` mirrors `wel` (fclk domain) into the sclk domain. This
-// removes a long combinational chain from `wel` (set on a fclk
-// edge between frames) into the sclk-clocked RAM write enable
-// that nextpnr otherwise treats as a same-cycle path.
+<<SPI: shift engine reset>>=
+bit_cnt     <= 0;
+phase_cnt   <= 0;
+byte_cnt    <= 0;
+opcode      <= 0;
+shift_in    <= 0;
+shift_out   <= 0;
+addr_low    <= 0;
+qin_phase   <= 0;
+quad_in_cnt <= 0;
+nibble_buf  <= 0;
+@
+
+The single-lane MOSI bit arrives on `io[0]`. We append it to the
+running shift register and increment the bit counter; when
+`bit_cnt` wraps from 7 to 0 the byte-boundary arm picks up.
+
+<<SPI: shift in and bit counter>>=
+shift_in <= {shift_in[5:0], io_d_in[0]};
+bit_cnt  <= bit_cnt + 3'd1;
+@
+
+Between byte loads, `shift_out` left-shifts every cycle so the
+negedge presenter sees the correct outgoing bit on `shift_out[7]`.
+A boundary load in the dispatch chunk below overrides this default
+on the same cycle.
+
+<<SPI: shift out default>>=
+shift_out <= {shift_out[6:0], 1'b0};
+@
+
+A single RAM write statement keeps yosys's memory inference
+clean: one write port, one read port, mapped to a 16x8 distributed
+LUT RAM (~8 LUTs) instead of sixteen flops plus a wide read mux
+(~200 LCs). The write enable, address, and data are computed
+combinationally in the RAM-ports chunk further down.
+
+<<SPI: RAM write at boundaries>>=
+if (ram_we) ram[ram_waddr] <= ram_wdata;
+@
+
+For 0x32 Quad Page Program the master drives all four IO pins
+during the data phase; the FPGA samples `io[3:0]` on every sclk
+rise and pairs two rises into one byte. `qin_phase` toggles per
+rise: phase 0 latches the upper nibble into `nibble_buf`, phase 1
+delivers the lower nibble (the actual write happens through the
+shared RAM-write statement above) and advances both the page
+pointer and the data-byte counter.
+
+<<SPI: quad input data phase>>=
+if (quad_in_phase) begin
+   qin_phase <= ~qin_phase;
+   if (qin_phase == 1'b0) begin
+      nibble_buf <= io_d_in;
+   end else begin
+      addr_low    <= addr_low + 4'd1;
+      quad_in_cnt <= quad_in_cnt + 20'd1;
+   end
+end
+@
+
+The byte-boundary arm runs on every eighth rise. It bumps the
+display-side `byte_cnt`, advances the saturating `phase_cnt` (so
+the eighth-and-beyond byte of a long transfer keeps matching the
+catch-all `> 4` arms in the dispatch), and dispatches into the
+opcode-specific arm.
+
+<<SPI: byte boundary actions>>=
+if (byte_done) begin
+   byte_cnt  <= byte_cnt  + 16'd1;
+   if (phase_cnt != 3'd7) phase_cnt <= phase_cnt + 3'd1;
+   <<SPI: byte boundary opcode dispatch>>
+end
+@
+
+The opcode dispatch handles, in order: byte 0 of any frame
+(latch opcode, load any single-cycle response constant); the
+0x9F JEDEC ID continuation bytes; 0x03 Normal Read (capture
+address on byte 3 and load the first response from `ram_rd` in
+one cycle, then increment for each subsequent byte); 0x0B Fast
+Read (same pattern with the extra dummy byte); 0x02 Page Program
+(latch address, increment under WEL gating); 0x32 Quad Page
+Program (only the address latch lives here; the data-phase
+write is the quad-input chunk above); 0x6B Quad Output Read
+(latch address; the data presenter is the quad-output engine).
+
+<<SPI: byte boundary opcode dispatch>>=
+if (phase_cnt == 3'd0) begin
+   opcode <= byte_captured;
+   if (byte_captured == 8'h9F) shift_out <= 8'hAA;
+   else if (byte_captured == 8'h05) shift_out <= 8'h00;
+end else if (phase_cnt == 3'd1 && opcode == 8'h9F) begin
+   shift_out <= 8'h55;
+end else if (phase_cnt == 3'd2 && opcode == 8'h9F) begin
+   shift_out <= 8'h01;
+end else if (opcode == 8'h03 && phase_cnt == 3'd3) begin
+   addr_low  <= new_low + 4'd1;
+   shift_out <= ram_rd;
+end else if (opcode == 8'h03 && phase_cnt > 3'd3) begin
+   addr_low  <= addr_low + 4'd1;
+   shift_out <= ram_rd;
+end else if (opcode == 8'h0B && phase_cnt == 3'd3) begin
+   addr_low <= new_low;
+end else if (opcode == 8'h0B && phase_cnt == 3'd4) begin
+   shift_out <= ram_rd;
+   addr_low  <= addr_low + 4'd1;
+end else if (opcode == 8'h0B && phase_cnt > 3'd4) begin
+   shift_out <= ram_rd;
+   addr_low  <= addr_low + 4'd1;
+end else if (opcode == 8'h02 && phase_cnt == 3'd3) begin
+   addr_low <= new_low;
+end else if (opcode == 8'h02 && phase_cnt > 3'd3 && wel) begin
+   addr_low <= addr_low + 4'd1;
+end else if (opcode == 8'h32 && phase_cnt == 3'd3) begin
+   addr_low <= new_low;
+end else if (opcode == 8'h6B && phase_cnt == 3'd3) begin
+   addr_low <= new_low;
+end
+@
+
+`wel` is set in the fclk domain on the cs-rise pulse; the RAM
+write-enable is sclk-domain. A direct combinational reference
+into the sclk-domain write would create a long unconstrained
+path into the RAM block. `wel_s` mirrors `wel` through one sclk
+flop so nextpnr can close timing on a single same-cycle path.
+
+<<SPI: shift engine WEL synchroniser>>=
 reg wel_s;
 initial wel_s = 0;
-always @(posedge sclk or posedge cs_n) begin
-   if (cs_n) wel_s <= 1'b0;
+always @(posedge sclk or posedge cs_async_rst) begin
+   if (cs_async_rst) wel_s <= 1'b0;
    else      wel_s <= wel;
 end
+@
 
+The RAM has one write port and one combinational read port. The
+write enable fires on 0x02 byte boundaries and on the lower
+nibble of every 0x32 data byte, both gated by `wel_s`. The read
+address is a single mux: during the 0x6B data phase it tracks
+`data_ptr` (or `data_ptr + 1` on an advance posedge so the byte
+we register into `quad_byte` is the NEXT byte); for 0x03/0x0B
+boundary reads it picks `new_low` so the first response byte
+hits the same cycle the address is captured; otherwise it
+follows `addr_low`.
+
+<<SPI: shift engine RAM ports>>=
 wire ram_we = (opcode == 8'h02 && phase_cnt > 3'd3 && byte_done && wel_s)
            || (opcode == 8'h32 && quad_in_phase && qin_phase == 1'b1 && wel_s);
 wire [3:0] ram_waddr = addr_low;
 wire [7:0] ram_wdata = (opcode == 8'h32) ? {nibble_buf, io_d_in}
                                          : byte_captured;
 
-// Combinational RAM read. A single mux on the address selects the
-// right candidate per cycle:
-// - 0x6B data phase: `data_ptr` outside an advance posedge,
-//   `data_ptr + 1` on the advance posedge so the byte we register
-//   into `quad_byte` is the NEXT byte of the stream.
-// - shift engine: `new_low` on the boundary that captures the
-//   address byte; `addr_low` otherwise.
 wire [3:0] ram_raddr = quad_data
                      ? (quad_advance ? (data_ptr + 4'd1) : data_ptr)
                      : (byte_done
@@ -275,8 +327,8 @@ combinational mux + IO buffer; the master gets a full SCLK period
 to see the bit before its next rising-edge sample. Mode 0 timing
 holds because the rise that loads the next byte simultaneously
 presents bit 7 on the wire (clk-to-Q + IO delay), which is well
-within a half-period at the iCE40 IO speeds we care about (<100
-MHz SCLK).
+within a half-period at the iCE40 IO speeds we care about (under
+100 MHz SCLK).
 @
 
 Page buffer and Write Enable Latch (WEL). The 16-byte RAM is
@@ -292,7 +344,22 @@ pulse fires, the sclk-domain `opcode` and `byte_cnt` are stable (no
 more sclk edges arrive until the next CS-fall), so reading them
 from the fclk domain on this single pulse is safe.
 
+The sclk-domain reset arm is driven by `cs_async_rst`, an fclk
+flop whose D input is `cs_n`, rather than by `cs_n` directly. This
+keeps `cs_n` purely sync-read (the cs_sync chain) and
+`cs_async_rst` purely async-edge sensitive, so the two roles do
+not collide on a single net. The cost is one fclk cycle of
+latency on cs-rise/cs-fall to the sclk-domain reset --- well
+within the master's CS-fall-to-first-SCLK setup at the SCLK
+rates this slave targets.
+
 <<SPI: page buffer and WEL>>=
+<<SPI: page buffer storage>>
+<<SPI: cs_n CDC chain>>
+<<SPI: WEL update>>
+@
+
+<<SPI: page buffer storage>>=
 reg [7:0] ram [0:15];
 reg       wel;
 integer   _i;
@@ -300,19 +367,26 @@ initial begin
    for (_i = 0; _i < 16; _i = _i + 1) ram[_i] = 8'h00;
    wel = 0;
 end
+@
 
+<<SPI: cs_n CDC chain>>=
 reg [1:0] cs_sync;
 initial cs_sync = 2'b11;
 always @(posedge clk) cs_sync <= {cs_sync[0], cs_n};
+reg cs_async_rst;
+initial cs_async_rst = 1'b1;
+always @(posedge clk) cs_async_rst <= cs_n;
 wire cs_s     = cs_sync[1];
 reg  cs_s_d;
 initial cs_s_d = 1'b1;
 always @(posedge clk) cs_s_d <= cs_s;
 wire cs_rise_pulse = !cs_s_d && cs_s;
+@
 
+<<SPI: WEL update>>=
 always @(posedge clk) begin
    if (cs_rise_pulse) begin
-      if (snap_op == 8'h06 && snap_byte_cnt[7:0] == 8'd1)
+      if (snap_op == 8'h06 && snap_byte_cnt == 8'd1)
          wel <= 1'b1;
       else if (snap_op == 8'h02 || snap_op == 8'h32)
          wel <= 1'b0;
@@ -320,27 +394,37 @@ always @(posedge clk) begin
 end
 @
 
-Quad output engine. For 0x6B Quad Output Read the FPGA drives all
-four IO pins during the data phase at one nibble per SCLK cycle:
-upper nibble on the first cycle of a data byte, lower nibble on the
-second. The nibble is presented on the preceding SCLK falling edge,
-so the master samples stable data on the rising edge (mode 0). Each
-data byte therefore takes 2 SCLK cycles = 2 bit_cnt increments = a
-quarter of a single-lane byte period. Accounting: `byte_cnt` still
-counts single-lane SCLK-bytes (groups of 8 SCLK rises); 16 quad data
-bytes = 32 rises = 4 byte_cnt increments.
+For 0x6B Quad Output Read the FPGA drives all four IO pins during
+the data phase at one nibble per SCLK cycle: upper nibble on the
+first cycle of a data byte, lower nibble on the second. Each
+nibble is presented on the preceding SCLK falling edge so the
+master samples stable data on the rising edge (mode 0). Each data
+byte therefore takes 2 SCLK cycles = 2 `bit_cnt` increments = a
+quarter of a single-lane byte period; `byte_cnt` still counts
+single-lane SCLK-bytes, so sixteen quad data bytes show up as
+four `byte_cnt` increments in the printer's `bytes=` field.
 
-`quad_data` is active for 0x6B once the dummy byte has completed
-(byte_cnt >= 5). `quad_phase` selects upper (0) vs lower (1) nibble
-for the NEXT SCLK fall to present; on each fall we drive `quad_out`
-accordingly, then advance phase. When phase completes a pair (after
-presenting the lower nibble) we bump the page-buffer pointer
-`data_ptr`. The pointer is initialised to `addr_low` at the rise
-that finishes the dummy byte.
+The engine partitions into state, the data-phase qualifier
+`quad_data`, an sclk-domain pointer-and-fetch process that
+straddles the byte boundary, and a negedge presenter that slices
+the prefetched byte into nibbles.
 
 <<SPI: quad output engine>>=
+<<SPI: quad output state>>
+<<SPI: quad output qualifiers>>
+<<SPI: quad output sclk process>>
+<<SPI: quad output negedge presenter>>
+@
+
+`quad_phase` is the negedge presenter's nibble-select (0 = upper
+next, 1 = lower next). `data_ptr` indexes the page buffer for the
+data phase, separate from the shift engine's `addr_low` so a
+read does not perturb the latched start address. `quad_byte` is
+the prefetched RAM byte the presenter slices.
+
+<<SPI: quad output state>>=
 reg [3:0] quad_out;
-reg       quad_phase;  // 0 = upper nibble is next to present
+reg       quad_phase;
 reg [3:0] data_ptr;
 reg [7:0] quad_byte;
 
@@ -350,49 +434,49 @@ initial begin
    data_ptr   = 0;
    quad_byte  = 0;
 end
+@
 
-// Active high during the 0x6B data phase (after opcode + 3 addr +
-// dummy = 5 single-lane SCLK-bytes). `phase_cnt` saturates at 7,
-// which still satisfies `>= 5` for all subsequent bytes.
+`quad_data` is high during the 0x6B data phase only --- after the
+opcode, three address bytes, and dummy byte (five single-lane
+SCLK-bytes). `phase_cnt` saturates at 7, which still satisfies
+`>= 5` for every subsequent byte, so the qualifier needs no
+additional latch.
+
+`quad_advance` fires the byte fetch in the sclk process. The
+data phase uses two negedges per RAM byte, so `quad_byte` must
+stay stable across both negedges of a pair and refresh before
+the third. The cadence is set by a dedicated sclk-domain toggle
+`quad_byte_phase` that starts at 0 the cycle the data phase
+begins (the `!quad_data` branch in the process below resets it)
+and flips on every subsequent rise; the advance fires on the
+posedge after two negedges have consumed the current byte.
+`bit_cnt[0]` is the wrong reference --- it phases off the
+upper-nibble negedge by one cycle and reassembles
+`{byte_N_upper, byte_{N+1}_lower}` for every pair.
+
+<<SPI: quad output qualifiers>>=
 wire quad_data = (opcode == 8'h6B) && (phase_cnt >= 3'd5);
 
-// Pointer advance cadence. The 0x6B data phase uses TWO negedges
-// per RAM byte: one presents the upper nibble, the next presents
-// the lower nibble. `quad_byte` must stay stable across both
-// negedges of a pair, then refresh to the next RAM byte before the
-// third negedge.
-//
-// The step-12 version gated the advance on `bit_cnt[0]`. That was
-// off by one SCLK: the advance fired on the posedge BETWEEN the
-// upper-nibble negedge and the lower-nibble negedge, causing
-// `quad_byte` to switch to byte N+1 before the lower nibble of
-// byte N had been presented. Master reassembled
-// `{byte_N_upper, byte_{N+1}_lower}` for every pair -- garbage.
-//
-// The fix is a dedicated sclk-domain toggle `quad_byte_phase` that
-// starts at 0 the cycle the data phase begins and flips on every
-// subsequent posedge inside the data phase. The advance fires when
-// `quad_byte_phase == 1` -- i.e., on posedge #3, #5, #7 ... (after
-// two negedges have consumed the current byte). The very first
-// load at posedge #1 is the `!quad_data` branch, which also resets
-// `quad_byte_phase` to 0 so the cadence is aligned with the start
-// of the data phase regardless of what `bit_cnt` happened to be.
 reg        quad_byte_phase;
 initial    quad_byte_phase = 0;
 wire       quad_advance = quad_data && quad_byte_phase;
+@
 
-always @(posedge sclk or posedge cs_n) begin
-   if (cs_n) begin
+The sclk process samples the shared RAM read port at every rise
+during the data phase. The `!quad_data` branch (re-entered each
+cycle the data phase has not yet started) latches `data_ptr`
+from the shift engine's `addr_low`, prefetches the first byte,
+and zeroes the cadence toggle. Inside the data phase the toggle
+flips every rise; on each `quad_advance` cycle the pointer
+increments and the next byte is prefetched.
+
+<<SPI: quad output sclk process>>=
+always @(posedge sclk or posedge cs_async_rst) begin
+   if (cs_async_rst) begin
       data_ptr        <= 0;
       quad_byte       <= 0;
       quad_byte_phase <= 0;
    end else begin
-      // Always sample the shared RAM read port on posedge sclk;
-      // quad_byte holds the byte for the negedge presenter to
-      // slice. When `quad_advance` is asserted (or when we just
-      // entered the data phase via `!quad_data`), data_ptr and
-      // quad_byte refresh. Otherwise quad_byte stays put across
-      // the lower-nibble negedge.
       if (!quad_data) begin
          data_ptr        <= addr_low;
          quad_byte       <= ram_rd;
@@ -406,11 +490,16 @@ always @(posedge sclk or posedge cs_n) begin
       end
    end
 end
+@
 
-// Negedge presenter: pure registered slice of `quad_byte`. No RAM
-// read on this clock edge; just a 4-bit mux into a flop.
-always @(negedge sclk or posedge cs_n) begin
-   if (cs_n) begin
+The negedge presenter is a pure registered slice of `quad_byte`
+into `quad_out`. It does not touch RAM; just a 4-bit mux into a
+flop, alternating upper and lower nibble each negedge of the
+data phase.
+
+<<SPI: quad output negedge presenter>>=
+always @(negedge sclk or posedge cs_async_rst) begin
+   if (cs_async_rst) begin
       quad_out   <= 0;
       quad_phase <= 0;
    end else if (quad_data) begin
@@ -427,59 +516,69 @@ always @(negedge sclk or posedge cs_n) begin
 end
 @
 
-Quad input engine state. For 0x32 Quad Page Program the master
-drives all four IO pins during the data phase; the FPGA samples
-`io[3:0]` on each SCLK rising edge (mode 0 sample point). Two rises
-form one byte: the first provides the upper nibble
-(IO3=bit7..IO0=bit4), the second the lower nibble (IO3=bit3..IO0=bit0).
-The actual sampling, RAM write, and pointer/count advance happen in
-the shift engine's sclk_rise block (to avoid multiple drivers on
-`quad_phase`, `addr_low`, and `ram`). This chunk only declares the
-state registers used there.
+For 0x32 Quad Page Program the master drives all four IO pins
+during the data phase; the FPGA samples `io[3:0]` on each SCLK
+rising edge (mode 0 sample point) and pairs two rises into one
+byte (IO3..IO0 → upper nibble first, then lower). The sampling,
+RAM write, and pointer/count advance all live inside the shift
+engine's `posedge sclk` process to avoid multiple drivers on
+`addr_low` and the page buffer; the state registers
+(`quad_in_cnt`, `nibble_buf`, `qin_phase`) are likewise declared
+in the shift-engine state chunk above.
 
-`quad_in_cnt` counts the number of data bytes received during a
-0x32 frame; at CS rise the end-of-frame latch uses it to synthesise
-a `bytes=K` log field in byte-equivalents (1 opcode + 3 addr + N
-data bytes), ignoring how many SCLK cycles were physically used.
+`quad_in_cnt` counts data bytes received during a 0x32 frame; the
+end-of-frame latch uses it to render the printer's `bytes=` field
+in byte-equivalents (1 opcode + 3 addr + N data bytes), ignoring
+how many SCLK cycles were physically used.
+
+This chunk is intentionally empty: the structure-only reference
+above holds the prose, and there is nothing left to tangle.
 
 <<SPI: quad input engine>>=
-// Quad-input state (`quad_in_cnt`, `nibble_buf`, `qin_phase`,
-// `quad_in_phase`) is declared and driven inside the sclk-domain
-// shift engine block; this chunk intentionally has no body.
 @
 
-IO pin drivers. Four tri-state drivers, one per lane. Only `io[1]`
-is driven in single-lane response phases (`shift_out[7]` gated by
-`resp_window`); the other lanes are Hi-Z until the 0x6B quad data
-phase, when all four outputs drive `quad_out`.
+Four tri-state drivers, one per lane. Only `io[1]` carries a
+useful single-lane response (`shift_out[7]` gated by
+`resp_window`); the other lanes stay Hi-Z until the 0x6B quad
+data phase, when all four outputs drive `quad_out`. The drivers
+split into the two qualifiers, the per-lane data and OE wires,
+the inferred tri-state assigns, and the testbench-visible
+aggregate views.
 
-Step-14 (post step-13 hardware regression): the explicit SB_IO
-instantiation in step 13 caused both 0x6B and single-lane bench
-reads to regress. Reverting to inferred tristates from
-`assign io[k] = oe_k ? d_k : 1'bz;` -- but each lane gets its own
-named, distinct OE wire so yosys cannot collapse multiple lanes'
-OEs into a single signal and accidentally drop one of them. The
-per-lane OE wires (`io_oe_0` .. `io_oe_3`) are also exposed as a
-4-bit `io_oe` bus for the testbench to probe.
+Each lane gets its own named OE wire. Bundling all four lanes
+through a single OE expression lets yosys collapse `io[0]`,
+`io[2]`, and `io[3]` onto one shared `$_TBUF_` in an intermediate
+pass, dropping OE on the collapsed lanes in the placed bitstream.
+Naming the OE wires per lane prevents that sharing.
 
 <<SPI: IO drivers>>=
-// `resp_window` is high during single-lane MISO phases on io[1].
-// `quad_data_drive` is high during the 0x6B quad data phase. The
-// raw `cs_n` pin is gated in so io snaps to Hi-Z the instant CS
-// rises, even before the cs_n synchroniser into fclk has settled.
+<<SPI: IO drive qualifiers>>
+<<SPI: IO per-lane OE and data>>
+<<SPI: IO tri-state assigns>>
+<<SPI: IO testbench views>>
+@
+
+`resp_window` is the single-lane MISO window on `io[1]` for any
+opcode that returns a serial response. `quad_data_drive` covers
+the 0x6B quad data phase across all four lanes. Both are gated
+on the raw `cs_n` pin so the bus snaps to Hi-Z the instant CS
+rises, before the fclk-domain synchroniser of `cs_n` has even
+settled.
+
+<<SPI: IO drive qualifiers>>=
 wire resp_window = (!cs_n)
                 && ( ((opcode == 8'h9F) && (phase_cnt >= 3'd1) && (phase_cnt <= 3'd3))
                   || ((opcode == 8'h05) && (phase_cnt == 3'd1))
                   || ((opcode == 8'h03) && (phase_cnt >= 3'd4))
                   || ((opcode == 8'h0B) && (phase_cnt >= 3'd5)) );
 wire quad_data_drive = (!cs_n) && quad_data;
+@
 
-// Per-lane OEs. Each lane is an independent named wire so yosys
-// keeps four distinct tristate enables in the inferred SB_IO
-// instances. (Step-13 had four `assign io[k] = ... : 1'bz;`
-// statements but yosys collapsed io[0]/io[2]/io[3] OEs into a
-// single $_TBUF_ in some intermediate pass, and one of those
-// lanes ended up without a working OE in the placed bitstream.)
+Per-lane OE wires. `io_oe_1` is the only lane that aggregates
+both the single-lane response window and the quad data phase;
+the other three lanes drive only during quad data.
+
+<<SPI: IO per-lane OE and data>>=
 wire io_oe_0    = quad_data_drive;
 wire io_oe_1    = quad_data_drive | resp_window;
 wire io_oe_2    = quad_data_drive;
@@ -488,18 +587,23 @@ wire io_d_out_0 = quad_out[0];
 wire io_d_out_1 = quad_data_drive ? quad_out[1] : shift_out[7];
 wire io_d_out_2 = quad_out[2];
 wire io_d_out_3 = quad_out[3];
+@
 
-// Inferred tristates. Each lane's `assign` references a UNIQUE
-// per-lane OE wire so the inferred SB_IOs cannot share / collapse
-// their OE signals.
+Each lane's tri-state `assign` references its own OE wire so the
+inferred `SB_IO` instances keep four distinct OE signals.
+
+<<SPI: IO tri-state assigns>>=
 assign io[0] = io_oe_0 ? io_d_out_0 : 1'bz;
 assign io[1] = io_oe_1 ? io_d_out_1 : 1'bz;
 assign io[2] = io_oe_2 ? io_d_out_2 : 1'bz;
 assign io[3] = io_oe_3 ? io_d_out_3 : 1'bz;
+@
 
-// Aggregate the per-lane OE signals as a 4-bit `io_oe` bus for
-// testbench introspection. The `io_d_in` view is just the inout
-// port itself (combinational input).
+`io_oe` packs the per-lane OE wires into a 4-bit bus for the
+testbench to probe. `io_d_in` is just the `inout` port itself
+(combinational input view).
+
+<<SPI: IO testbench views>>=
 wire [3:0] io_oe   = {io_oe_3, io_oe_2, io_oe_1, io_oe_0};
 wire [3:0] io_d_in = io;
 @
@@ -528,42 +632,50 @@ The qualifier decision for the just-completed byte at pre-increment
   dummy and quad data);
 - everything else (0x02, 0x06, 0xBB, unknown): all bytes master-driven.
 
+The CRC engine partitions into the register and the
+combinational fold functions, the master-driven-byte qualifier
+that limits the CRC scope, the 0x32 quad-input alternate fold
+hook, and the sclk-domain update process.
+
 <<SPI: MOSI CRC-32>>=
+<<SPI: CRC register and fold functions>>
+<<SPI: master-driven qualifier>>
+<<SPI: quad-input byte-done qualifier>>
+<<SPI: CRC update process>>
+@
+
+`crc_reg` lives in the sclk domain alongside the rest of the
+capture state. `crc32_step` does one bit; `crc32_byte` unrolls
+eight LSB-first steps so the byte fold completes in a single
+cycle. The `+ 4'd9` style offset is unnecessary here because
+`crc32_byte` simply chains eight `crc32_step` calls in order.
+
+<<SPI: CRC register and fold functions>>=
 reg [31:0] crc_reg;
 initial crc_reg = 32'hFFFFFFFF;
 
-function [31:0] crc32_step;
-   input [31:0] c;
-   input        bit_in;
-   reg          lsb;
-   begin
-      lsb = c[0] ^ bit_in;
-      crc32_step = {1'b0, c[31:1]} ^ (lsb ? 32'hEDB88320 : 32'h00000000);
-   end
+function automatic [31:0] crc32_step(input [31:0] c, input bit_in);
+   crc32_step = {1'b0, c[31:1]}
+              ^ ((c[0] ^ bit_in) ? 32'hEDB88320 : 32'h00000000);
 endfunction
 
-function [31:0] crc32_byte;
-   input [31:0] c;
-   input [7:0]  b;
-   reg   [31:0] t;
-   begin
-      // Reflected input: fold bits LSB-first.
-      t = c;
-      t = crc32_step(t, b[0]);
-      t = crc32_step(t, b[1]);
-      t = crc32_step(t, b[2]);
-      t = crc32_step(t, b[3]);
-      t = crc32_step(t, b[4]);
-      t = crc32_step(t, b[5]);
-      t = crc32_step(t, b[6]);
-      t = crc32_step(t, b[7]);
-      crc32_byte = t;
-   end
+function automatic [31:0] crc32_byte(input [31:0] c, input [7:0] b);
+   crc32_byte = crc32_step(crc32_step(crc32_step(crc32_step(
+                  crc32_step(crc32_step(crc32_step(crc32_step(
+                     c, b[0]), b[1]), b[2]), b[3]),
+                              b[4]), b[5]), b[6]), b[7]);
 endfunction
+@
 
-// Master-driven qualifier: combinational from `byte_cnt` (pre-inc at
-// the boundary) and `opcode` (which is updated on this same edge
-// for N==0, but we override that branch to "always driven").
+The CRC scope covers only bytes the master actually drove on
+MOSI (opcode + address + dummy + write-data); bytes clocked
+during a read-data phase, where MOSI floats, are excluded. The
+qualifier reads `phase_cnt` and `opcode` combinationally; on
+the boundary that captures the opcode (`phase_cnt == 0`) we
+short-circuit to "always driven" because `opcode` is being
+updated on the same edge.
+
+<<SPI: master-driven qualifier>>=
 wire master_driven_byte =
      (phase_cnt == 3'd0)                               ? 1'b1 :
      (opcode == 8'h9F || opcode == 8'h05)              ? 1'b0 :
@@ -572,19 +684,26 @@ wire master_driven_byte =
      (opcode == 8'h6B)                                 ? (phase_cnt <= 3'd3) :
      (opcode == 8'h32)                                 ? (phase_cnt <= 3'd3) :
                                                          1'b1;
+@
 
-// For 0x32, the data-phase bytes arrive across IO[3:0] rather than
-// serially on MOSI, so `shift_in` does not hold the completed byte.
-// Instead we fold the reconstructed quad byte `{nibble_buf, io[3:0]}`
-// into the CRC at the instant the lower nibble arrives (qin_phase==1
-// on a quad-in rise).
+For 0x32 the data-phase bytes arrive across `io[3:0]` rather
+than serially on MOSI, so `shift_in` does not hold the
+completed byte. Instead the CRC update folds the reconstructed
+`{nibble_buf, io[3:0]}` at the instant the lower nibble lands
+(`qin_phase == 1` on a quad-input rise).
+
+<<SPI: quad-input byte-done qualifier>>=
 wire quad_in_byte_done = quad_in_phase && (qin_phase == 1'b1);
+@
 
-// CRC register lives in the sclk domain alongside the rest of the
-// capture state. Async-cleared on cs_n high so each frame starts
-// from the IEEE init value.
-always @(posedge sclk or posedge cs_n) begin
-   if (cs_n) begin
+`cs_async_rst` clears the register to the IEEE init value. On every
+single-lane byte boundary the captured byte is folded under the
+master-driven qualifier; on every 0x32 quad-input lower-nibble
+rise the reconstructed byte is folded instead.
+
+<<SPI: CRC update process>>=
+always @(posedge sclk or posedge cs_async_rst) begin
+   if (cs_async_rst) begin
       crc_reg <= 32'hFFFFFFFF;
    end else if ((bit_cnt == 3'd7) && master_driven_byte) begin
       crc_reg <= crc32_byte(crc_reg, {shift_in[6:0], io_d_in[0]});
@@ -599,25 +718,42 @@ End-of-frame latch. On the CS rising edge, snap `opcode`,
 registers the printer FSM consumes, and pulse `frame_done` for one
 cycle.
 
-<<SPI: end-of-frame latch>>=
-// Snapshot the sclk-domain state on the cs_n rising edge. Using
-// cs_n itself as the clock means the capture flops sample the
-// pre-edge value of `opcode`/`byte_cnt`/`quad_in_cnt`/`crc_reg`
-// exactly when those source flops are being asynchronously cleared
-// by the same cs_n edge. Standard non-blocking semantics: RHS is
-// captured before the reset takes effect, so the snapshot holds
-// the end-of-frame value until the next CS-rise.
-//
-// `frame_cnt_pre` collapses byte_cnt and quad_in_cnt into the value
-// the printer wants to display, so we only carry one 32-bit count
-// in the snapshot (saves ~20 flops vs separate quad_in_cnt
-// snapshot).
-wire [15:0] frame_cnt_pre = (opcode == 8'h32)
-                          ? (16'd4 + {4'd0, quad_in_cnt[11:0]})
-                          : byte_cnt;
+The latch splits into a precomputed display-byte-count, the
+sclk-domain snapshot register triggered by the `cs_n` rising
+edge itself, the fclk-domain `frame_done` pulse for the printer,
+and the snapshot aliases consumed by the page-buffer/WEL block.
 
+<<SPI: end-of-frame latch>>=
+<<SPI: end-of-frame display byte count>>
+<<SPI: end-of-frame snapshot>>
+<<SPI: end-of-frame done pulse>>
+<<SPI: end-of-frame snapshot aliases>>
+@
+
+`frame_cnt_pre` collapses `byte_cnt` and `quad_in_cnt` into the
+single value the printer wants to display, so the snapshot
+carries one count instead of two (saving roughly twenty flops).
+For 0x32, the displayed count is "1 opcode + 3 addr + N data"
+in byte-equivalents.
+
+<<SPI: end-of-frame display byte count>>=
+wire [15:0] frame_cnt_pre_full = (opcode == 8'h32)
+                               ? (16'd4 + {4'd0, quad_in_cnt[11:0]})
+                               : byte_cnt;
+wire [7:0]  frame_cnt_pre        = frame_cnt_pre_full[7:0];
+wire [7:0]  unused_frame_cnt_hi  = frame_cnt_pre_full[15:8];
+@
+
+The snapshot uses `cs_async_rst` as the clock --- the same edge
+that asynchronously clears the sclk-domain source flops. Capture
+flops sample the pre-edge values of `opcode`, `frame_cnt_pre`,
+and `crc_reg`. Non-blocking semantics guarantee the RHS is
+sampled before the reset propagates, so the snapshot holds the
+end-of-frame state until the next CS rise.
+
+<<SPI: end-of-frame snapshot>>=
 reg [7:0]  frame_op;
-reg [15:0] frame_cnt;
+reg [7:0]  frame_cnt;
 reg [31:0] frame_crc_raw;
 initial begin
    frame_op       = 0;
@@ -625,38 +761,61 @@ initial begin
    frame_crc_raw  = 32'hFFFFFFFF;
 end
 
-always @(posedge cs_n) begin
+always @(posedge cs_async_rst) begin
    frame_op      <= opcode;
-   frame_cnt     <= frame_cnt_pre;
+   frame_cnt     <= frame_cnt_pre[7:0];
    frame_crc_raw <= crc_reg;
 end
+@
 
-// Frame-done pulse in the fclk domain: rising edge of the
-// synchronised cs_s. The printer consumes frame_op / frame_cnt /
-// frame_crc on this pulse. `frame_crc` is the finalised (XOR'd)
-// CRC, materialised combinationally from `frame_crc_raw`.
+`frame_done` is a one-cycle pulse in the fclk domain produced
+from the synchronised CS-rise. `frame_crc` is the finalised
+(XOR'd) CRC, materialised combinationally from `frame_crc_raw`
+so the snapshot register stays narrow.
+
+<<SPI: end-of-frame done pulse>>=
 wire [31:0] frame_crc = frame_crc_raw ^ 32'hFFFFFFFF;
 reg         frame_done;
 initial frame_done = 0;
 always @(posedge clk) frame_done <= cs_rise_pulse;
-
-// Aliases used by the page-buffer/WEL block, which needs to
-// distinguish 0x06 (set WEL) from 0x02/0x32 (clear WEL) using the
-// snapshot opcode / count that survives the sclk-domain reset.
-wire [7:0]  snap_op       = frame_op;
-wire [31:0] snap_byte_cnt = frame_cnt;
 @
 
-Printer FSM. Emits one line of the form:
+The page-buffer/WEL block in the fclk domain distinguishes 0x06
+(set WEL) from 0x02 / 0x32 (clear WEL) by reading the snapshot
+opcode and byte count. Aliasing them under `snap_*` names keeps
+that block's intent obvious without a second copy of the
+register.
+
+<<SPI: end-of-frame snapshot aliases>>=
+wire [7:0]  snap_op       = frame_op;
+wire [7:0]  snap_byte_cnt = frame_cnt;
+@
+
+The printer FSM emits exactly one line per frame, of the form:
 
     op=<hh> bytes=<dd> mosi_crc=<hhhhhhhh>\r\n
 
-Same shape as step 9: two-digit decimal byte count (correct for any
-transfer up to 99 SCLK-bytes; longer transfers roll over in the
-displayed field but the underlying counter and CRC engine do not),
-two-digit hex opcode, fixed-width 8-digit hex CRC.
+Two-digit hex opcode, two-digit decimal byte count (correct for
+any transfer up to 99 SCLK-bytes; longer transfers roll over in
+the displayed field but the underlying counter and CRC engine
+do not), fixed-width 8-digit hex CRC. The FSM partitions into
+state encoding, register declarations and helpers, and the per-
+character `case` arms grouped by output region.
 
 <<SPI: UART printer FSM>>=
+<<Printer: state encoding>>
+<<Printer: registers>>
+<<Printer: helpers>>
+<<Printer: process>>
+@
+
+Each character of the output line gets its own state. The FSM
+walks them top-to-bottom: load on `frame_done`, then the literal
+`"op="`, two opcode hex digits, `" bytes="`, an optional tens
+digit + units digit, `" mosi_crc="`, eight hex CRC digits, CR,
+LF.
+
+<<Printer: state encoding>>=
 localparam P_IDLE = 6'd0;
 localparam P_O    = 6'd1;
 localparam P_P    = 6'd2;
@@ -692,7 +851,13 @@ localparam P_C1   = 6'd31;
 localparam P_C0   = 6'd32;
 localparam P_CR   = 6'd33;
 localparam P_LF   = 6'd34;
+@
 
+`p_op`, `p_cnt`, and `p_crc` latch the snapshot at the moment
+`frame_done` fires so the printer's slow walk does not race a
+new frame's snapshot if SPI is already running again.
+
+<<Printer: registers>>=
 reg [5:0]  pstate;
 reg [7:0]  p_op;
 reg [7:0]  p_cnt;
@@ -709,256 +874,116 @@ initial begin
    tx_start = 0;
    tx_data  = 0;
 end
+@
 
+`hexchar` maps a nibble to lowercase ASCII hex; `d1`/`d0` split
+the byte count into tens and units for the `bytes=` field.
+
+<<Printer: helpers>>=
 function [7:0] hexchar(input [3:0] n);
    hexchar = (n < 4'd10) ? (8'h30 + {4'h0, n})
                          : (8'h61 + {4'h0, n} - 8'd10);
 endfunction
 
-wire [3:0] d1 = (p_cnt / 8'd10);
-wire [3:0] d0 = (p_cnt % 8'd10);
+wire [3:0] d1, d0;
+wire [3:0] unused_d1_hi, unused_d0_hi;
+assign {unused_d1_hi, d1} = p_cnt / 8'd10;
+assign {unused_d0_hi, d0} = p_cnt % 8'd10;
+@
 
+The process body is a single `case (pstate)` whose arms split
+top-to-bottom into the load step, the literal-prefix walks, and
+the data-hex walks. `tx_start` defaults low every cycle so any
+arm wanting to issue a byte just reassigns it; the
+`!tx_busy && !tx_start` gate matches the `uart_tx` handshake
+contract documented in the UART chapter.
+
+<<Printer: process>>=
 always @(posedge clk) begin
    tx_start <= 1'b0;
    case (pstate)
-      P_IDLE: if (frame_done) begin
-                 p_op   <= frame_op;
-                 p_cnt  <= frame_cnt[7:0];
-                 p_crc  <= frame_crc;
-                 pstate <= P_O;
-              end
-      P_O:   if (!tx_busy && !tx_start) begin tx_data <= "o"; tx_start <= 1; pstate <= P_P;   end
-      P_P:   if (!tx_busy && !tx_start) begin tx_data <= "p"; tx_start <= 1; pstate <= P_EQ1; end
-      P_EQ1: if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_HH;  end
-      P_HH:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_op[7:4]); tx_start <= 1; pstate <= P_HL; end
-      P_HL:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_op[3:0]); tx_start <= 1; pstate <= P_SP; end
-      P_SP:  if (!tx_busy && !tx_start) begin tx_data <= " "; tx_start <= 1; pstate <= P_B;   end
-      P_B:   if (!tx_busy && !tx_start) begin tx_data <= "b"; tx_start <= 1; pstate <= P_Y;   end
-      P_Y:   if (!tx_busy && !tx_start) begin tx_data <= "y"; tx_start <= 1; pstate <= P_T;   end
-      P_T:   if (!tx_busy && !tx_start) begin tx_data <= "t"; tx_start <= 1; pstate <= P_E;   end
-      P_E:   if (!tx_busy && !tx_start) begin tx_data <= "e"; tx_start <= 1; pstate <= P_S;   end
-      P_S:   if (!tx_busy && !tx_start) begin tx_data <= "s"; tx_start <= 1; pstate <= P_EQ2; end
-      P_EQ2: if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_D1;  end
-      P_D1:  if (!tx_busy && !tx_start) begin
-                 if (d1 != 0) begin
-                    tx_data <= hexchar(d1); tx_start <= 1; pstate <= P_D0;
-                 end else pstate <= P_D0;
-              end
-      P_D0:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(d0); tx_start <= 1; pstate <= P_SP2; end
-      P_SP2: if (!tx_busy && !tx_start) begin tx_data <= " "; tx_start <= 1; pstate <= P_MM;  end
-      P_MM:  if (!tx_busy && !tx_start) begin tx_data <= "m"; tx_start <= 1; pstate <= P_MO;  end
-      P_MO:  if (!tx_busy && !tx_start) begin tx_data <= "o"; tx_start <= 1; pstate <= P_MS;  end
-      P_MS:  if (!tx_busy && !tx_start) begin tx_data <= "s"; tx_start <= 1; pstate <= P_MI;  end
-      P_MI:  if (!tx_busy && !tx_start) begin tx_data <= "i"; tx_start <= 1; pstate <= P_MU;  end
-      P_MU:  if (!tx_busy && !tx_start) begin tx_data <= "_"; tx_start <= 1; pstate <= P_MC;  end
-      P_MC:  if (!tx_busy && !tx_start) begin tx_data <= "c"; tx_start <= 1; pstate <= P_MR;  end
-      P_MR:  if (!tx_busy && !tx_start) begin tx_data <= "r"; tx_start <= 1; pstate <= P_MC2; end
-      P_MC2: if (!tx_busy && !tx_start) begin tx_data <= "c"; tx_start <= 1; pstate <= P_EQ3; end
-      P_EQ3: if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_C7;  end
-      P_C7:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[31:28]); tx_start <= 1; pstate <= P_C6; end
-      P_C6:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[27:24]); tx_start <= 1; pstate <= P_C5; end
-      P_C5:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[23:20]); tx_start <= 1; pstate <= P_C4; end
-      P_C4:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[19:16]); tx_start <= 1; pstate <= P_C3; end
-      P_C3:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[15:12]); tx_start <= 1; pstate <= P_C2; end
-      P_C2:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[11: 8]); tx_start <= 1; pstate <= P_C1; end
-      P_C1:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[ 7: 4]); tx_start <= 1; pstate <= P_C0; end
-      P_C0:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[ 3: 0]); tx_start <= 1; pstate <= P_CR; end
-      P_CR:  if (!tx_busy && !tx_start) begin tx_data <= 8'h0d; tx_start <= 1; pstate <= P_LF;   end
-      P_LF:  if (!tx_busy && !tx_start) begin tx_data <= 8'h0a; tx_start <= 1; pstate <= P_IDLE; end
+      <<Printer: arm idle and load>>
+      <<Printer: arms for "op=" prefix>>
+      <<Printer: arms for opcode hex>>
+      <<Printer: arms for " bytes=" prefix>>
+      <<Printer: arms for byte count digits>>
+      <<Printer: arms for " mosi_crc=" prefix>>
+      <<Printer: arms for CRC hex digits>>
+      <<Printer: arms for CR/LF tail>>
       default: pstate <= P_IDLE;
    endcase
 end
 @
-localparam P_IDLE = 6'd0;
-// "#" frame_no[7:4] frame_no[3:0] " op=" op7..4 op3..0 " bytes="
-//   c7..c0 (byte count 8 hex) " mosi_crc=" m7..m0 " miso_crc=" s7..s0 CR LF
-localparam P_HASH = 6'd1;
-localparam P_F7   = 6'd2;  // frame_no nibbles 7..0 (top 4 are always 0)
-localparam P_F6   = 6'd3;
-localparam P_F5   = 6'd4;
-localparam P_F4   = 6'd5;
-localparam P_F3   = 6'd6;
-localparam P_F2   = 6'd7;
-localparam P_F1   = 6'd8;
-localparam P_F0   = 6'd9;
-localparam P_SP1  = 6'd10;
-localparam P_OO   = 6'd11;
-localparam P_OP   = 6'd12;
-localparam P_EQ1  = 6'd13;
-localparam P_H1   = 6'd14;
-localparam P_H0   = 6'd15;
-localparam P_SP2  = 6'd16;
-localparam P_B    = 6'd17;
-localparam P_Y    = 6'd18;
-localparam P_T    = 6'd19;
-localparam P_E    = 6'd20;
-localparam P_S    = 6'd21;
-localparam P_EQ2  = 6'd22;
-localparam P_N7   = 6'd23;
-localparam P_N6   = 6'd24;
-localparam P_N5   = 6'd25;
-localparam P_N4   = 6'd26;
-localparam P_N3   = 6'd27;
-localparam P_N2   = 6'd28;
-localparam P_N1   = 6'd29;
-localparam P_N0   = 6'd30;
-localparam P_SP3  = 6'd31;
-localparam P_MM   = 6'd32;
-localparam P_MO   = 6'd33;
-localparam P_MS   = 6'd34;
-localparam P_MI   = 6'd35;
-localparam P_MU   = 6'd36;
-localparam P_MC   = 6'd37;
-localparam P_MR   = 6'd38;
-localparam P_MC2  = 6'd39;
-localparam P_EQ3  = 6'd40;
-localparam P_M7   = 6'd41;
-localparam P_M6   = 6'd42;
-localparam P_M5   = 6'd43;
-localparam P_M4   = 6'd44;
-localparam P_M3   = 6'd45;
-localparam P_M2   = 6'd46;
-localparam P_M1   = 6'd47;
-localparam P_M0   = 6'd48;
-localparam P_SP4  = 6'd49;
-localparam P_SI   = 6'd50; // "miso_crc="
-localparam P_SI2  = 6'd51;
-localparam P_SS   = 6'd52;
-localparam P_SO   = 6'd53;
-localparam P_SU   = 6'd54;
-localparam P_SC   = 6'd55;
-localparam P_SR   = 6'd56;
-localparam P_SC2  = 6'd57;
-localparam P_EQ4  = 6'd58;
-localparam P_S7   = 6'd59;
-localparam P_S6   = 6'd60;
-localparam P_S5   = 6'd61;
-localparam P_S4   = 6'd62;
-localparam P_CR   = 6'd63;
-// 64 states fits in 6 bits; the last 4 nibbles of miso_crc plus
-// CR/LF need to spill to a second small FSM. Use a tail counter
-// for them instead of new pstates. The P_CR state below becomes
-// a tail state driven by `tail_n` that emits s3..s0, CR, LF.
-reg  [2:0] tail_n;      // 5..0 countdown of s3,s2,s1,s0,CR,LF
 
-reg  [5:0] pstate;
-reg  [7:0] p_op;
-reg [31:0] p_cnt;
-reg [31:0] p_mcrc;
-reg [31:0] p_scrc;
-reg  [7:0] frame_no;
-reg        tx_start;
-reg  [7:0] tx_data;
-wire       tx_busy;
+<<Printer: arm idle and load>>=
+P_IDLE: if (frame_done) begin
+           p_op   <= frame_op;
+           p_cnt  <= frame_cnt;
+           p_crc  <= frame_crc;
+           pstate <= P_O;
+        end
+@
 
-initial begin
-   pstate   = P_IDLE;
-   p_op     = 0;
-   p_cnt    = 0;
-   p_mcrc   = 0;
-   p_scrc   = 0;
-   frame_no = 0;
-   tail_n   = 0;
-   tx_start = 0;
-   tx_data  = 0;
-end
+<<Printer: arms for "op=" prefix>>=
+P_O:   if (!tx_busy && !tx_start) begin tx_data <= "o"; tx_start <= 1; pstate <= P_P;   end
+P_P:   if (!tx_busy && !tx_start) begin tx_data <= "p"; tx_start <= 1; pstate <= P_EQ1; end
+P_EQ1: if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_HH;  end
+@
 
-function [7:0] hexchar(input [3:0] n);
-   hexchar = (n < 4'd10) ? (8'h30 + {4'h0, n})
-                         : (8'h61 + {4'h0, n} - 8'd10);
-endfunction
+<<Printer: arms for opcode hex>>=
+P_HH:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_op[7:4]); tx_start <= 1; pstate <= P_HL; end
+P_HL:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_op[3:0]); tx_start <= 1; pstate <= P_SP; end
+@
 
-always @(posedge clk) begin
-   tx_start <= 1'b0;
-   case (pstate)
-      P_IDLE: if (frame_done) begin
-                 p_op     <= frame_op;
-                 p_cnt    <= frame_cnt;
-                 p_mcrc   <= frame_crc;
-                 p_scrc   <= frame_crc_miso;
-                 frame_no <= frame_no + 8'd1;
-                 pstate   <= P_HASH;
-              end
-      P_HASH: if (!tx_busy && !tx_start) begin tx_data <= "#"; tx_start <= 1; pstate <= P_F7; end
-      P_F7:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(4'd0); tx_start <= 1; pstate <= P_F6; end
-      P_F6:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(4'd0); tx_start <= 1; pstate <= P_F5; end
-      P_F5:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(4'd0); tx_start <= 1; pstate <= P_F4; end
-      P_F4:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(4'd0); tx_start <= 1; pstate <= P_F3; end
-      P_F3:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(4'd0); tx_start <= 1; pstate <= P_F2; end
-      P_F2:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(4'd0); tx_start <= 1; pstate <= P_F1; end
-      P_F1:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(frame_no[7:4]); tx_start <= 1; pstate <= P_F0; end
-      P_F0:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(frame_no[3:0]); tx_start <= 1; pstate <= P_SP1; end
-      P_SP1:  if (!tx_busy && !tx_start) begin tx_data <= " "; tx_start <= 1; pstate <= P_OO;  end
-      P_OO:   if (!tx_busy && !tx_start) begin tx_data <= "o"; tx_start <= 1; pstate <= P_OP;  end
-      P_OP:   if (!tx_busy && !tx_start) begin tx_data <= "p"; tx_start <= 1; pstate <= P_EQ1; end
-      P_EQ1:  if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_H1;  end
-      P_H1:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_op[7:4]); tx_start <= 1; pstate <= P_H0; end
-      P_H0:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_op[3:0]); tx_start <= 1; pstate <= P_SP2; end
-      P_SP2:  if (!tx_busy && !tx_start) begin tx_data <= " "; tx_start <= 1; pstate <= P_B;   end
-      P_B:    if (!tx_busy && !tx_start) begin tx_data <= "b"; tx_start <= 1; pstate <= P_Y;   end
-      P_Y:    if (!tx_busy && !tx_start) begin tx_data <= "y"; tx_start <= 1; pstate <= P_T;   end
-      P_T:    if (!tx_busy && !tx_start) begin tx_data <= "t"; tx_start <= 1; pstate <= P_E;   end
-      P_E:    if (!tx_busy && !tx_start) begin tx_data <= "e"; tx_start <= 1; pstate <= P_S;   end
-      P_S:    if (!tx_busy && !tx_start) begin tx_data <= "s"; tx_start <= 1; pstate <= P_EQ2; end
-      P_EQ2:  if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_N7;  end
-      P_N7:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_cnt[31:28]); tx_start <= 1; pstate <= P_N6; end
-      P_N6:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_cnt[27:24]); tx_start <= 1; pstate <= P_N5; end
-      P_N5:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_cnt[23:20]); tx_start <= 1; pstate <= P_N4; end
-      P_N4:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_cnt[19:16]); tx_start <= 1; pstate <= P_N3; end
-      P_N3:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_cnt[15:12]); tx_start <= 1; pstate <= P_N2; end
-      P_N2:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_cnt[11: 8]); tx_start <= 1; pstate <= P_N1; end
-      P_N1:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_cnt[ 7: 4]); tx_start <= 1; pstate <= P_N0; end
-      P_N0:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_cnt[ 3: 0]); tx_start <= 1; pstate <= P_SP3; end
-      P_SP3:  if (!tx_busy && !tx_start) begin tx_data <= " "; tx_start <= 1; pstate <= P_MM;  end
-      P_MM:   if (!tx_busy && !tx_start) begin tx_data <= "m"; tx_start <= 1; pstate <= P_MO;  end
-      P_MO:   if (!tx_busy && !tx_start) begin tx_data <= "o"; tx_start <= 1; pstate <= P_MS;  end
-      P_MS:   if (!tx_busy && !tx_start) begin tx_data <= "s"; tx_start <= 1; pstate <= P_MI;  end
-      P_MI:   if (!tx_busy && !tx_start) begin tx_data <= "i"; tx_start <= 1; pstate <= P_MU;  end
-      P_MU:   if (!tx_busy && !tx_start) begin tx_data <= "_"; tx_start <= 1; pstate <= P_MC;  end
-      P_MC:   if (!tx_busy && !tx_start) begin tx_data <= "c"; tx_start <= 1; pstate <= P_MR;  end
-      P_MR:   if (!tx_busy && !tx_start) begin tx_data <= "r"; tx_start <= 1; pstate <= P_MC2; end
-      P_MC2:  if (!tx_busy && !tx_start) begin tx_data <= "c"; tx_start <= 1; pstate <= P_EQ3; end
-      P_EQ3:  if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_M7;  end
-      P_M7:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_mcrc[31:28]); tx_start <= 1; pstate <= P_M6; end
-      P_M6:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_mcrc[27:24]); tx_start <= 1; pstate <= P_M5; end
-      P_M5:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_mcrc[23:20]); tx_start <= 1; pstate <= P_M4; end
-      P_M4:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_mcrc[19:16]); tx_start <= 1; pstate <= P_M3; end
-      P_M3:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_mcrc[15:12]); tx_start <= 1; pstate <= P_M2; end
-      P_M2:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_mcrc[11: 8]); tx_start <= 1; pstate <= P_M1; end
-      P_M1:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_mcrc[ 7: 4]); tx_start <= 1; pstate <= P_M0; end
-      P_M0:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_mcrc[ 3: 0]); tx_start <= 1; pstate <= P_SP4; end
-      P_SP4:  if (!tx_busy && !tx_start) begin tx_data <= " "; tx_start <= 1; pstate <= P_SI;  end
-      P_SI:   if (!tx_busy && !tx_start) begin tx_data <= "m"; tx_start <= 1; pstate <= P_SI2; end
-      P_SI2:  if (!tx_busy && !tx_start) begin tx_data <= "i"; tx_start <= 1; pstate <= P_SS;  end
-      P_SS:   if (!tx_busy && !tx_start) begin tx_data <= "s"; tx_start <= 1; pstate <= P_SO;  end
-      P_SO:   if (!tx_busy && !tx_start) begin tx_data <= "o"; tx_start <= 1; pstate <= P_SU;  end
-      P_SU:   if (!tx_busy && !tx_start) begin tx_data <= "_"; tx_start <= 1; pstate <= P_SC;  end
-      P_SC:   if (!tx_busy && !tx_start) begin tx_data <= "c"; tx_start <= 1; pstate <= P_SR;  end
-      P_SR:   if (!tx_busy && !tx_start) begin tx_data <= "r"; tx_start <= 1; pstate <= P_SC2; end
-      P_SC2:  if (!tx_busy && !tx_start) begin tx_data <= "c"; tx_start <= 1; pstate <= P_EQ4; end
-      P_EQ4:  if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_S7;  end
-      P_S7:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_scrc[31:28]); tx_start <= 1; pstate <= P_S6; end
-      P_S6:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_scrc[27:24]); tx_start <= 1; pstate <= P_S5; end
-      P_S5:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_scrc[23:20]); tx_start <= 1; pstate <= P_S4; end
-      P_S4:   if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_scrc[19:16]); tx_start <= 1; pstate <= P_CR; tail_n <= 3'd5; end
-      // Tail: emit scrc[15:12], scrc[11:8], scrc[7:4], scrc[3:0], CR, LF, using a tail counter so we fit within 6-bit pstate encoding.
-      P_CR: if (!tx_busy && !tx_start) begin
-                case (tail_n)
-                   3'd5: tx_data <= hexchar(p_scrc[15:12]);
-                   3'd4: tx_data <= hexchar(p_scrc[11: 8]);
-                   3'd3: tx_data <= hexchar(p_scrc[ 7: 4]);
-                   3'd2: tx_data <= hexchar(p_scrc[ 3: 0]);
-                   3'd1: tx_data <= 8'h0d;
-                   3'd0: tx_data <= 8'h0a;
-                   default: tx_data <= 8'h0a;
-                endcase
-                tx_start <= 1'b1;
-                if (tail_n == 3'd0) pstate <= P_IDLE;
-                else tail_n <= tail_n - 3'd1;
-             end
-      default: pstate <= P_IDLE;
-   endcase
-end
+<<Printer: arms for " bytes=" prefix>>=
+P_SP:  if (!tx_busy && !tx_start) begin tx_data <= " "; tx_start <= 1; pstate <= P_B;   end
+P_B:   if (!tx_busy && !tx_start) begin tx_data <= "b"; tx_start <= 1; pstate <= P_Y;   end
+P_Y:   if (!tx_busy && !tx_start) begin tx_data <= "y"; tx_start <= 1; pstate <= P_T;   end
+P_T:   if (!tx_busy && !tx_start) begin tx_data <= "t"; tx_start <= 1; pstate <= P_E;   end
+P_E:   if (!tx_busy && !tx_start) begin tx_data <= "e"; tx_start <= 1; pstate <= P_S;   end
+P_S:   if (!tx_busy && !tx_start) begin tx_data <= "s"; tx_start <= 1; pstate <= P_EQ2; end
+P_EQ2: if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_D1;  end
+@
+
+`P_D1` skips the tens digit when the byte count is a single
+digit so `bytes=4` reads naturally instead of `bytes=04`.
+
+<<Printer: arms for byte count digits>>=
+P_D1:  if (!tx_busy && !tx_start) begin
+           if (d1 != 0) begin
+              tx_data <= hexchar(d1); tx_start <= 1; pstate <= P_D0;
+           end else pstate <= P_D0;
+        end
+P_D0:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(d0); tx_start <= 1; pstate <= P_SP2; end
+@
+
+<<Printer: arms for " mosi_crc=" prefix>>=
+P_SP2: if (!tx_busy && !tx_start) begin tx_data <= " "; tx_start <= 1; pstate <= P_MM;  end
+P_MM:  if (!tx_busy && !tx_start) begin tx_data <= "m"; tx_start <= 1; pstate <= P_MO;  end
+P_MO:  if (!tx_busy && !tx_start) begin tx_data <= "o"; tx_start <= 1; pstate <= P_MS;  end
+P_MS:  if (!tx_busy && !tx_start) begin tx_data <= "s"; tx_start <= 1; pstate <= P_MI;  end
+P_MI:  if (!tx_busy && !tx_start) begin tx_data <= "i"; tx_start <= 1; pstate <= P_MU;  end
+P_MU:  if (!tx_busy && !tx_start) begin tx_data <= "_"; tx_start <= 1; pstate <= P_MC;  end
+P_MC:  if (!tx_busy && !tx_start) begin tx_data <= "c"; tx_start <= 1; pstate <= P_MR;  end
+P_MR:  if (!tx_busy && !tx_start) begin tx_data <= "r"; tx_start <= 1; pstate <= P_MC2; end
+P_MC2: if (!tx_busy && !tx_start) begin tx_data <= "c"; tx_start <= 1; pstate <= P_EQ3; end
+P_EQ3: if (!tx_busy && !tx_start) begin tx_data <= "="; tx_start <= 1; pstate <= P_C7;  end
+@
+
+<<Printer: arms for CRC hex digits>>=
+P_C7:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[31:28]); tx_start <= 1; pstate <= P_C6; end
+P_C6:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[27:24]); tx_start <= 1; pstate <= P_C5; end
+P_C5:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[23:20]); tx_start <= 1; pstate <= P_C4; end
+P_C4:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[19:16]); tx_start <= 1; pstate <= P_C3; end
+P_C3:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[15:12]); tx_start <= 1; pstate <= P_C2; end
+P_C2:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[11: 8]); tx_start <= 1; pstate <= P_C1; end
+P_C1:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[ 7: 4]); tx_start <= 1; pstate <= P_C0; end
+P_C0:  if (!tx_busy && !tx_start) begin tx_data <= hexchar(p_crc[ 3: 0]); tx_start <= 1; pstate <= P_CR; end
+@
+
+<<Printer: arms for CR/LF tail>>=
+P_CR:  if (!tx_busy && !tx_start) begin tx_data <= 8'h0d; tx_start <= 1; pstate <= P_LF;   end
+P_LF:  if (!tx_busy && !tx_start) begin tx_data <= 8'h0a; tx_start <= 1; pstate <= P_IDLE; end
 @
 
 The UART transmitter is the one defined verbatim in the UART chapter.
@@ -974,7 +999,7 @@ uart_tx #(.CLKS_PER_BIT(104)) u_tx (
 );
 @
 
-== Pin map
+=== Pin map
 
 iCEstick pin numbers for the already-wired rig. The 12 MHz
 oscillator is on pin 21; CS / SCLK / MOSI / MISO are on the Pmod
@@ -992,7 +1017,7 @@ set_io io[2]   60
 set_io io[3]   48
 @
 
-== Build fragment
+=== Build fragment
 
 Two Verilog sources tangle into the build: `qspi.v` for the slave
 itself and `uart_tx.v` reused verbatim from the UART chapter.
@@ -1001,10 +1026,10 @@ itself and `uart_tx.v` reused verbatim from the UART chapter.
 QSPI_VS := verilog/qspi.v verilog/uart_tx.v
 
 build/qspi/qspi.json: $(QSPI_VS) | build/qspi
-	cd build/qspi && yosys -q -p "read_verilog ../../verilog/qspi.v ../../verilog/uart_tx.v; synth_ice40 -top qspi_slave -json qspi.json"
+	cd build/qspi && yosys -q -p "read_verilog ../../verilog/qspi.v ../../verilog/uart_tx.v; synth_ice40 -top qspi -json qspi.json"
 
 build/qspi/sim: tb/tb_qspi.sv $(QSPI_VS) verilog/uart_rx.v | build/qspi
-	cd build/qspi && verilator --Mdir obj_dir -Wall -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNOPTFLAT -Wno-UNUSEDSIGNAL -Wno-CASEINCOMPLETE -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-BLKSEQ -Wno-BLKANDNBLK -Wno-MULTIDRIVEN -Wno-SYNCASYNCNET -Wno-LATCH -Wno-PINMISSING -Wno-PINCONNECTEMPTY --binary --top-module tb_qspi ../../tb/tb_qspi.sv ../../verilog/qspi.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v
+	cd build/qspi && verilator --Mdir obj_dir -Wall --binary --top-module tb_qspi ../../tb/tb_qspi.sv ../../verilog/qspi.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v
 	cd build/qspi && obj_dir/Vtb_qspi
 	@touch $@
 
@@ -1012,7 +1037,7 @@ bitstream: build/qspi/qspi.bin
 sim: build/qspi/sim
 @
 
-== Testbench
+=== Testbench
 
 The testbench drives two SPI frames on the DUT. First, a 0x9F (JEDEC
 read id) frame that clocks out three extra bytes on MISO while MOSI
@@ -1054,7 +1079,7 @@ module tb_qspi;
    // is the DUT's single-lane response line (io[1] read back).
    wire miso = io[1];
 
-   qspi_slave dut (
+   qspi dut (
       .clk (clk),
       .cs_n(cs_n),
       .sclk(sclk),
@@ -1111,18 +1136,15 @@ module tb_qspi;
    integer t_q  = 60;   // quarter-bit setup window
    integer t_h  = 120;  // SCLK high duration
    reg [31:0] oracle_crc;
+   function automatic [31:0] crc32_step(input [31:0] c, input bit_in);
+      crc32_step = (c >> 1)
+                 ^ ((c[0] ^ bit_in) ? 32'hEDB88320 : 32'h00000000);
+   endfunction
    function automatic [31:0] crc32_byte(input [31:0] c, input [7:0] b);
-      reg [31:0] t;
-      integer    i;
-      reg        lsb;
-      begin
-         t = c;
-         for (i = 0; i < 8; i = i + 1) begin
-            lsb = t[0] ^ b[i];
-            t = (t >> 1) ^ (lsb ? 32'hEDB88320 : 32'h00000000);
-         end
-         crc32_byte = t;
-      end
+      crc32_byte = crc32_step(crc32_step(crc32_step(crc32_step(
+                     crc32_step(crc32_step(crc32_step(crc32_step(
+                        c, b[0]), b[1]), b[2]), b[3]),
+                                 b[4]), b[5]), b[6]), b[7]);
    endfunction
 
    // Drive one SPI byte, MSB first, and capture MISO MSB-first on
@@ -1143,6 +1165,25 @@ module tb_qspi;
             #(t_q);
             sclk = 1;
             got[i] = miso;
+            #(t_h);
+            sclk = 0;
+            #(t_q);
+         end
+         if (driven) oracle_crc = crc32_byte(oracle_crc, b);
+      end
+   endtask
+
+   // Send-only variant used wherever the slave's MISO byte is
+   // ignored (opcode and address bytes of write/program frames,
+   // dummy clocks ahead of slave-driven phases).
+   task automatic spi_send(input [7:0] b, input driven);
+      integer i;
+      begin
+         tb_io_oe = 4'b0001;
+         for (i = 7; i >= 0; i = i - 1) begin
+            tb_io_out[0] = b[i];
+            #(t_q);
+            sclk = 1;
             #(t_h);
             sclk = 0;
             #(t_q);
@@ -1316,17 +1357,16 @@ module tb_qspi;
       // Slave drives 16 data bytes of 0x00.
       begin : frame4
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0;
          #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
@@ -1354,15 +1394,14 @@ module tb_qspi;
       #200 cs_n = 1;
       expect_line("op=02 bytes=5", oracle_crc ^ 32'hFFFFFFFF);
       begin : frame6
-         reg [7:0] tmp;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          spi_byte(8'h00, 1'b0, got0);
          #200 cs_n = 1;
          $display("MISO trace (03 after no-WEL 02): %02h", got0);
@@ -1380,18 +1419,17 @@ module tb_qspi;
       #200 cs_n = 1;
       expect_line("op=06 bytes=1", oracle_crc ^ 32'hFFFFFFFF);
       begin : frame8
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h02, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h02, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
-            spi_byte(8'h50 + k[7:0], 1'b1, tmp);
+            spi_send(8'h50 + k[7:0], 1'b1);
          #200 cs_n = 1;
          expect_line("op=02 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
@@ -1399,16 +1437,15 @@ module tb_qspi;
       // Frame 9: 0x03 read back -- expect 0x50..0x5F.
       begin : frame9
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);  // opcode
-         spi_byte(8'h00, 1'b1, tmp);  // addr
-         spi_byte(8'h00, 1'b1, tmp);  // addr
-         spi_byte(8'h00, 1'b1, tmp);  // addr
+         spi_send(8'h03, 1'b1);  // opcode
+         spi_send(8'h00, 1'b1);  // addr
+         spi_send(8'h00, 1'b1);  // addr
+         spi_send(8'h00, 1'b1);  // addr
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
@@ -1427,16 +1464,15 @@ module tb_qspi;
       begin : frame10
          reg [7:0] got_dummy;
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h0B, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h0B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          spi_byte(8'h00, 1'b0, got_dummy);  // not slave-driven
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
@@ -1458,7 +1494,6 @@ module tb_qspi;
       // Frame 11: 0x6B Quad Output Read -- slave drives 16 quad data bytes.
       begin : frame11
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
@@ -1469,10 +1504,10 @@ module tb_qspi;
 
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h6B, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          // Probe the DUT's per-lane output enable: must be 0 during
          // the dummy byte (master tri-states all four lanes), and
          // must turn on for all four lanes once the data phase
@@ -1516,16 +1551,15 @@ module tb_qspi;
       // bytes 0xC0..0xCF in quad. `bytes=` field is in byte-
       // equivalents: 1 + 3 + 16 = 20.
       begin : frame12
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h32, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h32, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
             spi_quad_write_byte(8'hC0 + k[7:0]);
          release_io();
@@ -1536,16 +1570,15 @@ module tb_qspi;
       // Frame 13: 0x03 readback after no-WEL 32 -- buffer still 0x50..
       begin : frame13
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
@@ -1569,16 +1602,15 @@ module tb_qspi;
       #200 cs_n = 1;
       expect_line("op=06 bytes=1", oracle_crc ^ 32'hFFFFFFFF);
       begin : frame15
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h32, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h32, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1) begin
             // 0x32 is a quad WRITE: master drives all four lanes;
             // the slave must NOT drive any io_oe during this phase.
@@ -1595,16 +1627,15 @@ module tb_qspi;
       // Frame 16: 0x03 readback -- expect 0xC0..0xCF.
       begin : frame16
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
@@ -1626,17 +1657,16 @@ module tb_qspi;
       // so `{byte_N_upper, byte_N_lower}` is delivered.
       begin : frame16b
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          release_io();
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h6B, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          if (dut.io_oe !== 4'b0000)
             $fatal(1, "FAIL: 6B/CF pre-dummy io_oe=%b", dut.io_oe);
          spi_dummy_quad();
@@ -1700,18 +1730,17 @@ module tb_qspi;
 
       // Frame 19: 0x02 PP at high rate, write 0xA0..0xAF.
       begin : hs_pp
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h02, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h02, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
-            spi_byte(8'hA0 + k[7:0], 1'b1, tmp);
+            spi_send(8'hA0 + k[7:0], 1'b1);
          #200 cs_n = 1;
          expect_line("op=02 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
@@ -1719,16 +1748,15 @@ module tb_qspi;
       // Frame 20: 0x03 readback at high rate, expect 0xA0..0xAF.
       begin : hs_rd
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
@@ -1750,16 +1778,15 @@ module tb_qspi;
       // cross-boundary behaviour in sim.
       begin : hs_rd_long
          reg [7:0] got_arr [0:39];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 40; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
@@ -1786,16 +1813,15 @@ module tb_qspi;
       expect_line("op=06 bytes=1", oracle_crc ^ 32'hFFFFFFFF);
 
       begin : hs_qpp
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h32, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h32, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
             spi_quad_write_byte(8'hE0 + k[7:0]);
          release_io();
@@ -1806,16 +1832,15 @@ module tb_qspi;
       // Frame 22: 0x03 readback, expect 0xE0..0xEF.
       begin : hs_qrd
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
@@ -1832,17 +1857,16 @@ module tb_qspi;
       // Frame 23: 0x6B Quad Output Read at high rate.
       begin : hs_qor
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          release_io();
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h6B, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          spi_dummy_quad();
          for (k = 0; k < 16; k = k + 1)
             spi_quad_data_byte(got_arr[k]);
@@ -1867,3 +1891,87 @@ module tb_qspi;
    end
 endmodule
 @
+
+=== Hardware testing
+
+==== Hardware Needed
+
+- Lattice iCEstick (iCE40-HX1K, 12 MHz)
+- USB-A extension cable or hub for the iCEstick
+- An external SPI master wired to the Pmod pins matching the
+  chapter's pin map (CS=56, SCLK=45, MOSI=`io[0]`=47, MISO=`io[1]`=44,
+  `io[2]`=60, `io[3]`=48); the FT4222 referenced by the `dsp` plugin
+  is the canonical master when its SPI lines are routed to the
+  iCEstick rather than to the SHARC carrier's QSPI header
+
+==== Test Setup
+
+The iCEstick's FT2232H exposes the FPGA UART (115200, 8N1) on
+which the slave prints one log line per completed SPI frame:
+`op=<hh> bytes=<K> mosi_crc=<8hex>\r\n`. The CRC field is CRC-32
+over the MOSI bytes of that frame.
+
+==== Manual Test
+
+Program the bitstream and open a 115200/8N1 terminal on the FPGA
+UART. With nothing driving CS no UART line appears. Assert CS and
+clock four bytes `9f 00 00 00` (single-lane, mode 0): the terminal
+prints `op=9f bytes=4 mosi_crc=<hex>`. Drive a second frame of two
+bytes `05 00`: the terminal prints `op=05 bytes=2 mosi_crc=<hex>`.
+Equality of the CRC across runs of the same payload is the
+trivial sanity check.
+
+==== Automated Test
+
+The standard rig in this repository wires the only available SPI
+master (the FT4222 referenced by the `dsp` plugin) to the SHARC
+carrier's QSPI header, not to the iCEstick. The automated test
+therefore restricts itself to the path that does work without any
+master-side wiring: program the bitstream and confirm the program
+op completed cleanly. Frame-logging coverage is owned by the
+simulation testbench above; the manual test is the route to
+verify it on real silicon.
+
+<<TEST.md>>=
+```
+fpga:program bin=@qspi.bin
+```
+
+- Check `test_serv` had no errors
+@
+
+The verifier has only the generic "no errors" predicate from the
+shared library: the plan's only meaningful outcome is whether
+`fpga:program` returned cleanly.
+
+<<verify.py>>=
+import os
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
+import verify_lib as v
+
+
+DISPATCH = {
+    "Check `test_serv` had no errors":
+        v.check_no_errors,
+}
+
+
+if __name__ == "__main__":
+    sys.exit(v.main(DISPATCH, sys.argv))
+@
+
+=== Summary
+
+The chapter's verification stack now mirrors the rest of the
+project. The Verilator testbench drives every supported opcode
+through the slave at simulation speed and on the high-rate
+sclk/fclk decoupling path, asserting both the wire-side response
+bytes and the per-frame UART log lines. Hardware testing loads
+the bitstream onto a real iCEstick and confirms the program path
+is clean; exercising the SPI side requires an external master and
+is described as a manual procedure. `TEST.md` and `verify.py`
+tangle out of this chapter so the plan and per-bullet check stay
+attached to the prose that justifies them.

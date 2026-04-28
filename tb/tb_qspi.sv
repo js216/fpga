@@ -30,7 +30,7 @@ module tb_qspi;
    // is the DUT's single-lane response line (io[1] read back).
    wire miso = io[1];
 
-   qspi_slave dut (
+   qspi dut (
       .clk (clk),
       .cs_n(cs_n),
       .sclk(sclk),
@@ -87,18 +87,15 @@ module tb_qspi;
    integer t_q  = 60;   // quarter-bit setup window
    integer t_h  = 120;  // SCLK high duration
    reg [31:0] oracle_crc;
+   function automatic [31:0] crc32_step(input [31:0] c, input bit_in);
+      crc32_step = (c >> 1)
+                 ^ ((c[0] ^ bit_in) ? 32'hEDB88320 : 32'h00000000);
+   endfunction
    function automatic [31:0] crc32_byte(input [31:0] c, input [7:0] b);
-      reg [31:0] t;
-      integer    i;
-      reg        lsb;
-      begin
-         t = c;
-         for (i = 0; i < 8; i = i + 1) begin
-            lsb = t[0] ^ b[i];
-            t = (t >> 1) ^ (lsb ? 32'hEDB88320 : 32'h00000000);
-         end
-         crc32_byte = t;
-      end
+      crc32_byte = crc32_step(crc32_step(crc32_step(crc32_step(
+                     crc32_step(crc32_step(crc32_step(crc32_step(
+                        c, b[0]), b[1]), b[2]), b[3]),
+                                 b[4]), b[5]), b[6]), b[7]);
    endfunction
 
    // Drive one SPI byte, MSB first, and capture MISO MSB-first on
@@ -119,6 +116,25 @@ module tb_qspi;
             #(t_q);
             sclk = 1;
             got[i] = miso;
+            #(t_h);
+            sclk = 0;
+            #(t_q);
+         end
+         if (driven) oracle_crc = crc32_byte(oracle_crc, b);
+      end
+   endtask
+
+   // Send-only variant used wherever the slave's MISO byte is
+   // ignored (opcode and address bytes of write/program frames,
+   // dummy clocks ahead of slave-driven phases).
+   task automatic spi_send(input [7:0] b, input driven);
+      integer i;
+      begin
+         tb_io_oe = 4'b0001;
+         for (i = 7; i >= 0; i = i - 1) begin
+            tb_io_out[0] = b[i];
+            #(t_q);
+            sclk = 1;
             #(t_h);
             sclk = 0;
             #(t_q);
@@ -292,17 +308,16 @@ module tb_qspi;
       // Slave drives 16 data bytes of 0x00.
       begin : frame4
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0;
          #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
@@ -330,15 +345,14 @@ module tb_qspi;
       #200 cs_n = 1;
       expect_line("op=02 bytes=5", oracle_crc ^ 32'hFFFFFFFF);
       begin : frame6
-         reg [7:0] tmp;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          spi_byte(8'h00, 1'b0, got0);
          #200 cs_n = 1;
          $display("MISO trace (03 after no-WEL 02): %02h", got0);
@@ -356,18 +370,17 @@ module tb_qspi;
       #200 cs_n = 1;
       expect_line("op=06 bytes=1", oracle_crc ^ 32'hFFFFFFFF);
       begin : frame8
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h02, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h02, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
-            spi_byte(8'h50 + k[7:0], 1'b1, tmp);
+            spi_send(8'h50 + k[7:0], 1'b1);
          #200 cs_n = 1;
          expect_line("op=02 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
@@ -375,16 +388,15 @@ module tb_qspi;
       // Frame 9: 0x03 read back -- expect 0x50..0x5F.
       begin : frame9
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);  // opcode
-         spi_byte(8'h00, 1'b1, tmp);  // addr
-         spi_byte(8'h00, 1'b1, tmp);  // addr
-         spi_byte(8'h00, 1'b1, tmp);  // addr
+         spi_send(8'h03, 1'b1);  // opcode
+         spi_send(8'h00, 1'b1);  // addr
+         spi_send(8'h00, 1'b1);  // addr
+         spi_send(8'h00, 1'b1);  // addr
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
@@ -403,16 +415,15 @@ module tb_qspi;
       begin : frame10
          reg [7:0] got_dummy;
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h0B, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h0B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          spi_byte(8'h00, 1'b0, got_dummy);  // not slave-driven
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
@@ -434,7 +445,6 @@ module tb_qspi;
       // Frame 11: 0x6B Quad Output Read -- slave drives 16 quad data bytes.
       begin : frame11
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
@@ -445,10 +455,10 @@ module tb_qspi;
 
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h6B, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          // Probe the DUT's per-lane output enable: must be 0 during
          // the dummy byte (master tri-states all four lanes), and
          // must turn on for all four lanes once the data phase
@@ -492,16 +502,15 @@ module tb_qspi;
       // bytes 0xC0..0xCF in quad. `bytes=` field is in byte-
       // equivalents: 1 + 3 + 16 = 20.
       begin : frame12
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h32, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h32, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
             spi_quad_write_byte(8'hC0 + k[7:0]);
          release_io();
@@ -512,16 +521,15 @@ module tb_qspi;
       // Frame 13: 0x03 readback after no-WEL 32 -- buffer still 0x50..
       begin : frame13
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
@@ -545,16 +553,15 @@ module tb_qspi;
       #200 cs_n = 1;
       expect_line("op=06 bytes=1", oracle_crc ^ 32'hFFFFFFFF);
       begin : frame15
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h32, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h32, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1) begin
             // 0x32 is a quad WRITE: master drives all four lanes;
             // the slave must NOT drive any io_oe during this phase.
@@ -571,16 +578,15 @@ module tb_qspi;
       // Frame 16: 0x03 readback -- expect 0xC0..0xCF.
       begin : frame16
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1) begin
             spi_byte(8'h00, 1'b0, got_arr[k]);
             end
@@ -602,17 +608,16 @@ module tb_qspi;
       // so `{byte_N_upper, byte_N_lower}` is delivered.
       begin : frame16b
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc      = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          release_io();
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h6B, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          if (dut.io_oe !== 4'b0000)
             $fatal(1, "FAIL: 6B/CF pre-dummy io_oe=%b", dut.io_oe);
          spi_dummy_quad();
@@ -676,18 +681,17 @@ module tb_qspi;
 
       // Frame 19: 0x02 PP at high rate, write 0xA0..0xAF.
       begin : hs_pp
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h02, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h02, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
-            spi_byte(8'hA0 + k[7:0], 1'b1, tmp);
+            spi_send(8'hA0 + k[7:0], 1'b1);
          #200 cs_n = 1;
          expect_line("op=02 bytes=20", oracle_crc ^ 32'hFFFFFFFF);
       end
@@ -695,16 +699,15 @@ module tb_qspi;
       // Frame 20: 0x03 readback at high rate, expect 0xA0..0xAF.
       begin : hs_rd
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
@@ -726,16 +729,15 @@ module tb_qspi;
       // cross-boundary behaviour in sim.
       begin : hs_rd_long
          reg [7:0] got_arr [0:39];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 40; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
@@ -762,16 +764,15 @@ module tb_qspi;
       expect_line("op=06 bytes=1", oracle_crc ^ 32'hFFFFFFFF);
 
       begin : hs_qpp
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h32, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h32, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
             spi_quad_write_byte(8'hE0 + k[7:0]);
          release_io();
@@ -782,16 +783,15 @@ module tb_qspi;
       // Frame 22: 0x03 readback, expect 0xE0..0xEF.
       begin : hs_qrd
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h03, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h03, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          for (k = 0; k < 16; k = k + 1)
             spi_byte(8'h00, 1'b0, got_arr[k]);
          #200 cs_n = 1;
@@ -808,17 +808,16 @@ module tb_qspi;
       // Frame 23: 0x6B Quad Output Read at high rate.
       begin : hs_qor
          reg [7:0] got_arr [0:15];
-         reg [7:0] tmp;
          integer   k;
          oracle_crc = 32'hFFFFFFFF;
          repeat (200) @(posedge clk);
          release_io();
          @(posedge clk);
          cs_n = 0; #200;
-         spi_byte(8'h6B, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
-         spi_byte(8'h00, 1'b1, tmp);
+         spi_send(8'h6B, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
          spi_dummy_quad();
          for (k = 0; k < 16; k = k + 1)
             spi_quad_data_byte(got_arr[k]);
