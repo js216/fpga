@@ -557,7 +557,7 @@ end
 @
 
 
-== Test bench
+=== Test bench
 
 The testbench exercises three paths: the heartbeat read path (DUT
 reads an externally-driven GPIO pattern and the formatted line
@@ -925,7 +925,7 @@ initial begin
 end
 @
 
-== Formal verification
+=== Formal verification
 
 A single BMC task proves every `assert` within its depth budget.
 `TICK_CYCLES` is shrunk to 20 so the solver reaches a timer wrap
@@ -969,7 +969,7 @@ prep -top gpio
 ../../verilog/uart_rx.v
 @
 
-== iCEstick pin mapping
+=== iCEstick pin mapping
 
 Clock on pin 21 (12 MHz Discera MEMS oscillator), UART TX on pin 8
 and RX on pin 9 (FT2232H channel B, the PC's COM port). The sixteen
@@ -1007,7 +1007,7 @@ set_io pins[14] 45
 set_io pins[15] 44
 @
 
-== Build fragment
+=== Build fragment
 
 The gpio top pulls in `uart_tx.v` and `uart_rx.v` as dependencies,
 so the generic single-file rules in the top Makefile do not
@@ -1036,9 +1036,9 @@ sim: build/gpio/sim
 formal: build/gpio/formal
 @
 
-=== Hardware testing
+==== Hardware testing
 
-==== Hardware Needed
+===== Hardware Needed
 
 - Lattice iCEstick (iCE40-HX1K, 12 MHz)
 - USB-A extension cable or hub for the iCEstick
@@ -1049,12 +1049,12 @@ the FPGA, so the heartbeat lines in the power-on `gpio_oe = 0` phase
 read whatever the unloaded pins happen to settle to. The drive phase
 of the test enables every pin and overrides this with known values.
 
-==== Test Setup
+===== Test Setup
 
 The on-board FT2232H exposes two interfaces: one for programming
 the FPGA, one for the UART. The UART runs at 115200, 8N1.
 
-==== Manual Test
+===== Manual Test
 
 Program the bitstream and open a 115200/8N1 terminal on the FPGA
 UART. Every 100 ms a four-digit hex line followed by `\r\n` should
@@ -1065,7 +1065,7 @@ should change to `1234`. `Wabcd` flips the pattern to `abcd`.
 `E0000` releases all sixteen pins back to high-impedance and the
 lines return to whatever the floating pins read.
 
-==== Automated Test
+===== Automated Test
 
 The plan programs the bitstream, opens the UART capture, lets a
 few power-on heartbeats arrive, then drives a sequence of two
@@ -1209,7 +1209,7 @@ DISPATCH = {
 }
 @
 
-== Summary
+=== Summary
 
 One top module, no new UART machinery. The `gpio` top reads all
 sixteen J1/J3 expansion pins every 100 ms and streams the state as

@@ -924,7 +924,7 @@ end
 @
 
 
-== Build fragment
+=== Build fragment
 
 Cordic only has formal proofs and a sim --- no synthesis target. The
 fragment wires sim and formal into the top Makefile's aggregates.

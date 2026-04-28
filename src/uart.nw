@@ -18,7 +18,7 @@ The baud rate is a ratio between the input clock and the `CLKS_PER_BIT`
 parameter. For the iCEstick's 12 MHz oscillator the default of 104 lands
 on 115200 baud with a 0.16% error, well inside UART tolerance.
 
-== Receiver
+=== Receiver
 
 The receiver decodes one start bit, eight data bits (LSB first), and one
 stop bit. It runs at the system clock and counts out `CLKS_PER_BIT` cycles
@@ -182,7 +182,7 @@ S_DONE: begin
 end
 @
 
-=== Formal properties
+==== Formal properties
 
 The receiver's safety properties cover state hygiene, bounded counters,
 ready-strobe semantics, and the handshake from idle. Together they pin
@@ -262,7 +262,7 @@ always @(posedge clk) begin
 end
 @
 
-== Transmitter
+=== Transmitter
 
 The transmitter is the mirror of the receiver. On a `start` pulse with
 `data` valid on the same cycle, the FSM latches the byte and drives a
@@ -423,7 +423,7 @@ S_STOP: begin
 end
 @
 
-=== Formal properties
+==== Formal properties
 
 The transmitter's safety properties mirror the receiver's style: valid
 state encoding, bounded counters, idle register hygiene, and line-level
@@ -500,7 +500,7 @@ with the arbiter, which ANDs `busy` with its own start pulse.
 always @(posedge clk) assert(busy == (state != S_IDLE));
 @
 
-== Heartbeat byte source
+=== Heartbeat byte source
 
 `uart_hello` is a byte producer: every `PERIOD_CYCLES` clock ticks it
 walks the 21-byte `"Hello from iCEstick\r\n"` message out through a
@@ -620,7 +620,7 @@ always @(posedge clk) begin
 end
 @
 
-== Loopback + heartbeat demo top
+=== Loopback + heartbeat demo top
 
 The iCEstick demo instantiates one `uart_rx`, one `uart_hello`, and one
 `uart_tx`, plus a small arbiter that picks between the hello byte
@@ -742,7 +742,7 @@ always @(posedge clk)
 assign led = led_reg;
 @
 
-== Test bench
+=== Test bench
 
 The testbench has two phases. First it drives four test characters
 through the echo loop and checks that each comes back verbatim, covering
@@ -1002,7 +1002,7 @@ captures and validates all 21 of its bytes.
 expect_heartbeat();
 @
 
-== Formal verification
+=== Formal verification
 
 Both `uart_rx` and `uart_tx` carry their own `ifdef FORMAL` blocks of
 safety invariants. SymbiYosys runs a separate BMC task per module,
@@ -1042,7 +1042,7 @@ bmc_tx: prep -top uart_tx
 ../../verilog/uart_tx.v
 @
 
-== iCEstick pin mapping
+=== iCEstick pin mapping
 
 Clock on pin 21 (GBIN6, 12 MHz Discera MEMS oscillator), UART RX on pin 9
 (from the FT2232H channel B, the PC's COM port), UART TX on pin 8 (back
@@ -1060,7 +1060,7 @@ set_io led[3] 96
 set_io led[4] 95
 @
 
-== Build fragment
+=== Build fragment
 
 Four Verilog modules from one `.nw` is the only per-module customization
 this chapter needs. The top Makefile handles single-output tangles
@@ -1093,19 +1093,19 @@ sim: build/uart/sim
 formal: build/uart/formal
 @
 
-=== Hardware testing
+==== Hardware testing
 
-==== Hardware Needed
+===== Hardware Needed
 
 - Lattice iCEstick (iCE40-HX1K, 12 MHz)
 - USB-A extension cable or hub for the iCEstick
 
-==== Test Setup
+===== Test Setup
 
 The on-board FT2232H exposes two interfaces: one for programming
 the FPGA, one for the UART. The UART runs at 115200, 8N1.
 
-==== Manual Test
+===== Manual Test
 
 Program the bitstream and open a 115200/8N1 terminal on the FPGA UART.
 Within `PERIOD_CYCLES` (one second at 12 MHz) the heartbeat should emit
@@ -1116,7 +1116,7 @@ locally. The heartbeat does not interrupt mid-byte; arbitration in
 `uart.v` waits for an in-flight character to finish before pivoting
 the `uart_tx` between sources.
 
-==== Automated Test
+===== Automated Test
 
 The plan resets the FPGA, opens the UART capture, programs the
 bitstream, lets the heartbeat run for two periods so we see the
