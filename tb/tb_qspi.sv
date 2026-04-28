@@ -278,9 +278,9 @@ module tb_qspi;
 
       $display("MISO trace: byte0=%02h byte1=%02h byte2=%02h byte3=%02h",
                got0, got1, got2, got3);
-      if (got1 !== 8'hAA) $fatal(1, "FAIL: MISO byte1 = %02h", got1);
-      if (got2 !== 8'h55) $fatal(1, "FAIL: MISO byte2 = %02h", got2);
-      if (got3 !== 8'h01) $fatal(1, "FAIL: MISO byte3 = %02h", got3);
+      if (got1 !== 8'h20) $fatal(1, "FAIL: MISO byte1 = %02h", got1);
+      if (got2 !== 8'h20) $fatal(1, "FAIL: MISO byte2 = %02h", got2);
+      if (got3 !== 8'h14) $fatal(1, "FAIL: MISO byte3 = %02h", got3);
       expect_line("op=9f bytes=4", oracle_crc ^ 32'hFFFFFFFF);
       oracle_crc      = 32'hFFFFFFFF;
       repeat (200) @(posedge clk);
@@ -665,7 +665,7 @@ module tb_qspi;
       spi_byte(8'h00, 1'b0, got3);
       #200 cs_n = 1;
       $display("HS 9F: %02h %02h %02h %02h", got0, got1, got2, got3);
-      if (got1 !== 8'hAA || got2 !== 8'h55 || got3 !== 8'h01)
+      if (got1 !== 8'h20 || got2 !== 8'h20 || got3 !== 8'h14)
          $fatal(1, "FAIL: high-rate 9F miso = %02h %02h %02h",
                 got1, got2, got3);
       expect_line("op=9f bytes=4", oracle_crc ^ 32'hFFFFFFFF);

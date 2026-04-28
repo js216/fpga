@@ -63,12 +63,12 @@ module qspi (
             if (phase_cnt != 3'd7) phase_cnt <= phase_cnt + 3'd1;
             if (phase_cnt == 3'd0) begin
                opcode <= byte_captured;
-               if (byte_captured == 8'h9F) shift_out <= 8'hAA;
+               if (byte_captured == 8'h9F) shift_out <= 8'h20;
                else if (byte_captured == 8'h05) shift_out <= 8'h00;
             end else if (phase_cnt == 3'd1 && opcode == 8'h9F) begin
-               shift_out <= 8'h55;
+               shift_out <= 8'h20;
             end else if (phase_cnt == 3'd2 && opcode == 8'h9F) begin
-               shift_out <= 8'h01;
+               shift_out <= 8'h14;
             end else if (opcode == 8'h03 && phase_cnt == 3'd3) begin
                addr_low  <= new_low + 4'd1;
                shift_out <= ram_rd;

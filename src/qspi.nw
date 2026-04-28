@@ -247,12 +247,12 @@ write is the quad-input chunk above); 0x6B Quad Output Read
 <<SPI: byte boundary opcode dispatch>>=
 if (phase_cnt == 3'd0) begin
    opcode <= byte_captured;
-   if (byte_captured == 8'h9F) shift_out <= 8'hAA;
+   if (byte_captured == 8'h9F) shift_out <= 8'h20;
    else if (byte_captured == 8'h05) shift_out <= 8'h00;
 end else if (phase_cnt == 3'd1 && opcode == 8'h9F) begin
-   shift_out <= 8'h55;
+   shift_out <= 8'h20;
 end else if (phase_cnt == 3'd2 && opcode == 8'h9F) begin
-   shift_out <= 8'h01;
+   shift_out <= 8'h14;
 end else if (opcode == 8'h03 && phase_cnt == 3'd3) begin
    addr_low  <= new_low + 4'd1;
    shift_out <= ram_rd;
@@ -1327,9 +1327,9 @@ module tb_qspi;
 
       $display("MISO trace: byte0=%02h byte1=%02h byte2=%02h byte3=%02h",
                got0, got1, got2, got3);
-      if (got1 !== 8'hAA) $fatal(1, "FAIL: MISO byte1 = %02h", got1);
-      if (got2 !== 8'h55) $fatal(1, "FAIL: MISO byte2 = %02h", got2);
-      if (got3 !== 8'h01) $fatal(1, "FAIL: MISO byte3 = %02h", got3);
+      if (got1 !== 8'h20) $fatal(1, "FAIL: MISO byte1 = %02h", got1);
+      if (got2 !== 8'h20) $fatal(1, "FAIL: MISO byte2 = %02h", got2);
+      if (got3 !== 8'h14) $fatal(1, "FAIL: MISO byte3 = %02h", got3);
       expect_line("op=9f bytes=4", oracle_crc ^ 32'hFFFFFFFF);
       oracle_crc      = 32'hFFFFFFFF;
       repeat (200) @(posedge clk);
@@ -1714,7 +1714,7 @@ module tb_qspi;
       spi_byte(8'h00, 1'b0, got3);
       #200 cs_n = 1;
       $display("HS 9F: %02h %02h %02h %02h", got0, got1, got2, got3);
-      if (got1 !== 8'hAA || got2 !== 8'h55 || got3 !== 8'h01)
+      if (got1 !== 8'h20 || got2 !== 8'h20 || got3 !== 8'h14)
          $fatal(1, "FAIL: high-rate 9F miso = %02h %02h %02h",
                 got1, got2, got3);
       expect_line("op=9f bytes=4", oracle_crc ^ 32'hFFFFFFFF);
