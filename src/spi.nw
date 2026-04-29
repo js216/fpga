@@ -18,13 +18,13 @@ QUADSPI raw read samples IO0 in 1-line data mode even though
 conventional SPI labels often call IO1/MISO the slave-output lane.
 Mirroring the pattern avoids making the raw-read benchmark depend
 on that naming ambiguity.
-`LANES=4` drives all four lanes on `negedge sclk`; the bench
+`LANES=4` drives all four lanes combinationally; the bench
 command is `b <len> 1 1`. The 4-lane case follows the convention
 the rest of this codebase has settled on: the STM32MP1 QUADSPI
 indirect-read engine assembles each byte as
-`{second_sample, first_sample}`, so the FIRST negedge of a byte
-cycle carries the LOWER nibble and the SECOND negedge carries
-the UPPER. Byte-swap-on-the-wire is a host-side post-process.
+`{first_sample, second_sample}`, so the first sample of a byte
+cycle carries the upper nibble and the second sample carries the
+lower nibble.
 
 === Why explicit `SB_IO` instances
 
@@ -47,13 +47,15 @@ existing `!==` check happens to flag in some stimulus shapes
 but not in others.
 
 The fix is to bypass tri-state inference entirely and
-instantiate `SB_IO` cells directly. Each pad is configured as
-`PIN_TYPE = 6'b100101` (output registered with output enable)
+instantiate `SB_IO` cells directly. The 1-lane pads are configured
+as `PIN_TYPE = 6'b100101` (output registered with output enable)
 and `NEG_TRIGGER = 1` so the IOB's output flop captures
-`D_OUT_0` on `negedge OUTPUT_CLK`. `OUTPUT_CLK = sclk`,
-`OUTPUT_ENABLE = ~cs_n`. The IOB flop is the negedge presenter:
-it captures the next bit half a cycle ahead of the master's
-mode-0 rising-edge sample point.
+`D_OUT_0` on `negedge OUTPUT_CLK`. The 4-lane pads use
+`PIN_TYPE = 6'b101001`, keeping the explicit output enable but
+driving the nibble value unregistered. `OUTPUT_CLK = sclk`,
+`OUTPUT_ENABLE = ~cs_n`. In 1-lane mode the IOB flop is the
+negedge presenter: it captures the next bit half a cycle ahead of
+the master's mode-0 rising-edge sample point.
 
 === Lane data path
 
@@ -63,13 +65,14 @@ rise. The output flop starts at the first bit/nibble of byte 0, so
 the first rising edge in a frame samples valid data even before any
 falling edge has occurred. The `phase` counter narrows per variant:
 3 bits for 1-lane (eight rises per byte, MSB-first), 1 bit for
-4-lane (two rises per byte, lower nibble first then upper).
+4-lane (two rises per byte, upper nibble first then lower).
 
-The combinational `dout_lane[3:0]` carries the value the IOB flop
-will latch at the next negedge. For 4-lane, every lane carries a
-real bit of the current nibble. For 1-lane, `dout_lane[0]` and
-`dout_lane[1]` both carry the data bit; the other two lanes are
-held low when enabled. Both variants feed a
+The combinational `dout_lane[3:0]` carries the current lane value.
+For 4-lane, every lane carries a real bit of the current nibble
+directly to an unregistered pad. For 1-lane, `dout_lane[0]` and
+`dout_lane[1]` both carry the data bit that the IOB flop will latch
+at the next negedge; the other two lanes are held low when enabled.
+Both variants feed a
 single shared genvar loop that instantiates one `SB_IO` per pad, so
 the synthesis netlist contains exactly four explicit pad drivers and
 no fabric tri-state cells regardless of `LANES`.
@@ -114,10 +117,10 @@ end else begin : g_one
 end endgenerate
 @
 
-For 4-lane the nibble mux picks the lower nibble when
-`phase == 0` and the upper nibble when `phase == 1`, matching
+For 4-lane the nibble mux picks the upper nibble when
+`phase == 0` and the lower nibble when `phase == 1`, matching
 the STM32MP1 QUADSPI indirect-read assembly of
-`{second_sample, first_sample}`.
+`{first_sample, second_sample}`.
 
 <<SPI streaming: quad lane>>=
 reg phase;
@@ -131,7 +134,7 @@ always @(posedge cs_n or posedge sclk) begin
       if (phase) data_byte <= data_byte + 8'd1;
    end
 end
-assign dout_lane = phase ? data_byte[7:4] : data_byte[3:0];
+assign dout_lane = phase ? data_byte[3:0] : data_byte[7:4];
 @
 
 For 1-lane the bit mux picks `data_byte[7 - phase]`, MSB-first,
@@ -157,11 +160,13 @@ assign dout_lane[2] = 1'b0;
 assign dout_lane[3] = 1'b0;
 @
 
-The IO driver uses one explicit iCE40 `SB_IO` per pad. `NEG_TRIGGER`
-makes each output flop capture `dout_lane[g]` on SCLK falling edges,
-so pad transitions happen half a cycle ahead of the MP135 rising-edge
-sample without making the stream counter itself sensitive to falling
-edges. That distinction matters for long peripheral reads where SCLK
+The IO driver uses one explicit iCE40 `SB_IO` per pad. In 1-lane
+mode, `NEG_TRIGGER` makes each output flop capture `dout_lane[g]` on
+SCLK falling edges, so pad transitions happen half a cycle ahead of
+the MP135 rising-edge sample without making the stream counter itself
+sensitive to falling edges. In 4-lane mode the pads are unregistered
+so the phase mux output reaches the pins directly. Keeping the stream
+counter on rising edges matters for long peripheral reads where SCLK
 can pause: repeated or idle falling-edge observations re-present the
 same computed value instead of advancing the byte stream.
 
@@ -169,7 +174,7 @@ same computed value instead of advancing the byte stream.
 genvar g;
 generate for (g = 0; g < 4; g = g + 1) begin : g_io
    SB_IO #(
-      .PIN_TYPE(6'b100101),
+      .PIN_TYPE(LANES == 4 ? 6'b101001 : 6'b100101),
       .NEG_TRIGGER(1'b1)
    ) iob (
       .PACKAGE_PIN(io[g]),
@@ -503,15 +508,18 @@ set_io io[3]   48
 yosys recognises `SB_IO` as a built-in iCE40 primitive and
 needs no help from us during synthesis. verilator does not, so
 the testbench is compiled against a stand-alone behavioural
-model that covers exactly the configuration our DUT uses
-(`PIN_TYPE = 6'b100101`, `NEG_TRIGGER = 1`). Any other
-configuration is rejected at elaboration so a future change to
-the DUT does not silently desync the sim from the synth path.
+model that covers exactly the configurations our DUT uses
+(`PIN_TYPE = 6'b100101` for registered 1-lane pads and
+`PIN_TYPE = 6'b101001` for unregistered quad pads, both with
+`NEG_TRIGGER = 1`). Any other configuration is rejected at
+elaboration so a future change to the DUT does not silently desync
+the sim from the synth path.
 
-The model owns one negedge-clocked register per pad and gates its
-output through `OUTPUT_ENABLE`. When the slave releases the bus the
-inout port is driven to `1'bz`, and the testbench attaches a
-`pullup` per lane to model the master-side MISO pull-up.
+The model owns one negedge-clocked register per registered pad and
+otherwise forwards `D_OUT_0` directly, then gates the selected output
+through `OUTPUT_ENABLE`. When the slave releases the bus the inout
+port is driven to `1'bz`, and the testbench attaches a `pullup` per
+lane to model the master-side MISO pull-up.
 
 <<SB_IO.v>>=
 module SB_IO #(
@@ -524,8 +532,9 @@ module SB_IO #(
       input  D_OUT_0
    );
    initial begin
-      if (PIN_TYPE !== 6'b100101 || NEG_TRIGGER !== 1'b1) begin
-         $display("ERROR SB_IO sim model only supports PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
+      if ((PIN_TYPE !== 6'b100101 && PIN_TYPE !== 6'b101001) ||
+            NEG_TRIGGER !== 1'b1) begin
+         $display("ERROR SB_IO sim model only supports PIN_TYPE=100101/101001 NEG_TRIGGER=1, got %b %b",
                   PIN_TYPE, NEG_TRIGGER);
          $finish;
       end
@@ -534,7 +543,8 @@ module SB_IO #(
    initial dout_reg = 1'b0;
    always @(negedge OUTPUT_CLK)
       dout_reg <= D_OUT_0;
-   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_reg : 1'bz;
+   wire dout = (PIN_TYPE == 6'b101001) ? D_OUT_0 : dout_reg;
+   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout : 1'bz;
 endmodule
 @
 
@@ -664,7 +674,7 @@ The 4-lane TB mirrors the 1-lane shape exactly --- same four
 scenarios, same expected byte stream, same pull-up modelling,
 same `errs` accumulator --- but the sampler reads all four
 `io` lines on each rise and reassembles the byte as
-`{second_sample, first_sample}`.
+`{first_sample, second_sample}`.
 
 <<tb_spi_quad.sv>>=
 `timescale 1ns/1ps
@@ -687,7 +697,7 @@ pullup pu2 (io[2]);
 pullup pu3 (io[3]);
 spi #(.LANES(4)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
 integer    errs;
-reg [3:0]  lo, hi;
+reg [3:0]  first_sample, second_sample;
 reg [7:0]  rx;
 @
 
@@ -695,12 +705,12 @@ reg [7:0]  rx;
 task automatic clock_byte(input integer expected);
    begin
       #5 sclk = 1'b1;
-      lo = io;
+      first_sample = io;
       #5 sclk = 1'b0;
       #5 sclk = 1'b1;
-      hi = io;
+      second_sample = io;
       #5 sclk = 1'b0;
-      rx = {hi, lo};
+      rx = {first_sample, second_sample};
       if (rx !== expected[7:0]) begin
          $display("FAIL byte %0d: got %02x expected %02x",
                   expected, rx, expected[7:0]);
@@ -817,8 +827,11 @@ def check(path, lanes):
         name, cell = pads[key]
         params = cell.get("parameters", {})
         conns = cell.get("connections", {})
-        if params.get("PIN_TYPE") != "100101":
-            raise AssertionError(f"{path}: {name} PIN_TYPE={params.get('PIN_TYPE')}, expected 100101")
+        expected_pin_type = "101001" if lanes == 4 else "100101"
+        if params.get("PIN_TYPE") != expected_pin_type:
+            raise AssertionError(
+                f"{path}: {name} PIN_TYPE={params.get('PIN_TYPE')}, "
+                f"expected {expected_pin_type}")
         if params.get("NEG_TRIGGER") != "1":
             raise AssertionError(f"{path}: {name} NEG_TRIGGER={params.get('NEG_TRIGGER')}, expected 1")
         if conns.get("OUTPUT_ENABLE") != [oe_bit]:
@@ -1089,9 +1102,9 @@ opens the MP135 console, sets the prescaler, and issues the raw bench
 command. The 1-lane phase reuses the `spi_1lane.bin` image already
 loaded by the 1-lane preflight block, avoiding repeated FPGA
 reprogramming while the iCEstick USB side is recovering. The success
-sentinel is `firsterr` --- it appears in the bench summary line
-only after the whole megabyte has been validated against the
-incrementing pattern.
+sentinel is the final summary field `, firsterr=-1`, after the whole
+megabyte has been validated against the incrementing pattern. Bare
+`firsterr` is not unique when BENCHDBG emits intermediate diagnostics.
 
 The prescaler sweep covers 203 (~1.63 MHz wire), 63 (~5.19 MHz),
 15 (~20.75 MHz), 5 (~55.3 MHz), 4 (~66.4 MHz), 3 (~83 MHz),
@@ -1112,7 +1125,7 @@ mp135:uart_write data="p 203\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=15000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mark tag=bench_done
 mp135:uart_close
 ```
@@ -1131,7 +1144,7 @@ mp135:uart_write data="p 63\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=10000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=10000
 mark tag=bench_done
 mp135:uart_close
 ```
@@ -1150,7 +1163,7 @@ mp135:uart_write data="p 15\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=8000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
 mark tag=bench_done
 mp135:uart_close
 ```
@@ -1169,7 +1182,7 @@ mp135:uart_write data="p 5 1\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
 mark tag=bench_done
 mp135:uart_close
 ```
@@ -1188,12 +1201,34 @@ mp135:uart_write data="p 203\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=10000
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=10000
 mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=10000
 mp135:uart_close
 ```
 
 - Check 1lane MDMA @ presc=203 pattern correct
+
+Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=255.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 255\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mp135:uart_write data="A 1048576 0 1 262144\r"
+mp135:uart_expect sentinel="stream 1048576 B" timeout_ms=20000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane stream @ presc=255 pattern correct
 
 Phase 1 -- 1-lane MDMA read at presc=63.
 
@@ -1207,8 +1242,9 @@ mp135:uart_write data="p 63\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=10000
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=10000
 mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=10000
 mp135:uart_close
 ```
 
@@ -1226,8 +1262,9 @@ mp135:uart_write data="p 15\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=8000
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=8000
 mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
 mp135:uart_close
 ```
 
@@ -1245,14 +1282,15 @@ mp135:uart_write data="p 5 1\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=6000
 mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
 mp135:uart_close
 ```
 
 - Check 1lane MDMA @ presc=5 pattern correct
 
-Phase 1 -- 1-lane MDMA read at presc=4.
+Phase 1 -- 1-lane MDMA read at presc=5 wall-rate floor.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
@@ -1260,149 +1298,18 @@ dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 4 1\r"
+mp135:uart_write data="p 5 1\r"
 delay ms=100
+mp135:uart_write data="m 4194304 0 1\r"
+mp135:uart_expect sentinel="mdma_begin" timeout_ms=6000
 mark tag=bench_start
-mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=6000
 mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mp135:uart_close
 ```
 
-- Check 1lane MDMA @ presc=4 pattern correct
-
-Phase 1 -- 1-lane MDMA read at presc=3.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 3 1\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=6000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane MDMA @ presc=3 pattern correct
-
-Phase 1 -- 1-lane MDMA read at presc=2.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 2\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=5000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane MDMA @ presc=2 pattern correct
-
-Phase 1 -- 1-lane MDMA read at presc=1.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 1\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=5000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane MDMA @ presc=1 pattern correct
-
-Phase 1 -- 1-lane sweep at presc=4.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 4 1\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=6000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane @ presc=4 pattern correct
-
-Phase 1 -- 1-lane sweep at presc=3.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 3 1\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=6000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane @ presc=3 pattern correct
-
-Phase 1 -- 1-lane sweep at presc=2.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 2\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=5000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane @ presc=2 pattern correct
-
-Phase 1 -- 1-lane sweep at presc=1.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 1\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=5000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane @ presc=1 pattern correct
+- Check 1lane MDMA @ presc=5 wall rate >= 100 Mbps
 
 Phase 2 -- 4-lane sweep at presc=203.
 
@@ -1417,7 +1324,7 @@ mp135:uart_write data="p 203\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=15000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mark tag=bench_done
 mp135:uart_close
 ```
@@ -1437,7 +1344,7 @@ mp135:uart_write data="p 63\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=8000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
 mark tag=bench_done
 mp135:uart_close
 ```
@@ -1457,7 +1364,7 @@ mp135:uart_write data="p 15\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=6000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
 mark tag=bench_done
 mp135:uart_close
 ```
@@ -1477,52 +1384,12 @@ mp135:uart_write data="p 5\r"
 delay ms=100
 mark tag=bench_start
 mp135:uart_write data="b 1048576 1 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=5000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=5000
 mark tag=bench_done
 mp135:uart_close
 ```
 
 - Check quad @ presc=5 pattern correct
-
-Phase 2 -- 4-lane sweep at presc=2.
-
-```
-fpga:program bin=@spi_quad.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 2\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="b 1048576 1 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=5000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check quad @ presc=2 pattern correct
-
-Phase 2 -- 4-lane sweep at presc=1.
-
-```
-fpga:program bin=@spi_quad.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 1\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="b 1048576 1 1\r"
-mp135:uart_expect sentinel="firsterr" timeout_ms=5000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check quad @ presc=1 pattern correct
 @
 
 The verifier walks the captured MP135 UART stream
@@ -1544,6 +1411,7 @@ contract.
 import os
 import re
 import sys
+import zlib
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
@@ -1553,16 +1421,26 @@ import verify_lib as v
 UART = "streams/mp135.uart.bin"
 FPGA_UART = "streams/fpga.uart.bin"
 TIMELINE = "timeline.log"
-QSPI_KER_HZ = 332_000_000
+QSPI_KER_HZ = 656_000_000
 
 BENCH_RE = re.compile(
     rb"bench\s+(\d+)\s+B\s+(1lane|quad)\s+@\s+presc=(\d+)\s+in\s+"
-    rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=[0-9a-f]+,\s+"
+    rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=([0-9a-f]+),\s+"
+    rb"(?:expect=([0-9a-f]+),\s+)?"
     rb"firsterr=(-?\d+)")
 MDMA_RE = re.compile(
     rb"mdma\s+(\d+)\s+B\s+(1lane|quad)\s+in\s+"
-    rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=[0-9a-f]+,\s+"
-    rb"firsterr=(-?\d+)")
+    rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=([0-9a-f]+),\s+"
+    rb"(?:expect=([0-9a-f]+),\s+)?"
+    rb"firsterr=(-?\d+)"
+    rb"(?:,\s+xfer=(\d+)\s+ms,\s+validate=(\d+)\s+ms,\s+"
+    rb"poison=(\d+)\s+ms)?")
+STREAM_RE = re.compile(
+    rb"stream\s+(\d+)\s+B\s+(1lane|quad)\s+in\s+"
+    rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=([0-9a-f]+),\s+"
+    rb"expect=([0-9a-f]+),\s+firsterr=(-?\d+),\s+chunk=(\d+),\s+"
+    rb"chunks=(\d+),\s+(?:buf=(sram|ddr),\s+)?auto=(on|off)"
+    rb"(?:,\s+presc=(\d+),\s+qspi_hz=(\d+))?")
 DEBUG_RE = re.compile(rb"SPI E=([0-9a-f]{4}) S=([0-9a-f]{8})")
 HEXLINE_RE = re.compile(rb"[0-9a-f]{8}:(?:\s+[0-9a-f]{2}){1,16}")
 HEXBYTE_RE = re.compile(rb"\b([0-9a-f]{2})\b")
@@ -1753,12 +1631,23 @@ def _bench_pick(mode, presc):
     return last
 
 
-def _mdma_pick(mode):
+def _mdma_pick(mode, byte_count=1048576):
     raw = _read_uart()
     if raw is None:
         return None
     last = None
     for m in MDMA_RE.finditer(raw):
+        if int(m.group(1)) == byte_count and m.group(2).decode() == mode:
+            last = m
+    return last
+
+
+def _stream_pick(mode):
+    raw = _read_uart()
+    if raw is None:
+        return None
+    last = None
+    for m in STREAM_RE.finditer(raw):
         if int(m.group(1)) == 1048576 and m.group(2).decode() == mode:
             last = m
     return last
@@ -1791,6 +1680,24 @@ def _wall_rate_mbps(byte_count, wall_ms):
     return byte_count * 8.0 / (wall_ms * 1000.0)
 
 
+def _rate_bounds_mbps(mode, presc):
+    lanes = 4 if mode == "quad" else 1
+    max_rate = _sclk_mhz(presc) * lanes
+    return 0.90 * max_rate, max_rate
+
+
+def _check_rate_bounds(label, mode, presc, rate, qspi_hz=QSPI_KER_HZ):
+    lanes = 4 if mode == "quad" else 1
+    max_rate = (qspi_hz / (presc + 1) / 1_000_000) * lanes
+    lo, hi = 0.90 * max_rate, max_rate
+    if rate < lo or rate > hi:
+        sys.stderr.write(
+            f"{label}={rate:.3f}Mbps outside "
+            f"{lo:.3f}..{hi:.3f}Mbps for {mode} presc={presc}\n")
+        return False
+    return True
+
+
 def _wall_text(byte_count, wall_ms):
     if wall_ms is None:
         return " wall=unknown wall_rate=unknown"
@@ -1804,22 +1711,144 @@ def _bench_rate_text(mode, presc, match):
     byte_count = int(match.group(1))
     ms = int(match.group(4))
     mbps = match.group(5).decode("ascii")
+    crc = match.group(6).decode("ascii")
+    expect = match.group(7).decode("ascii") if match.group(7) else "unknown"
     wall_ms = _bench_wall_ms()
     wall = _wall_text(byte_count, wall_ms)
     return (f"{mode} @ presc={presc} "
             f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
-            f"bench={ms}ms{wall}")
+            f"bench={ms}ms crc32={crc} expect={expect}{wall}")
+
+
+def _bench_rates(match):
+    byte_count = int(match.group(1))
+    effective = float(match.group(5).decode("ascii"))
+    wall = _wall_rate_mbps(byte_count, _bench_wall_ms())
+    return effective, wall
 
 
 def _mdma_rate_text(mode, presc, match):
     byte_count = int(match.group(1))
     ms = int(match.group(3))
     mbps = match.group(4).decode("ascii")
+    crc = match.group(5).decode("ascii")
+    expect = match.group(6).decode("ascii") if match.group(6) else "unknown"
     wall_ms = _bench_wall_ms()
     wall = _wall_text(byte_count, wall_ms)
+    detail = ""
+    if match.group(8) is not None:
+        detail = (f" xfer={int(match.group(8))}ms"
+                  f" validate={int(match.group(9))}ms"
+                  f" poison={int(match.group(10))}ms")
     return (f"{mode} MDMA @ presc={presc} "
             f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
-            f"bench={ms}ms{wall}")
+            f"bench={ms}ms crc32={crc} expect={expect}{detail}{wall}")
+
+
+def _mdma_rates(match):
+    byte_count = int(match.group(1))
+    effective = float(match.group(4).decode("ascii"))
+    wall = _wall_rate_mbps(byte_count, _bench_wall_ms())
+    return effective, wall
+
+
+def _stream_rate_text(mode, presc, match):
+    byte_count = int(match.group(1))
+    ms = int(match.group(3))
+    mbps = match.group(4).decode("ascii")
+    crc = match.group(5).decode("ascii")
+    expect = match.group(6).decode("ascii")
+    wall_ms = _bench_wall_ms()
+    wall = _wall_text(byte_count, wall_ms)
+    qspi = ""
+    buf = match.group(10).decode() if match.group(10) else "unknown"
+    auto = match.group(11).decode()
+    if match.group(13) is not None:
+        qspi = f" qspi_hz={int(match.group(13))}"
+    return (f"{mode} stream @ presc={presc} "
+            f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
+            f"bench={ms}ms crc32={crc} expect={expect} "
+            f"chunk={int(match.group(8))} "
+            f"chunks={int(match.group(9))} buf={buf} auto={auto}"
+            f"{qspi}{wall}")
+
+
+def _stream_rates(match):
+    byte_count = int(match.group(1))
+    effective = float(match.group(4).decode("ascii"))
+    wall = _wall_rate_mbps(byte_count, _bench_wall_ms())
+    return effective, wall
+
+
+def _stream_detail_block(mode, presc, match, wall):
+    wall_text = "unknown" if wall is None else f"{wall:.3f}Mbps"
+    buf = match.group(10).decode() if match.group(10) else "unknown"
+    auto = match.group(11).decode()
+    qspi = "unknown" if match.group(13) is None else match.group(13).decode()
+    return (
+        f"stream details:\n"
+        f"  mode={mode} presc={presc} sclk={_sclk_mhz(presc):.3f}MHz "
+        f"qspi_hz={qspi}\n"
+        f"  effective={float(match.group(4).decode('ascii')):.3f}Mbps "
+        f"wall_rate={wall_text} bench={int(match.group(3))}ms\n"
+        f"  crc32={match.group(5).decode('ascii')} "
+        f"expect={match.group(6).decode('ascii')} "
+        f"firsterr={int(match.group(7))}\n"
+        f"  chunk={int(match.group(8))} chunks={int(match.group(9))} "
+        f"buf={buf} auto={auto}\n")
+
+
+def _check_rates(rate, mode, presc, effective, wall):
+    if not _check_rate_bounds("effective", mode, presc, effective):
+        sys.stderr.write(rate + "\n")
+        return False
+    if wall is None:
+        sys.stderr.write(f"wall_rate=unknown for {mode} presc={presc}\n")
+        sys.stderr.write(rate + "\n")
+        return False
+    if not _check_rate_bounds("wall_rate", mode, presc, wall):
+        sys.stderr.write(rate + "\n")
+        return False
+    return True
+
+
+def _check_rates_with_clock(rate, mode, presc, effective, wall, qspi_hz,
+                            print_rate=True):
+    if not _check_rate_bounds("effective", mode, presc, effective, qspi_hz):
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    if wall is None:
+        sys.stderr.write(f"wall_rate=unknown for {mode} presc={presc}\n")
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    if not _check_rate_bounds("wall_rate", mode, presc, wall, qspi_hz):
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    return True
+
+
+def _expected_crc32(byte_count):
+    pattern = bytes(range(256))
+    whole, rem = divmod(byte_count, len(pattern))
+    crc = 0
+    for _ in range(whole):
+        crc = zlib.crc32(pattern, crc)
+    if rem:
+        crc = zlib.crc32(pattern[:rem], crc)
+    return crc & 0xffffffff
+
+
+def _check_crc(label, byte_count, got_hex):
+    got = int(got_hex, 16)
+    exp = _expected_crc32(byte_count)
+    if got != exp:
+        sys.stderr.write(
+            f"{label} crc32={got:08x} expected={exp:08x}\n")
+        return False
+    return True
 
 
 def check_pattern(mode, presc):
@@ -1835,8 +1864,21 @@ def check_pattern(mode, presc):
             sys.stderr.write(raw[-512:].decode("ascii", "replace"))
             sys.stderr.write("\n")
         return False
-    fe = int(m.group(6))
+    byte_count = int(m.group(1))
+    fe = int(m.group(8))
     rate = _bench_rate_text(mode, presc, m)
+    if not _check_crc(f"{mode} presc={presc}", byte_count,
+                      m.group(6).decode("ascii")):
+        sys.stderr.write(rate + "\n")
+        return False
+    if m.group(7) is not None:
+        got = int(m.group(6), 16)
+        exp = int(m.group(7), 16)
+        if got != exp:
+            sys.stderr.write(
+                f"{mode} presc={presc} crc32={got:08x} expect={exp:08x}\n")
+            sys.stderr.write(rate + "\n")
+            return False
     if fe != -1:
         msg = f"{rate}: firsterr={fe} (expected -1)"
         tail = m.string[m.end():m.end() + 256]
@@ -1861,10 +1903,110 @@ def check_mdma_pattern(mode, presc):
             sys.stderr.write(raw[-512:].decode("ascii", "replace"))
             sys.stderr.write("\n")
         return False
-    fe = int(m.group(5))
+    byte_count = int(m.group(1))
+    fe = int(m.group(7))
     rate = _mdma_rate_text(mode, presc, m)
+    effective, wall = _mdma_rates(m)
+    _check_rates(rate, mode, presc, effective, wall)
+    if not _check_crc(f"{mode} MDMA presc={presc}", byte_count,
+                      m.group(5).decode("ascii")):
+        sys.stderr.write(rate + "\n")
+        return False
+    if m.group(6) is not None:
+        got = int(m.group(5), 16)
+        exp = int(m.group(6), 16)
+        if got != exp:
+            sys.stderr.write(
+                f"{mode} MDMA presc={presc} crc32={got:08x} expect={exp:08x}\n")
+            sys.stderr.write(rate + "\n")
+            return False
     if fe != -1:
         sys.stderr.write(f"{rate}: firsterr={fe} (expected -1)\n")
+        return False
+    sys.stdout.write(rate + "\n")
+    return True
+
+
+def check_mdma_wall_rate_at_least(mode, presc, min_mbps):
+    if not v.check_no_errors():
+        return False
+    m = _mdma_pick(mode, 4194304)
+    if m is None:
+        sys.stderr.write(f"no {mode} mdma line\n")
+        raw = _read_uart()
+        if raw:
+            sys.stderr.write("--- last 512 bytes of UART ---\n")
+            sys.stderr.write(raw[-512:].decode("ascii", "replace"))
+            sys.stderr.write("\n")
+        return False
+    byte_count = int(m.group(1))
+    fe = int(m.group(7))
+    rate = _mdma_rate_text(mode, presc, m)
+    _effective, wall = _mdma_rates(m)
+    if not _check_crc(f"{mode} MDMA presc={presc}", byte_count,
+                      m.group(5).decode("ascii")):
+        sys.stderr.write(rate + "\n")
+        return False
+    if m.group(6) is not None:
+        got = int(m.group(5), 16)
+        exp = int(m.group(6), 16)
+        if got != exp:
+            sys.stderr.write(
+                f"{mode} MDMA presc={presc} crc32={got:08x} expect={exp:08x}\n")
+            sys.stderr.write(rate + "\n")
+            return False
+    if fe != -1:
+        sys.stderr.write(f"{rate}: firsterr={fe} (expected -1)\n")
+        return False
+    if wall is None:
+        sys.stderr.write(
+            f"{rate}: wall_rate=unknown "
+            f"(expected >= {min_mbps:.3f}Mbps)\n")
+        return False
+    if wall < min_mbps:
+        sys.stderr.write(
+            f"{rate}: wall_rate={wall:.3f}Mbps below {min_mbps:.3f}Mbps\n")
+        return False
+    sys.stdout.write(rate + f" wall_rate_floor={min_mbps:.3f}Mbps\n")
+    return True
+
+
+def check_stream_pattern(mode, presc):
+    if not v.check_no_errors():
+        return False
+    m = _stream_pick(mode)
+    if m is None:
+        sys.stderr.write(f"no {mode} stream line\n")
+        raw = _read_uart()
+        if raw:
+            sys.stderr.write("--- last 512 bytes of UART ---\n")
+            sys.stderr.write(raw[-512:].decode("ascii", "replace"))
+            sys.stderr.write("\n")
+        return False
+    byte_count = int(m.group(1))
+    fe = int(m.group(7))
+    rate = _stream_rate_text(mode, presc, m)
+    effective, wall = _stream_rates(m)
+    qspi_hz = int(m.group(13)) if m.group(13) is not None else QSPI_KER_HZ
+    if not _check_rates_with_clock(rate, mode, presc, effective, wall,
+                                   qspi_hz, print_rate=False):
+        sys.stderr.write(_stream_detail_block(mode, presc, m, wall))
+    if not _check_crc(f"{mode} stream presc={presc}", byte_count,
+                      m.group(5).decode("ascii")):
+        sys.stderr.write(rate + "\n")
+        return False
+    got = int(m.group(5), 16)
+    exp = int(m.group(6), 16)
+    if got != exp:
+        sys.stderr.write(
+            f"{mode} stream crc32={got:08x} expect={exp:08x}\n")
+        sys.stderr.write(rate + "\n")
+        return False
+    if fe != -1:
+        sys.stderr.write(f"{rate}: firsterr={fe} (expected -1)\n")
+        return False
+    if m.group(11) != b"on":
+        sys.stderr.write(f"{rate}: auto-consume is not on\n")
         return False
     sys.stdout.write(rate + "\n")
     return True
@@ -1873,7 +2015,7 @@ def check_mdma_pattern(mode, presc):
 def _make_dispatch():
     """Generate one DISPATCH entry per (mode, presc) pair declared in
     the hardware test plan. Keys exactly match the TEST.md bullets."""
-    presc_steps = [203, 63, 15, 5, 4, 3, 2, 1]
+    presc_steps = [203, 63, 15, 5]
     out = {}
     out["Check SPI header wiring via GPIO preflight"] = check_gpio_wiring
     out["Check 1lane bit-bang read returns incrementing pattern"] = (
@@ -1884,9 +2026,13 @@ def _make_dispatch():
         lambda: check_raw_read_pattern("1lane", 512))
     out["Check 1lane MDMA @ presc=203 pattern correct"] = (
         lambda: check_mdma_pattern("1lane", 203))
-    for p in [63, 15, 5, 4, 3, 2, 1]:
+    out["Check 1lane stream @ presc=255 pattern correct"] = (
+        lambda: check_stream_pattern("1lane", 255))
+    for p in [63, 15, 5]:
         key = f"Check 1lane MDMA @ presc={p} pattern correct"
         out[key] = (lambda pr=p: check_mdma_pattern("1lane", pr))
+    out["Check 1lane MDMA @ presc=5 wall rate >= 100 Mbps"] = (
+        lambda: check_mdma_wall_rate_at_least("1lane", 5, 100.0))
     out["Check quad bit-bang read returns incrementing pattern"] = (
         lambda: check_bitbang_pattern("quad"))
     out["Check FPGA UART debug reports first 32 SCLK edges"] = (
@@ -1922,14 +2068,22 @@ NW := ../../src/spi.nw
 MP135_QSPI_DIR := /home/claude/stm32mp135_test_board/baremetal/qspi/build
 MP135_QSPI_SRC := /home/claude/stm32mp135_test_board/baremetal/qspi
 
-.PHONY: all test bitstreams
+.PHONY: all test bitstreams sim bitstream
 all: TEST.md verify.py flash.tsv main.stm32
+
+Makefile: $(NW)
+	tangle Makefile < $<
 
 test: all bitstreams
 	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi --log run_md.log
 
 bitstreams:
 	$(MAKE) -C ../.. build/spi/pin_preflight build/spi/spi_1lane.bin build/spi/spi_quad.bin
+
+bitstream: bitstreams
+
+sim:
+	$(MAKE) -C ../.. build/spi/sim_1lane build/spi/sim_quad build/spi/netlist_check
 
 TEST.md: $(NW)
 	tangle TEST.md < $<

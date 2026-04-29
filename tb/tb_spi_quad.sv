@@ -10,17 +10,17 @@ module tb_spi_quad;
    pullup pu3 (io[3]);
    spi #(.LANES(4)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
    integer    errs;
-   reg [3:0]  lo, hi;
+   reg [3:0]  first_sample, second_sample;
    reg [7:0]  rx;
    task automatic clock_byte(input integer expected);
       begin
          #5 sclk = 1'b1;
-         lo = io;
+         first_sample = io;
          #5 sclk = 1'b0;
          #5 sclk = 1'b1;
-         hi = io;
+         second_sample = io;
          #5 sclk = 1'b0;
-         rx = {hi, lo};
+         rx = {first_sample, second_sample};
          if (rx !== expected[7:0]) begin
             $display("FAIL byte %0d: got %02x expected %02x",
                      expected, rx, expected[7:0]);

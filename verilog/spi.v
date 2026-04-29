@@ -21,7 +21,7 @@ module spi #(
             if (phase) data_byte <= data_byte + 8'd1;
          end
       end
-      assign dout_lane = phase ? data_byte[7:4] : data_byte[3:0];
+      assign dout_lane = phase ? data_byte[3:0] : data_byte[7:4];
    end else begin : g_one
       reg [2:0] phase;
       initial phase = 3'd0;
@@ -42,7 +42,7 @@ module spi #(
    genvar g;
    generate for (g = 0; g < 4; g = g + 1) begin : g_io
       SB_IO #(
-         .PIN_TYPE(6'b100101),
+         .PIN_TYPE(LANES == 4 ? 6'b101001 : 6'b100101),
          .NEG_TRIGGER(1'b1)
       ) iob (
          .PACKAGE_PIN(io[g]),
