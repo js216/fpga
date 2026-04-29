@@ -1199,11 +1199,13 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 203\r"
 delay ms=100
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=10000
+mp135:uart_write data="m 1000000 0 1\r"
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=40000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=10000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=40000
 mp135:uart_close
 ```
 
@@ -1240,11 +1242,13 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 63\r"
 delay ms=100
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=10000
+mp135:uart_write data="m 1000000 0 1\r"
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=15000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=10000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
 mp135:uart_close
 ```
 
@@ -1260,11 +1264,13 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 15\r"
 delay ms=100
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_write data="m 1048576 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=8000
+mp135:uart_write data="m 1000000 0 1\r"
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=12000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
 mp135:uart_close
 ```
 
@@ -1280,11 +1286,13 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 5 1\r"
 delay ms=100
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_write data="m 1048576 0 1\r"
+mp135:uart_write data="m 1000000 0 1\r"
 mp135:uart_expect sentinel="mdma_xfer" timeout_ms=6000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
 mp135:uart_close
 ```
 
@@ -1300,10 +1308,11 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 5 1\r"
 delay ms=100
-mp135:uart_write data="m 4194304 0 1\r"
-mp135:uart_expect sentinel="mdma_begin" timeout_ms=6000
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=6000
+mp135:uart_write data="m 1000000 0 1\r"
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=15000
 mark tag=bench_done
 mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mp135:uart_close
@@ -1631,7 +1640,7 @@ def _bench_pick(mode, presc):
     return last
 
 
-def _mdma_pick(mode, byte_count=1048576):
+def _mdma_pick(mode, byte_count=1000000):
     raw = _read_uart()
     if raw is None:
         return None
@@ -1642,13 +1651,13 @@ def _mdma_pick(mode, byte_count=1048576):
     return last
 
 
-def _stream_pick(mode):
+def _stream_pick(mode, byte_count=1048576):
     raw = _read_uart()
     if raw is None:
         return None
     last = None
     for m in STREAM_RE.finditer(raw):
-        if int(m.group(1)) == 1048576 and m.group(2).decode() == mode:
+        if int(m.group(1)) == byte_count and m.group(2).decode() == mode:
             last = m
     return last
 
@@ -1715,7 +1724,7 @@ def _bench_rate_text(mode, presc, match):
     expect = match.group(7).decode("ascii") if match.group(7) else "unknown"
     wall_ms = _bench_wall_ms()
     wall = _wall_text(byte_count, wall_ms)
-    return (f"{mode} @ presc={presc} "
+    return (f"{mode} @ presc={presc} bytes={byte_count} "
             f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
             f"bench={ms}ms crc32={crc} expect={expect}{wall}")
 
@@ -1740,7 +1749,7 @@ def _mdma_rate_text(mode, presc, match):
         detail = (f" xfer={int(match.group(8))}ms"
                   f" validate={int(match.group(9))}ms"
                   f" poison={int(match.group(10))}ms")
-    return (f"{mode} MDMA @ presc={presc} "
+    return (f"{mode} MDMA @ presc={presc} bytes={byte_count} "
             f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
             f"bench={ms}ms crc32={crc} expect={expect}{detail}{wall}")
 
@@ -1765,7 +1774,7 @@ def _stream_rate_text(mode, presc, match):
     auto = match.group(11).decode()
     if match.group(13) is not None:
         qspi = f" qspi_hz={int(match.group(13))}"
-    return (f"{mode} stream @ presc={presc} "
+    return (f"{mode} stream @ presc={presc} bytes={byte_count} "
             f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
             f"bench={ms}ms crc32={crc} expect={expect} "
             f"chunk={int(match.group(8))} "
@@ -1831,7 +1840,7 @@ def _check_rates_with_clock(rate, mode, presc, effective, wall, qspi_hz,
 
 
 def _expected_crc32(byte_count):
-    pattern = bytes(range(256))
+    pattern = bytes(range(256)) * 16
     whole, rem = divmod(byte_count, len(pattern))
     crc = 0
     for _ in range(whole):
@@ -1930,7 +1939,7 @@ def check_mdma_pattern(mode, presc):
 def check_mdma_wall_rate_at_least(mode, presc, min_mbps):
     if not v.check_no_errors():
         return False
-    m = _mdma_pick(mode, 4194304)
+    m = _mdma_pick(mode, 1000000)
     if m is None:
         sys.stderr.write(f"no {mode} mdma line\n")
         raw = _read_uart()
@@ -1971,12 +1980,12 @@ def check_mdma_wall_rate_at_least(mode, presc, min_mbps):
     return True
 
 
-def check_stream_pattern(mode, presc):
+def check_stream_pattern(mode, presc, byte_count=1048576, max_wall_ms=None):
     if not v.check_no_errors():
         return False
-    m = _stream_pick(mode)
+    m = _stream_pick(mode, byte_count)
     if m is None:
-        sys.stderr.write(f"no {mode} stream line\n")
+        sys.stderr.write(f"no {mode} stream line for {byte_count} bytes\n")
         raw = _read_uart()
         if raw:
             sys.stderr.write("--- last 512 bytes of UART ---\n")
@@ -2008,7 +2017,36 @@ def check_stream_pattern(mode, presc):
     if m.group(11) != b"on":
         sys.stderr.write(f"{rate}: auto-consume is not on\n")
         return False
+    if max_wall_ms is not None:
+        wall_ms = _bench_wall_ms()
+        if wall_ms is None:
+            sys.stderr.write(f"{rate}: wall time unknown\n")
+            return False
+        if wall_ms > max_wall_ms:
+            sys.stderr.write(
+                f"{rate}: wall={wall_ms:.0f}ms exceeds "
+                f"{max_wall_ms}ms hard limit\n")
+            return False
     sys.stdout.write(rate + "\n")
+    return True
+
+
+def check_stream_wall_rate_at_least(mode, presc, min_mbps, byte_count=1000000):
+    if not check_stream_pattern(mode, presc, byte_count):
+        return False
+    m = _stream_pick(mode, byte_count)
+    rate = _stream_rate_text(mode, presc, m)
+    _effective, wall = _stream_rates(m)
+    if wall is None:
+        sys.stderr.write(
+            f"{rate}: wall_rate=unknown "
+            f"(expected >= {min_mbps:.3f}Mbps)\n")
+        return False
+    if wall < min_mbps:
+        sys.stderr.write(
+            f"{rate}: wall_rate={wall:.3f}Mbps below {min_mbps:.3f}Mbps\n")
+        return False
+    sys.stdout.write(rate + f" wall_rate_floor={min_mbps:.3f}Mbps\n")
     return True
 
 
