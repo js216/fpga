@@ -15,14 +15,53 @@ module tb_spi_quad;
    task automatic clock_byte(input integer expected);
       begin
          #5 sclk = 1'b1;
+         #1;
          first_sample = io;
-         #5 sclk = 1'b0;
+         #4 sclk = 1'b0;
          #5 sclk = 1'b1;
+         #1;
          second_sample = io;
-         #5 sclk = 1'b0;
+         #4 sclk = 1'b0;
          rx = {first_sample, second_sample};
          if (rx !== expected[7:0]) begin
             $display("FAIL byte %0d: got %02x expected %02x",
+                     expected, rx, expected[7:0]);
+            errs = errs + 1;
+         end
+      end
+   endtask
+   
+   task automatic clock_byte_paused(input integer expected);
+      begin
+         #5 sclk = 1'b1;
+         #1;
+         first_sample = io;
+         #19;
+         if (io !== first_sample) begin
+            $display("FAIL byte %0d high-pause: io changed from %x to %x",
+                     expected, first_sample, io);
+            errs = errs + 1;
+         end
+         sclk = 1'b0;
+         #20;
+         if (io !== expected[3:0]) begin
+            $display("FAIL byte %0d low-pause: io=%x expected lower nibble %x",
+                     expected, io, expected[3:0]);
+            errs = errs + 1;
+         end
+         #5 sclk = 1'b1;
+         #1;
+         second_sample = io;
+         #19;
+         if (io !== second_sample) begin
+            $display("FAIL byte %0d high-pause 2: io changed from %x to %x",
+                     expected, second_sample, io);
+            errs = errs + 1;
+         end
+         #4 sclk = 1'b0;
+         rx = {first_sample, second_sample};
+         if (rx !== expected[7:0]) begin
+            $display("FAIL byte %0d paused: got %02x expected %02x",
                      expected, rx, expected[7:0]);
             errs = errs + 1;
          end
@@ -35,6 +74,17 @@ module tb_spi_quad;
          #5;
          for (k = 0; k < count; k = k + 1)
             clock_byte(k);
+         #5 cs_n = 1'b1;
+         #20;
+      end
+   endtask
+   task automatic paused_frame(input integer count);
+      integer k;
+      begin
+         #20 cs_n = 1'b0;
+         #5;
+         for (k = 0; k < count; k = k + 1)
+            clock_byte_paused(k);
          #5 cs_n = 1'b1;
          #20;
       end
@@ -55,11 +105,12 @@ module tb_spi_quad;
       cs_high_quiet();
       cs_high_quiet();
       frame(256);
+      paused_frame(32);
       frame(4096);
       cs_high_quiet();
       cs_high_quiet();
       if (errs == 0)
-         $display("PASS tb_spi_quad: 4352 bytes plus CS-high checks match");
+         $display("PASS tb_spi_quad: 4384 bytes plus CS-high checks match");
       else
          $display("FAIL tb_spi_quad: %0d mismatches", errs);
       $finish;

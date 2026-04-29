@@ -11,17 +11,33 @@ module spi #(
    wire oe = ~cs_n;
    generate if (LANES == 4) begin : g_quad
       reg phase;
+      reg [3:0] dout_next;
+      reg [3:0] dout_present;
       initial phase = 1'b0;
+      initial dout_next = 4'd0;
+      initial dout_present = 4'd0;
       always @(posedge cs_n or posedge sclk) begin
          if (cs_n) begin
             data_byte <= 8'd0;
             phase     <= 1'b0;
+            dout_next <= 4'd0;
          end else begin
             phase <= ~phase;
-            if (phase) data_byte <= data_byte + 8'd1;
+            if (phase) begin
+               data_byte <= data_byte + 8'd1;
+               dout_next <= data_byte[7:4] + {3'b000, &data_byte[3:0]};
+            end else begin
+               dout_next <= data_byte[3:0];
+            end
          end
       end
-      assign dout_lane = phase ? data_byte[3:0] : data_byte[7:4];
+      always @(posedge cs_n or negedge sclk) begin
+         if (cs_n)
+            dout_present <= 4'd0;
+         else
+            dout_present <= dout_next;
+      end
+      assign dout_lane = dout_present;
    end else begin : g_one
       reg [2:0] phase;
       initial phase = 3'd0;

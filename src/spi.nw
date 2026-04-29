@@ -52,26 +52,30 @@ as `PIN_TYPE = 6'b100101` (output registered with output enable)
 and `NEG_TRIGGER = 1` so the IOB's output flop captures
 `D_OUT_0` on `negedge OUTPUT_CLK`. The 4-lane pads use
 `PIN_TYPE = 6'b101001`, keeping the explicit output enable but
-driving the nibble value unregistered. `OUTPUT_CLK = sclk`,
-`OUTPUT_ENABLE = ~cs_n`. In 1-lane mode the IOB flop is the
-negedge presenter: it captures the next bit half a cycle ahead of
-the master's mode-0 rising-edge sample point.
+driving the fabric-presented nibble without the IOB output flop.
+`OUTPUT_CLK = sclk`, `OUTPUT_ENABLE = ~cs_n`. In 1-lane mode the
+IOB flop is the negedge presenter: it captures the next bit half a
+cycle ahead of the master's mode-0 rising-edge sample point.
 
 === Lane data path
 
-The byte-pattern counter `data_byte` advances on `posedge sclk`
-and is synchronously cleared whenever `cs_n` is high at the
-rise. The output flop starts at the first bit/nibble of byte 0, so
-the first rising edge in a frame samples valid data even before any
-falling edge has occurred. The `phase` counter narrows per variant:
-3 bits for 1-lane (eight rises per byte, MSB-first), 1 bit for
-4-lane (two rises per byte, upper nibble first then lower).
+The byte-pattern counter `data_byte` advances after the master has
+sampled the final bit or nibble of each byte. In 1-lane mode that state
+update happens on the sampling `posedge sclk`, and the pad flop presents
+the next bit on the following falling edge. In 4-lane mode the stream
+state also advances on the sampling `posedge sclk`, and a small
+presenter register captures the next nibble on the following falling
+edge so it is stable for the next mode-0 rising edge sample. The output
+starts at the first bit/nibble of byte 0, so the first rising edge in a
+frame samples valid data. The `phase` counter narrows per variant:
+3 bits for 1-lane (eight rises per byte, MSB-first), 1 bit for 4-lane
+(two rises per byte, upper nibble first then lower).
 
-The combinational `dout_lane[3:0]` carries the current lane value.
-For 4-lane, every lane carries a real bit of the current nibble
-directly to an unregistered pad. For 1-lane, `dout_lane[0]` and
-`dout_lane[1]` both carry the data bit that the IOB flop will latch
-at the next negedge; the other two lanes are held low when enabled.
+The `dout_lane[3:0]` bus carries the current lane value. For 4-lane,
+every lane carries a registered bit of the current nibble directly to
+an unregistered pad. For 1-lane, `dout_lane[0]` and `dout_lane[1]` both
+carry the data bit that the IOB flop will latch at the next negedge; the
+other two lanes are held low when enabled.
 Both variants feed a
 single shared genvar loop that instantiates one `SB_IO` per pad, so
 the synthesis netlist contains exactly four explicit pad drivers and
@@ -103,11 +107,11 @@ wire oe = ~cs_n;
 
 The lane logic chunk holds the per-variant `phase` register,
 the edge counter, and the assignment that drives `dout_lane`
-from `data_byte` and `phase`. The stream state advances after each
-rising-edge sample, while the pad flops below present the already
-computed next value on the following falling edge. Raising `cs_n`
-asynchronously returns both variants to byte zero for the next
-transaction.
+from `data_byte` and `phase`. The stream state advances only after each
+mode-0 rising-edge sample point has observed the current value. In
+4-lane mode a presenter register, not the stream counter, updates on the
+following falling edge. Raising `cs_n` asynchronously returns both
+variants to byte zero for the next transaction.
 
 <<SPI streaming: lane logic>>=
 generate if (LANES == 4) begin : g_quad
@@ -124,17 +128,33 @@ the STM32MP1 QUADSPI indirect-read assembly of
 
 <<SPI streaming: quad lane>>=
 reg phase;
+reg [3:0] dout_next;
+reg [3:0] dout_present;
 initial phase = 1'b0;
+initial dout_next = 4'd0;
+initial dout_present = 4'd0;
 always @(posedge cs_n or posedge sclk) begin
    if (cs_n) begin
       data_byte <= 8'd0;
       phase     <= 1'b0;
+      dout_next <= 4'd0;
    end else begin
       phase <= ~phase;
-      if (phase) data_byte <= data_byte + 8'd1;
+      if (phase) begin
+         data_byte <= data_byte + 8'd1;
+         dout_next <= data_byte[7:4] + {3'b000, &data_byte[3:0]};
+      end else begin
+         dout_next <= data_byte[3:0];
+      end
    end
 end
-assign dout_lane = phase ? data_byte[3:0] : data_byte[7:4];
+always @(posedge cs_n or negedge sclk) begin
+   if (cs_n)
+      dout_present <= 4'd0;
+   else
+      dout_present <= dout_next;
+end
+assign dout_lane = dout_present;
 @
 
 For 1-lane the bit mux picks `data_byte[7 - phase]`, MSB-first,
@@ -165,10 +185,12 @@ mode, `NEG_TRIGGER` makes each output flop capture `dout_lane[g]` on
 SCLK falling edges, so pad transitions happen half a cycle ahead of
 the MP135 rising-edge sample without making the stream counter itself
 sensitive to falling edges. In 4-lane mode the pads are unregistered
-so the phase mux output reaches the pins directly. Keeping the stream
-counter on rising edges matters for long peripheral reads where SCLK
-can pause: repeated or idle falling-edge observations re-present the
-same computed value instead of advancing the byte stream.
+so the fabric presenter output reaches the pins directly; that presenter
+updates on falling edges, launching each nibble half a cycle ahead of
+the MP135 rising-edge sample. Keeping the stream counters on rising
+edges matters for long peripheral reads where SCLK can pause: repeated
+or idle falling-edge observations re-present the same computed value
+instead of advancing the byte stream.
 
 <<SPI streaming: io drivers>>=
 genvar g;
@@ -565,6 +587,9 @@ Two testbenches, one per `LANES` variant, share the same shape:
     frame wraps `data_byte[7:0]` sixteen times. The real bench
     streams one megabyte per frame, so the sim has to prove
     the counter rolls cleanly at every 256-byte boundary.
+  - **Quad paused frame.** The 4-lane bench also holds SCLK high and
+    low inside a short frame, modelling peripheral backpressure without
+    adding extra sample edges.
   - **CS-high quiet check, again.** Re-asserts that the slave
     releases the bus after the long frame closes.
 
@@ -670,11 +695,11 @@ initial begin
 end
 @
 
-The 4-lane TB mirrors the 1-lane shape exactly --- same four
-scenarios, same expected byte stream, same pull-up modelling,
-same `errs` accumulator --- but the sampler reads all four
-`io` lines on each rise and reassembles the byte as
-`{first_sample, second_sample}`.
+The 4-lane TB mirrors the 1-lane shape, expected byte stream,
+pull-up modelling, and `errs` accumulator, but the sampler reads all
+four `io` lines on each rise and reassembles the byte as
+`{first_sample, second_sample}`. It also adds a short paused frame to
+hold SCLK between sample edges.
 
 <<tb_spi_quad.sv>>=
 `timescale 1ns/1ps
@@ -705,14 +730,53 @@ reg [7:0]  rx;
 task automatic clock_byte(input integer expected);
    begin
       #5 sclk = 1'b1;
+      #1;
       first_sample = io;
-      #5 sclk = 1'b0;
+      #4 sclk = 1'b0;
       #5 sclk = 1'b1;
+      #1;
       second_sample = io;
-      #5 sclk = 1'b0;
+      #4 sclk = 1'b0;
       rx = {first_sample, second_sample};
       if (rx !== expected[7:0]) begin
          $display("FAIL byte %0d: got %02x expected %02x",
+                  expected, rx, expected[7:0]);
+         errs = errs + 1;
+      end
+   end
+endtask
+
+task automatic clock_byte_paused(input integer expected);
+   begin
+      #5 sclk = 1'b1;
+      #1;
+      first_sample = io;
+      #19;
+      if (io !== first_sample) begin
+         $display("FAIL byte %0d high-pause: io changed from %x to %x",
+                  expected, first_sample, io);
+         errs = errs + 1;
+      end
+      sclk = 1'b0;
+      #20;
+      if (io !== expected[3:0]) begin
+         $display("FAIL byte %0d low-pause: io=%x expected lower nibble %x",
+                  expected, io, expected[3:0]);
+         errs = errs + 1;
+      end
+      #5 sclk = 1'b1;
+      #1;
+      second_sample = io;
+      #19;
+      if (io !== second_sample) begin
+         $display("FAIL byte %0d high-pause 2: io changed from %x to %x",
+                  expected, second_sample, io);
+         errs = errs + 1;
+      end
+      #4 sclk = 1'b0;
+      rx = {first_sample, second_sample};
+      if (rx !== expected[7:0]) begin
+         $display("FAIL byte %0d paused: got %02x expected %02x",
                   expected, rx, expected[7:0]);
          errs = errs + 1;
       end
@@ -728,6 +792,17 @@ task automatic frame(input integer count);
       #5;
       for (k = 0; k < count; k = k + 1)
          clock_byte(k);
+      #5 cs_n = 1'b1;
+      #20;
+   end
+endtask
+task automatic paused_frame(input integer count);
+   integer k;
+   begin
+      #20 cs_n = 1'b0;
+      #5;
+      for (k = 0; k < count; k = k + 1)
+         clock_byte_paused(k);
       #5 cs_n = 1'b1;
       #20;
    end
@@ -751,11 +826,12 @@ initial begin
    cs_high_quiet();
    cs_high_quiet();
    frame(256);
+   paused_frame(32);
    frame(4096);
    cs_high_quiet();
    cs_high_quiet();
    if (errs == 0)
-      $display("PASS tb_spi_quad: 4352 bytes plus CS-high checks match");
+      $display("PASS tb_spi_quad: 4384 bytes plus CS-high checks match");
    else
       $display("FAIL tb_spi_quad: %0d mismatches", errs);
    $finish;
@@ -1113,6 +1189,21 @@ timeouts shrink with prescaler since the bench finishes faster
 at higher SCLK.
 
 <<TEST.md>>=
+Measure 128 KiB XOR timing on MP135 DDR.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="y 100\r"
+mp135:uart_expect sentinel="xor128" timeout_ms=20000
+mp135:uart_close
+```
+
+- Measure MP135 128 KiB XOR timing
+
 Phase 1 -- 1-lane sweep at presc=203.
 
 ```
@@ -1189,7 +1280,7 @@ mp135:uart_close
 
 - Check 1lane @ presc=5 pattern correct
 
-Phase 1 -- 1-lane MDMA read at presc=203.
+Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=203.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
@@ -1199,19 +1290,19 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 203\r"
 delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=40000
+mp135:uart_write data="A 1000000 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 1000000 B" timeout_ms=40000
 mark tag=bench_done
 mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=40000
 mp135:uart_close
 ```
 
-- Check 1lane MDMA @ presc=203 pattern correct
+- Check 1lane stream @ presc=203 pattern correct
 
-Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=255.
+Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=255.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
@@ -1221,18 +1312,19 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 255\r"
 delay ms=100
-mark tag=bench_start
 mp135:uart_write data="a 1\r"
 mp135:uart_expect sentinel="auto=on" timeout_ms=3000
-mp135:uart_write data="A 1048576 0 1 262144\r"
-mp135:uart_expect sentinel="stream 1048576 B" timeout_ms=20000
+mark tag=bench_start
+mp135:uart_write data="A 1048576 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 1048576 B" timeout_ms=20000
 mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=20000
 mp135:uart_close
 ```
 
 - Check 1lane stream @ presc=255 pattern correct
 
-Phase 1 -- 1-lane MDMA read at presc=63.
+Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=63.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
@@ -1242,19 +1334,19 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 63\r"
 delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=15000
+mp135:uart_write data="A 2097152 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 2097152 B" timeout_ms=15000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mp135:uart_close
 ```
 
-- Check 1lane MDMA @ presc=63 pattern correct
+- Check 1lane stream @ presc=63 pattern correct
 
-Phase 1 -- 1-lane MDMA read at presc=15.
+Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=15.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
@@ -1264,19 +1356,19 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 15\r"
 delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=12000
+mp135:uart_write data="A 1500000 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 1500000 B" timeout_ms=12000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=12000
 mp135:uart_close
 ```
 
-- Check 1lane MDMA @ presc=15 pattern correct
+- Check 1lane stream @ presc=15 pattern correct
 
-Phase 1 -- 1-lane MDMA read at presc=5.
+Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=5.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
@@ -1286,39 +1378,107 @@ mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 5 1\r"
 delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=6000
-mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
-mp135:uart_close
-```
-
-- Check 1lane MDMA @ presc=5 pattern correct
-
-Phase 1 -- 1-lane MDMA read at presc=5 wall-rate floor.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 5 1\r"
-delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
-mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=15000
+mp135:uart_write data="A 16842752 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 16842752 B" timeout_ms=15000
 mark tag=bench_done
 mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mp135:uart_close
 ```
 
-- Check 1lane MDMA @ presc=5 wall rate >= 100 Mbps
+- Check 1lane stream @ presc=5 pattern correct
+
+Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=5 wall-rate floor.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5 1\r"
+delay ms=100
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mark tag=bench_start
+mp135:uart_write data="A 33554432 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 33554432 B" timeout_ms=15000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135:uart_close
+```
+
+- Check 1lane stream @ presc=5 wall rate >= 100 Mbps
+
+Phase 1 -- 1-lane 512 MB ping-pong stream_xfer wall timing at presc=5.
+
+The 45 s transfer window is measured through the `stream_xfer` summary
+line. The pattern/CRC correctness check runs afterward and still must
+report `firsterr=-1`.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5 1\r"
+delay ms=100
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mark tag=bench_start
+mp135:uart_write data="A 512000000 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 512000000 B" timeout_ms=45000
+mark tag=bench_done
+mp135:uart_expect sentinel="stream 512000000 B" timeout_ms=45000
+mp135:uart_close
+```
+
+- Check 1lane stream @ presc=5 512 MB stream_xfer wall rate >= 100 Mbps within 45 s, then pattern correct
+
+Preflight -- quad software bit-bang read returns the SPI stream.
+
+Program the quad FPGA image here so the bit-bang diagnostic starts from
+a known lane-width bitstream before the peripheral path is exercised.
+
+```
+fpga:program bin=@spi_quad.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="k 16 1\r"
+mp135:uart_expect sentinel="bb read 16 (quad)" timeout_ms=5000
+delay ms=1000
+mp135:uart_close
+```
+
+- Check quad bit-bang read returns incrementing pattern
+
+Preflight -- quad peripheral raw read returns the SPI stream.
+
+Program the quad FPGA image here so the following 1 MiB sweep starts from
+a known lane-width bitstream.
+
+```
+fpga:program bin=@spi_quad.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 203\r"
+delay ms=100
+mp135:uart_write data="j 1024 1\r"
+mp135:uart_expect sentinel="raw read 1024 (quad)" timeout_ms=5000
+delay ms=1000
+mp135:uart_close
+```
+
+- Check quad peripheral raw read returns 1024-byte incrementing pattern
 
 Phase 2 -- 4-lane sweep at presc=203.
 
@@ -1399,6 +1559,116 @@ mp135:uart_close
 ```
 
 - Check quad @ presc=5 pattern correct
+
+MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=203.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 203\r"
+delay ms=100
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mark tag=bench_start
+mp135:uart_write data="m 1000000 0 1\r"
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=40000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=40000
+mp135:uart_close
+```
+
+- Check 1lane single-buffer DDR MDMA @ presc=203 pattern correct
+
+MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=63.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 63\r"
+delay ms=100
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mark tag=bench_start
+mp135:uart_write data="m 1000000 0 1\r"
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=15000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
+mp135:uart_close
+```
+
+- Check 1lane single-buffer DDR MDMA @ presc=63 pattern correct
+
+MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=15.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 15\r"
+delay ms=100
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mark tag=bench_start
+mp135:uart_write data="m 1000000 0 1\r"
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=12000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
+mp135:uart_close
+```
+
+- Check 1lane single-buffer DDR MDMA @ presc=15 pattern correct
+
+MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=5.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5 1\r"
+delay ms=100
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mark tag=bench_start
+mp135:uart_write data="m 1000000 0 1\r"
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=6000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
+mp135:uart_close
+```
+
+- Check 1lane single-buffer DDR MDMA @ presc=5 pattern correct
+
+MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=5 wall-rate floor.
+
+```
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5 1\r"
+delay ms=100
+mp135:uart_write data="o 1000000\r"
+mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mark tag=bench_start
+mp135:uart_write data="m 1000000 0 1\r"
+mp135:uart_expect sentinel="mdma_xfer" timeout_ms=15000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135:uart_close
+```
+
+- Check 1lane single-buffer DDR MDMA @ presc=5 wall rate >= 100 Mbps
 @
 
 The verifier walks the captured MP135 UART stream
@@ -1448,8 +1718,12 @@ STREAM_RE = re.compile(
     rb"stream\s+(\d+)\s+B\s+(1lane|quad)\s+in\s+"
     rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=([0-9a-f]+),\s+"
     rb"expect=([0-9a-f]+),\s+firsterr=(-?\d+),\s+chunk=(\d+),\s+"
-    rb"chunks=(\d+),\s+(?:buf=(sram|ddr),\s+)?auto=(on|off)"
+    rb"chunks=(\d+),\s+(?:buf=(sram|ddr|crc),\s+)?auto=(on|off)"
     rb"(?:,\s+presc=(\d+),\s+qspi_hz=(\d+))?")
+XOR128_RE = re.compile(
+    rb"xor128\s+len=(\d+)\s+iters=(\d+)\s+xor=([0-9a-f]+)\s+"
+    rb"cached=(\d+)\s+ms\s+cached_us_x1000=(\d+)\s+"
+    rb"cold=(\d+)\s+ms\s+cold_us_x1000=(\d+)")
 DEBUG_RE = re.compile(rb"SPI E=([0-9a-f]{4}) S=([0-9a-f]{8})")
 HEXLINE_RE = re.compile(rb"[0-9a-f]{8}:(?:\s+[0-9a-f]{2}){1,16}")
 HEXBYTE_RE = re.compile(rb"\b([0-9a-f]{2})\b")
@@ -1651,14 +1925,20 @@ def _mdma_pick(mode, byte_count=1000000):
     return last
 
 
-def _stream_pick(mode, byte_count=1048576):
+def _stream_pick(mode, byte_count=1048576, presc=None):
     raw = _read_uart()
     if raw is None:
         return None
     last = None
     for m in STREAM_RE.finditer(raw):
         if int(m.group(1)) == byte_count and m.group(2).decode() == mode:
-            last = m
+            if presc is None:
+                last = m
+                continue
+            if m.group(12) is None:
+                continue
+            if int(m.group(12)) == presc:
+                last = m
     return last
 
 
@@ -1689,20 +1969,52 @@ def _wall_rate_mbps(byte_count, wall_ms):
     return byte_count * 8.0 / (wall_ms * 1000.0)
 
 
-def _rate_bounds_mbps(mode, presc):
+STREAM_EFFECTIVE_RATE_FLOOR = 0.90
+STREAM_WALL_RATE_FLOOR = 0.90
+
+
+def _physical_max_mbps(mode, presc, qspi_hz=QSPI_KER_HZ):
     lanes = 4 if mode == "quad" else 1
-    max_rate = _sclk_mhz(presc) * lanes
+    return (qspi_hz / (presc + 1) / 1_000_000) * lanes
+
+
+def _rate_bounds_mbps(mode, presc):
+    max_rate = _physical_max_mbps(mode, presc)
     return 0.90 * max_rate, max_rate
 
 
 def _check_rate_bounds(label, mode, presc, rate, qspi_hz=QSPI_KER_HZ):
-    lanes = 4 if mode == "quad" else 1
-    max_rate = (qspi_hz / (presc + 1) / 1_000_000) * lanes
+    max_rate = _physical_max_mbps(mode, presc, qspi_hz)
     lo, hi = 0.90 * max_rate, max_rate
     if rate < lo or rate > hi:
         sys.stderr.write(
             f"{label}={rate:.3f}Mbps outside "
             f"{lo:.3f}..{hi:.3f}Mbps for {mode} presc={presc}\n")
+        return False
+    return True
+
+
+def _check_physical_ceiling(label, mode, presc, rate, qspi_hz):
+    max_rate = _physical_max_mbps(mode, presc, qspi_hz)
+    tolerance = max(0.001, max_rate * 0.001)
+    if rate > max_rate + tolerance:
+        sys.stderr.write(
+            f"{label}={rate:.3f}Mbps above physical ceiling "
+            f"{max_rate:.3f}Mbps for {mode} presc={presc}\n")
+        return False
+    return True
+
+
+def _check_physical_floor(label, mode, presc, rate, qspi_hz, floor):
+    max_rate = _physical_max_mbps(mode, presc, qspi_hz)
+    lo = floor * max_rate
+    tolerance = max(0.05, max_rate * 0.005)
+    if rate < lo - tolerance:
+        sys.stderr.write(
+            f"{label}={rate:.3f}Mbps below sanity floor "
+            f"{lo:.3f}Mbps ({floor:.0%} of physical, "
+            f"tolerance {tolerance:.3f}Mbps, "
+            f"{max_rate:.3f}Mbps) for {mode} presc={presc}\n")
         return False
     return True
 
@@ -1822,8 +2134,15 @@ def _check_rates(rate, mode, presc, effective, wall):
 
 
 def _check_rates_with_clock(rate, mode, presc, effective, wall, qspi_hz,
-                            print_rate=True):
-    if not _check_rate_bounds("effective", mode, presc, effective, qspi_hz):
+                            byte_count=None, print_rate=True,
+                            wall_floor_mbps=None):
+    if not _check_physical_ceiling("effective", mode, presc, effective,
+                                   qspi_hz):
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    if not _check_physical_floor("effective", mode, presc, effective,
+                                 qspi_hz, STREAM_EFFECTIVE_RATE_FLOOR):
         if print_rate:
             sys.stderr.write(rate + "\n")
         return False
@@ -1832,7 +2151,20 @@ def _check_rates_with_clock(rate, mode, presc, effective, wall, qspi_hz,
         if print_rate:
             sys.stderr.write(rate + "\n")
         return False
-    if not _check_rate_bounds("wall_rate", mode, presc, wall, qspi_hz):
+    if not _check_physical_ceiling("wall_rate", mode, presc, wall, qspi_hz):
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    if wall_floor_mbps is None:
+        if not _check_physical_floor("wall_rate", mode, presc, wall,
+                                     qspi_hz, STREAM_WALL_RATE_FLOOR):
+            if print_rate:
+                sys.stderr.write(rate + "\n")
+            return False
+    elif wall < wall_floor_mbps:
+        sys.stderr.write(
+            f"wall_rate={wall:.3f}Mbps below sanity floor "
+            f"{wall_floor_mbps:.3f}Mbps for {mode} presc={presc}\n")
         if print_rate:
             sys.stderr.write(rate + "\n")
         return False
@@ -1916,7 +2248,8 @@ def check_mdma_pattern(mode, presc):
     fe = int(m.group(7))
     rate = _mdma_rate_text(mode, presc, m)
     effective, wall = _mdma_rates(m)
-    _check_rates(rate, mode, presc, effective, wall)
+    if not _check_rates(rate, mode, presc, effective, wall):
+        return False
     if not _check_crc(f"{mode} MDMA presc={presc}", byte_count,
                       m.group(5).decode("ascii")):
         sys.stderr.write(rate + "\n")
@@ -1980,10 +2313,26 @@ def check_mdma_wall_rate_at_least(mode, presc, min_mbps):
     return True
 
 
-def check_stream_pattern(mode, presc, byte_count=1048576, max_wall_ms=None):
+def _check_stream_shape(rate, match, expected_chunk=None, min_chunks=None):
+    chunk = int(match.group(8))
+    chunks = int(match.group(9))
+    if expected_chunk is not None and chunk != expected_chunk:
+        sys.stderr.write(
+            f"{rate}: chunk={chunk} expected {expected_chunk}\n")
+        return False
+    if min_chunks is not None and chunks < min_chunks:
+        sys.stderr.write(
+            f"{rate}: chunks={chunks} below minimum {min_chunks}\n")
+        return False
+    return True
+
+
+def check_stream_pattern(mode, presc, byte_count=1048576, max_wall_ms=None,
+                         expected_chunk=None, min_chunks=None,
+                         wall_floor_mbps=None):
     if not v.check_no_errors():
         return False
-    m = _stream_pick(mode, byte_count)
+    m = _stream_pick(mode, byte_count, presc)
     if m is None:
         sys.stderr.write(f"no {mode} stream line for {byte_count} bytes\n")
         raw = _read_uart()
@@ -1998,8 +2347,11 @@ def check_stream_pattern(mode, presc, byte_count=1048576, max_wall_ms=None):
     effective, wall = _stream_rates(m)
     qspi_hz = int(m.group(13)) if m.group(13) is not None else QSPI_KER_HZ
     if not _check_rates_with_clock(rate, mode, presc, effective, wall,
-                                   qspi_hz, print_rate=False):
+                                   qspi_hz, byte_count,
+                                   print_rate=False,
+                                   wall_floor_mbps=wall_floor_mbps):
         sys.stderr.write(_stream_detail_block(mode, presc, m, wall))
+        return False
     if not _check_crc(f"{mode} stream presc={presc}", byte_count,
                       m.group(5).decode("ascii")):
         sys.stderr.write(rate + "\n")
@@ -2017,6 +2369,8 @@ def check_stream_pattern(mode, presc, byte_count=1048576, max_wall_ms=None):
     if m.group(11) != b"on":
         sys.stderr.write(f"{rate}: auto-consume is not on\n")
         return False
+    if not _check_stream_shape(rate, m, expected_chunk, min_chunks):
+        return False
     if max_wall_ms is not None:
         wall_ms = _bench_wall_ms()
         if wall_ms is None:
@@ -2031,10 +2385,13 @@ def check_stream_pattern(mode, presc, byte_count=1048576, max_wall_ms=None):
     return True
 
 
-def check_stream_wall_rate_at_least(mode, presc, min_mbps, byte_count=1000000):
-    if not check_stream_pattern(mode, presc, byte_count):
+def check_stream_wall_rate_at_least(mode, presc, min_mbps, byte_count=1000000,
+                                    max_wall_ms=None, expected_chunk=None,
+                                    min_chunks=None):
+    if not check_stream_pattern(mode, presc, byte_count, max_wall_ms,
+                                expected_chunk, min_chunks):
         return False
-    m = _stream_pick(mode, byte_count)
+    m = _stream_pick(mode, byte_count, presc)
     rate = _stream_rate_text(mode, presc, m)
     _effective, wall = _stream_rates(m)
     if wall is None:
@@ -2050,11 +2407,36 @@ def check_stream_wall_rate_at_least(mode, presc, min_mbps, byte_count=1000000):
     return True
 
 
+def check_xor128_timing():
+    if not v.check_no_errors():
+        return False
+    raw = _read_uart()
+    if raw is None:
+        return False
+    m = XOR128_RE.search(raw)
+    if m is None:
+        sys.stderr.write("no xor128 timing line\n")
+        sys.stderr.write(raw[-512:].decode("ascii", "replace") + "\n")
+        return False
+    length = int(m.group(1))
+    iters = int(m.group(2))
+    cached_ms = int(m.group(4))
+    cached_us_x1000 = int(m.group(5))
+    cold_ms = int(m.group(6))
+    cold_us_x1000 = int(m.group(7))
+    sys.stdout.write(
+        f"xor128 len={length} iters={iters} "
+        f"cached={cached_ms}ms ({cached_us_x1000 / 1000.0:.3f}us/half) "
+        f"cold={cold_ms}ms ({cold_us_x1000 / 1000.0:.3f}us/half)\n")
+    return length == 131072
+
+
 def _make_dispatch():
     """Generate one DISPATCH entry per (mode, presc) pair declared in
     the hardware test plan. Keys exactly match the TEST.md bullets."""
     presc_steps = [203, 63, 15, 5]
     out = {}
+    out["Measure MP135 128 KiB XOR timing"] = check_xor128_timing
     out["Check SPI header wiring via GPIO preflight"] = check_gpio_wiring
     out["Check 1lane bit-bang read returns incrementing pattern"] = (
         lambda: check_bitbang_pattern("1lane"))
@@ -2062,17 +2444,39 @@ def _make_dispatch():
         lambda: check_raw_read_pattern("1lane", 1024))
     out["Check 1lane peripheral raw read at presc=5 returns 512-byte incrementing pattern"] = (
         lambda: check_raw_read_pattern("1lane", 512))
-    out["Check 1lane MDMA @ presc=203 pattern correct"] = (
+    out["Check 1lane single-buffer DDR MDMA @ presc=203 pattern correct"] = (
         lambda: check_mdma_pattern("1lane", 203))
+    for p in [63, 15, 5]:
+        key = f"Check 1lane single-buffer DDR MDMA @ presc={p} pattern correct"
+        out[key] = (lambda pr=p: check_mdma_pattern("1lane", pr))
+    out["Check 1lane single-buffer DDR MDMA @ presc=5 wall rate >= 100 Mbps"] = (
+        lambda: check_mdma_wall_rate_at_least("1lane", 5, 100.0))
+    out["Check 1lane stream @ presc=203 pattern correct"] = (
+        lambda: check_stream_pattern("1lane", 203, 1000000))
     out["Check 1lane stream @ presc=255 pattern correct"] = (
         lambda: check_stream_pattern("1lane", 255))
-    for p in [63, 15, 5]:
-        key = f"Check 1lane MDMA @ presc={p} pattern correct"
-        out[key] = (lambda pr=p: check_mdma_pattern("1lane", pr))
-    out["Check 1lane MDMA @ presc=5 wall rate >= 100 Mbps"] = (
-        lambda: check_mdma_wall_rate_at_least("1lane", 5, 100.0))
+    out["Check 1lane stream @ presc=63 pattern correct"] = (
+        lambda: check_stream_pattern("1lane", 63, 2097152))
+    out["Check 1lane stream @ presc=15 pattern correct"] = (
+        lambda: check_stream_pattern("1lane", 15, 1500000,
+                                     wall_floor_mbps=32.0))
+    out["Check 1lane stream @ presc=5 pattern correct"] = (
+        lambda: check_stream_pattern("1lane", 5, 16842752,
+                                     expected_chunk=16777216,
+                                     min_chunks=2))
+    out["Check 1lane stream @ presc=5 wall rate >= 100 Mbps"] = (
+        lambda: check_stream_wall_rate_at_least("1lane", 5, 100.0, 33554432,
+                                                expected_chunk=16777216,
+                                                min_chunks=2))
+    out["Check 1lane stream @ presc=5 512 MB stream_xfer wall rate >= 100 Mbps within 45 s, then pattern correct"] = (
+        lambda: check_stream_wall_rate_at_least("1lane", 5, 100.0,
+                                                512000000, 45000,
+                                                expected_chunk=16777216,
+                                                min_chunks=31))
     out["Check quad bit-bang read returns incrementing pattern"] = (
         lambda: check_bitbang_pattern("quad"))
+    out["Check quad peripheral raw read returns 1024-byte incrementing pattern"] = (
+        lambda: check_raw_read_pattern("quad", 1024))
     out["Check FPGA UART debug reports first 32 SCLK edges"] = (
         check_debug_edges)
     out["Check FPGA UART debug first 32 IO1 samples are 00 01 02 03"] = (
