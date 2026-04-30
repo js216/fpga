@@ -1,5 +1,7 @@
 CHAPTERS := $(notdir $(basename $(wildcard src/*.nw)))
 
+chapter_src = src/$(1).nw
+
 # iCEstick defaults; override on command line.
 DEVICE  ?= hx1k
 PACKAGE ?= tq144
@@ -45,26 +47,26 @@ define CHAP_RULES
 build/$(1):
 	mkdir -p $$@
 
-build/$(1)/$(1).sby: src/$(1).nw | build/$(1)
+build/$(1)/$(1).sby: $$(call chapter_src,$(1)) | build/$(1)
 	cd build/$(1) && tangle $(1).sby < ../../$$<
 
-build/$(1)/$(1).mk: src/$(1).nw | build/$(1)
+build/$(1)/$(1).mk: $$(call chapter_src,$(1)) | build/$(1)
 	@cd build/$(1) && tangle $(1).mk < ../../$$< 2>/dev/null
 	@touch $$@
 
-build/$(1)/TEST.md: src/$(1).nw | build/$(1)
+build/$(1)/TEST.md: $$(call chapter_src,$(1)) | build/$(1)
 	@cd build/$(1) && tangle TEST.md < ../../$$< 2>/dev/null
 	@touch $$@
 
-build/$(1)/verify.py: src/$(1).nw | build/$(1)
+build/$(1)/verify.py: $$(call chapter_src,$(1)) | build/$(1)
 	@cd build/$(1) && tangle verify.py < ../../$$< 2>/dev/null
 	@touch $$@
 
-build/$(1)/Makefile: src/$(1).nw | build/$(1)
+build/$(1)/Makefile: $$(call chapter_src,$(1)) | build/$(1)
 	@cd build/$(1) && tangle Makefile < ../../$$< 2>/dev/null
 	@touch $$@
 
-build/$(1)/$(1).typ: src/$(1).nw style.typ | build/$(1)
+build/$(1)/$(1).typ: $$(call chapter_src,$(1)) style.typ | build/$(1)
 	cp style.typ $$@
 	weave < $$< >> $$@
 
@@ -98,7 +100,7 @@ MP135_QSPI_SRC := /home/claude/stm32mp135_test_board/baremetal/qspi
 
 stage: bitstream
 	@mkdir -p $(MP135_QSPI_DIR)
-	ln -sf $(CURDIR)/build/qspi/qspi.bin $(MP135_QSPI_DIR)/qspi.bin
+	ln -sf $(CURDIR)/build/jedec/jedec.bin $(MP135_QSPI_DIR)/jedec.bin
 	@mkdir -p $(CURDIR)/build/spi
 	ln -sf $(MP135_QSPI_DIR)/main.stm32 $(CURDIR)/build/spi/main.stm32
 	ln -sf $(MP135_QSPI_SRC)/flash.tsv  $(CURDIR)/build/spi/flash.tsv

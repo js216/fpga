@@ -55,7 +55,7 @@ example:
 - **uart**: 8N1 UART receiver, transmitter, and iCEstick echo demo
 - **gpio**: Verify and emit signals on GPIO pins
 - **spi**: Emulate a simple SPI and QSPI slave
-- **qspi**: Emulate a JEDEC QSPI flash interface
+- **jedec**: Emulate a JEDEC QSPI flash interface
 - **cordic**: CORDIC sine/cosine generator
 
 ### SPI Hardware Notes

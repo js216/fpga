@@ -229,7 +229,7 @@ end endgenerate
 
 === Pin map
 
-iCEstick pin numbers, mirroring the `qspi` chapter so the same
+iCEstick pin numbers, mirroring the `jedec` chapter so the same
 physical wires reach the MP135 `CN8` connector.
 
 <<spi.pcf>>=
@@ -1041,8 +1041,8 @@ build/spi/spi_quad.bin: build/spi/spi_quad.asc
 build/spi/spi_quad_framed.bin: build/spi/spi_quad_framed.asc
 	cd build/spi && icepack spi_quad_framed.asc spi_quad_framed.bin
 
-build/spi/qspi.bin: build/qspi/qspi.bin | build/spi
-	ln -sf ../qspi/qspi.bin $@
+build/spi/jedec.bin: build/jedec/jedec.bin | build/spi
+	ln -sf ../jedec/jedec.bin $@
 
 build/spi/gpio.bin: build/gpio/gpio.bin | build/spi
 	cp $< $@
@@ -1091,7 +1091,7 @@ build/spi/netlist_check: build/spi/check_spi_netlist.py build/spi/spi_1lane.json
 	cd build/spi && python3 check_spi_netlist.py spi_1lane.json:1 spi_quad.json:4 spi_quad_framed.json:4
 	@touch $@
 
-bitstream: build/spi/spi_1lane.bin build/spi/spi_quad.bin build/spi/qspi.bin
+bitstream: build/spi/spi_1lane.bin build/spi/spi_quad.bin build/spi/jedec.bin
 sim: build/spi/sim_1lane build/spi/sim_quad build/spi/netlist_check
 @
 
@@ -1485,7 +1485,7 @@ uses 0x6B framing but returns one-hot nibbles on IO[3:0].
 
 ```
 fpga:open
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1513,7 +1513,7 @@ value across both quad sample edges.
 
 ```
 fpga:open
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1541,7 +1541,7 @@ continuous 0,1,2,...,f nibble ramp. STM32 byte assembly should return
 
 ```
 fpga:open
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1568,7 +1568,7 @@ a known lane-width bitstream.
 
 ```
 fpga:open
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1591,7 +1591,7 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=203.
 
 ```
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1611,7 +1611,7 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=63.
 
 ```
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1631,7 +1631,7 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=15.
 
 ```
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1651,7 +1651,7 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=5.
 
 ```
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1675,7 +1675,7 @@ short repeated byte sequence around the failing 06/07/08 region.
 
 ```
 fpga:open
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1697,12 +1697,12 @@ mp135:uart_close
 
 Preflight -- quad software bit-bang read returns the SPI stream.
 
-Program the command-aware QSPI FPGA image here so the bit-bang diagnostic
+Program the command-aware JEDEC FPGA image here so the bit-bang diagnostic
 exercises the same slave protocol used by the peripheral path.
 
 ```
 fpga:open
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -2991,7 +2991,7 @@ test: all bitstreams
 	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi --log run_md.log
 
 bitstreams:
-	$(MAKE) -C ../.. build/spi/pin_preflight build/spi/spi_1lane.bin build/spi/spi_quad.bin build/spi/qspi.bin
+	$(MAKE) -C ../.. build/spi/pin_preflight build/spi/spi_1lane.bin build/spi/spi_quad.bin build/spi/jedec.bin
 
 bitstream: bitstreams
 
