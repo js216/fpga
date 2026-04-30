@@ -1,7 +1,5 @@
 *.swp
 
-.claude
-.codex
 build
 doc
 __pycache__
