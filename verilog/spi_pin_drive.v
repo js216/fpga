@@ -27,6 +27,7 @@ module spi_pin_walk #(
          count <= count + 1'b1;
 
    wire drive = count >= BOOT_TICKS;
+   wire [5:0] unused_d_in;
    wire [27:0] after_boot = count - BOOT_TICKS;
    wire [2:0] slot =
       (after_boot < 1 * STEP_TICKS) ? 3'd0 :
@@ -51,17 +52,17 @@ module spi_pin_walk #(
 
    SB_IO #(.PIN_TYPE(6'b100101)) i_sclk (
       .PACKAGE_PIN(sclk), .OUTPUT_CLK(clk),
-      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[0])
+      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[0]), .D_IN_0(unused_d_in[0])
    );
    SB_IO #(.PIN_TYPE(6'b100101)) i_cs_n (
       .PACKAGE_PIN(cs_n), .OUTPUT_CLK(clk),
-      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[1])
+      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[1]), .D_IN_0(unused_d_in[1])
    );
    genvar w;
    generate for (w=0; w<4; w=w+1) begin : w_io
       SB_IO #(.PIN_TYPE(6'b100101)) iob (
          .PACKAGE_PIN(io[w]), .OUTPUT_CLK(clk),
-         .OUTPUT_ENABLE(drive), .D_OUT_0(mask[w + 2])
+         .OUTPUT_ENABLE(drive), .D_OUT_0(mask[w + 2]), .D_IN_0(unused_d_in[w + 2])
       );
    end endgenerate
 endmodule

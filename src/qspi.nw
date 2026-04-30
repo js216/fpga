@@ -62,16 +62,19 @@ The clock-domain partition:
   `addr_low`, RAM writes, CRC, `qin_phase`, `nibble_buf`,
   `quad_in_cnt`) is clocked on `posedge sclk` with `cs_async_rst`
   as an asynchronous clear so the first frame after CS-fall starts
-  cleanly. `cs_async_rst` is taken from the *output* of `cs_s_d`
-  (the second-stage delayed mirror of `cs_s`), not directly from
-  `cs_n`. This keeps the asynchronous clear strictly later than
-  the synchronous snapshot trigger (`cs_rise_pulse`, which fires
-  one fclk earlier), so the snapshot always captures the
-  pre-clear value of the source registers.
-- All slave-driven outputs (`shift_out` shift-register tap into
-  `miso_out`, `quad_out`) are clocked on `negedge sclk` so data is
-  stable on the wire before the master's next rising-edge sample
-  (mode 0).
+  cleanly. Raw `cs_n` falling releases `cs_async_rst` immediately
+  so the sclk-domain flops are ready before the first SCLK edge.
+  On CS rise, `cs_async_rst` is reasserted from the *output* of
+  `cs_s_d` (the second-stage delayed mirror of `cs_s`), not
+  directly from `cs_n`. This keeps the asynchronous clear strictly
+  later than the synchronous snapshot trigger (`cs_rise_pulse`,
+  which fires one fclk earlier), so the snapshot always captures
+  the pre-clear value of the source registers.
+- Single-lane response data is precomputed on `posedge sclk`, then
+  presented by a fabric `negedge sclk` register named `io_pad_out`.
+  Quad responses likewise precompute their next pad value on
+  `posedge sclk`, then capture `io_pad_src` into `io_pad_out`. The
+  `SB_IO` cells are unregistered bidirectional pads.
 - There is no flash-data backing store: read responses come
   from the `data_byte` pattern counter described in the
   streaming-pattern section below. Page Program (0x02) and Quad
@@ -116,13 +119,12 @@ shortens the sclk-domain critical path; sixteen bits of `byte_cnt`
 are still wide enough for the printer's modulo-100 display.
 `addr_low` indexes the 16-byte page buffer (still used by 0x02
 and 0x32 page-program writes). `data_byte` is the 8-bit pattern
-counter that drives 0x03 / 0x0B / 0x6B response data: it is
-loaded with the captured low byte of the 24-bit address on the
-phase 3 boundary and increments once per emitted output byte,
-giving the deterministic `byte = address[7:0]` pattern. A single
-register serves both the single-lane (0x03 / 0x0B) and
-quad-lane (0x6B) read paths so the increment cadence is
-unambiguously owned by one always block. `quad_in_cnt`,
+counter for 0x03 / 0x0B single-lane response data and the captured
+address-low seed for 0x6B. The quad-output path copies that seed
+into `quad_data_byte` on the quad start boundary, then owns its own
+upper/lower nibble cadence and once-per-byte increment for the rest
+of the 0x6B data phase.
+`quad_in_cnt`,
 `nibble_buf`, and `qin_phase` are state owned by the 0x32 quad
 page-program data phase but declared here because the same
 `always @(posedge sclk)` block writes them.
@@ -178,7 +180,8 @@ sclk edges are masked by the held reset. The body splits into a reset arm and a 
 arm; the per-rise arm itself decomposes into the byte-rate shift
 input, the default left-shift of `shift_out` between byte loads,
 the inferred-RAM write statement, the 0x32 quad-input data phase,
-and the byte-boundary opcode dispatch.
+the 0x6B quad-output precompute, and the byte-boundary opcode
+dispatch.
 
 <<SPI: shift engine sclk process>>=
 always @(posedge sclk or posedge cs_async_rst) begin
@@ -189,7 +192,7 @@ always @(posedge sclk or posedge cs_async_rst) begin
       <<SPI: shift out default>>
       <<SPI: RAM write at boundaries>>
       <<SPI: quad input data phase>>
-      <<SPI: quad output pattern increment>>
+      <<SPI: quad output nibble precompute>>
       <<SPI: single-lane data-phase increment>>
       <<SPI: byte boundary actions>>
    end
@@ -213,26 +216,97 @@ if (byte_done && (   (opcode == 8'h03 && phase_cnt >  3'd3)
    data_byte <= data_byte + 8'd1;
 @
 
-For 0x6B Quad Output Read the slave emits one pattern byte every
-two sclk rises (one rise per nibble). The pattern counter
-`data_byte` therefore must increment once per quad byte ---
-specifically on the rise that completes a byte's lower-nibble
-sample (the second of the byte's two rises), so that the next
-negedge drives the upper nibble of the new byte. `bit_cnt[0]`
-in the data phase is high on exactly those rises (the second,
-fourth, sixth, eighth rise of every 8-rise span maps cleanly to
-the second rise of each two-rise quad byte), so it doubles as
-both the increment trigger and the negedge presenter's
-nibble-select. Putting the increment in its own chunk inside
-the shift engine's posedge process keeps a single writer site
-for the quad cadence: the dispatch chunk loads `data_byte` on
-the address boundary; this chunk advances it during the data
-phase. The conditions are mutually exclusive --- the dispatch
-phase-3 load and the data-phase increment share `byte_done` but
-gate on different `phase_cnt` values.
+For 0x6B Quad Output Read the slave emits each logical byte upper
+nibble then lower nibble, so a master that pairs the launched nibbles
+in pad-visible order captures the incrementing byte pattern. The
+stream emits one pattern byte every two sclk rises (one rise per
+nibble).
+Opcode 0x6C uses the same framing but emits the diagnostic one-hot nibble stream
+1,2,4,8,... so the STM32 capture can distinguish lane loss from
+nibble phase slip. Opcode 0x6D uses the same framing again but
+emits the nibble diagnostic sequence 0,6,0,7,0,8,0,9,0,a,0,b,0,c,0,d,...
+to separate byte-index/FIFO-boundary faults from value-transition
+faults. Opcode 0x6E emits 00,11,22,...,ff repeatedly so each quad
+nibble value is held for both sample edges in one byte. Opcode 0x6F
+emits the continuous nibble ramp 0,1,2,...,f,0,... to isolate
+nibble-to-nibble transition timing from byte-boundary effects. The
+post-dummy byte boundary explicitly starts the quad stream: the posedge precompute
+captures the first quad byte and prepares its first pad nibble before
+the first data-phase negedge. For 0x6B, that first pad nibble is the
+seed upper nibble; the following data-phase rises emit the seed lower
+nibble, advance the byte, then emit the next byte's upper nibble.
+Diagnostics keep their existing nibble order. A quad-owned
+`quad_active` latch owns the ongoing data-phase qualifier after
+the one-cycle start boundary. For the byte-oriented quad responses, `quad_hi_next` tracks the
+upper/lower cadence instead of deriving it from `bit_cnt[0]`,
+keeping the quad output phase independent of the single-lane
+shift counter and shared `data_byte` cadence.
 
-<<SPI: quad output pattern increment>>=
-if (quad_advance) data_byte <= data_byte + 8'd1;
+<<SPI: quad output nibble precompute>>=
+if (quad_start) begin
+   quad_active       <= 1'b1;
+   quad_data_drive_r <= 1'b1;
+   if (opcode == 8'h6C) begin
+      quad_next_nibble  <= quad_onehot(2'd0);
+      quad_diag_idx     <= 4'd1;
+      quad_data_byte    <= 8'h00;
+   end else if (opcode == 8'h6D) begin
+      quad_next_nibble  <= 4'h0;
+      quad_diag_idx     <= 4'd1;
+   end else if (opcode == 8'h6E) begin
+      quad_next_nibble  <= 4'h0;
+      quad_diag_idx     <= 4'd0;
+      quad_data_byte    <= 8'h00;
+   end else if (opcode == 8'h6F) begin
+      quad_next_nibble  <= 4'h0;
+      quad_diag_idx     <= 4'd0;
+      quad_data_byte    <= 8'h00;
+   end else begin
+      quad_next_nibble  <= quad_data_byte_seed[7:4];
+      quad_diag_idx     <= 4'd0;
+      quad_data_byte    <= quad_data_byte_seed;
+   end
+   quad_hi_next      <= 1'b0;
+end else if (quad_data) begin
+   quad_data_drive_r <= 1'b1;
+   if (opcode == 8'h6C) begin
+      quad_next_nibble <= quad_onehot(quad_diag_idx[1:0]);
+      quad_diag_idx    <= quad_diag_idx + 4'd1;
+   end else if (opcode == 8'h6D) begin
+      quad_next_nibble <= quad_diag6d_nibble;
+      quad_diag_idx    <= quad_diag_idx + 4'd1;
+   end else if (opcode == 8'h6F) begin
+      quad_next_nibble <= quad_next_nibble + 4'd1;
+   end else if (opcode == 8'h6B) begin
+      if (quad_hi_next) begin
+         quad_next_nibble <= quad_data_byte_inc[7:4];
+         quad_data_byte   <= quad_data_byte_inc;
+         quad_hi_next     <= 1'b0;
+      end else begin
+         quad_next_nibble <= quad_data_byte[3:0];
+         quad_hi_next     <= 1'b1;
+      end
+   end else begin
+      if (quad_hi_next) begin
+         if (opcode == 8'h6E) begin
+            quad_next_nibble <= quad_hold_byte_inc[7:4];
+            quad_data_byte   <= quad_hold_byte_inc;
+         end else begin
+            quad_next_nibble <= quad_data_byte_inc[7:4];
+            quad_data_byte   <= quad_data_byte_inc;
+         end
+         quad_hi_next     <= 1'b0;
+      end else begin
+         quad_next_nibble <= quad_data_byte[3:0];
+         quad_hi_next     <= 1'b1;
+      end
+   end
+end else begin
+   quad_active       <= 1'b0;
+   quad_data_drive_r <= 1'b0;
+   quad_hi_next      <= 1'b0;
+   quad_diag_idx     <= 4'd0;
+end
 @
 
 <<SPI: shift engine reset>>=
@@ -248,6 +322,12 @@ qin_phase   <= 0;
 quad_in_cnt <= 0;
 nibble_buf  <= 0;
 sfdp_idx    <= 0;
+quad_active       <= 0;
+quad_next_nibble  <= 0;
+quad_data_byte    <= 0;
+quad_data_drive_r <= 0;
+quad_hi_next      <= 0;
+quad_diag_idx     <= 0;
 @
 
 The single-lane MOSI bit arrives on `io[0]`. We append it to the
@@ -329,9 +409,9 @@ first response byte); 0x02 Page Program (latch RAM-buffer
 address, increment under WEL gating); 0x32 Quad Page Program
 (only the RAM-buffer address latch lives here; the data-phase
 write is the quad-input chunk above); 0x6B Quad Output Read
-(latch the address LSB into `data_byte` --- the quad-output
-engine consumes it directly, and the per-rise quad pattern
-increment chunk advances it during the data phase); and 0x5A
+(latch the address LSB into `data_byte` as the pattern seed that
+`quad_start` copies into `quad_data_byte` after the dummy byte);
+and 0x5A
 SFDP Read (latch the low 7 bits of the 24-bit address into
 `sfdp_idx` on byte 3, then on byte 4 onwards present
 `sfdp_rom[sfdp_idx]` as the next response byte and
@@ -499,15 +579,11 @@ end
 wire [7:0] sfdp_rd = sfdp_rom[sfdp_idx];
 @
 
-MISO output is the high bit of `shift_out` driven combinationally
-to `io[1]` via the IO drivers chunk. `shift_out` itself is
-registered on `posedge sclk`, so the path from flop to pin is just
-combinational mux + IO buffer; the master gets a full SCLK period
-to see the bit before its next rising-edge sample. Mode 0 timing
-holds because the rise that loads the next byte simultaneously
-presents bit 7 on the wire (clk-to-Q + IO delay), which is well
-within a half-period at the iCE40 IO speeds we care about (under
-100 MHz SCLK).
+MISO output is the high bit of `shift_out` driven into the `io[1]`
+pad through the IO drivers chunk. `shift_out` itself is registered on
+`posedge sclk`, and the fabric `io_pad_out` presenter captures it on
+the following `negedge sclk`, matching mode-0 output timing before
+the unregistered pad drives the pin.
 @
 
 Write Enable Latch (WEL). With the streaming pattern source in
@@ -532,13 +608,15 @@ more sclk edges arrive until the next CS-fall), so reading them
 from the fclk domain on this single pulse is safe.
 
 The sclk-domain reset arm is driven by `cs_async_rst`, an fclk
-flop whose D input is `cs_n`, rather than by `cs_n` directly. This
-keeps `cs_n` purely sync-read (the cs_sync chain) and
-`cs_async_rst` purely async-edge sensitive, so the two roles do
-not collide on a single net. The cost is one fclk cycle of
-latency on cs-rise/cs-fall to the sclk-domain reset --- well
-within the master's CS-fall-to-first-SCLK setup at the SCLK
-rates this slave targets.
+flop with an asynchronous raw-`cs_n` fall release and a delayed
+synchronized reassertion on CS rise. This lets each new transaction
+leave reset immediately when the master asserts CS, while preserving
+the delayed CS-rise clear that gives the fclk snapshot block a full
+cycle to copy the completed frame before the sclk-domain source
+flops are cleared. Verilator's `SYNCASYNCNET` warning is waived
+locally around this block because that mixed use of `cs_n` is the
+point of the circuit: raw fall is the reset-release path, while
+the sampled chain owns CS-rise detection and reset reassertion.
 
 <<SPI: page buffer and WEL>>=
 <<SPI: page buffer storage>>
@@ -554,6 +632,7 @@ end
 @
 
 <<SPI: cs_n CDC chain>>=
+/* verilator lint_off SYNCASYNCNET */
 reg [1:0] cs_sync;
 initial cs_sync = 2'b11;
 always @(posedge clk) cs_sync <= {cs_sync[0], cs_n};
@@ -565,7 +644,13 @@ wire cs_rise_pulse = !cs_s_d && cs_s;
 
 reg cs_async_rst;
 initial cs_async_rst = 1'b1;
-always @(posedge clk) cs_async_rst <= cs_s_d;
+always @(posedge clk or negedge cs_n) begin
+   if (!cs_n)
+      cs_async_rst <= 1'b0;
+   else
+      cs_async_rst <= cs_s_d;
+end
+/* verilator lint_on SYNCASYNCNET */
 @
 
 <<SPI: WEL update>>=
@@ -582,135 +667,131 @@ end
 @
 
 For 0x6B Quad Output Read the FPGA drives all four IO pins during
-the data phase at one nibble per SCLK cycle: LOWER nibble on the
-first cycle of a data byte, UPPER nibble on the second. The
-STM32MP1 QUADSPI peripheral in indirect-read quad mode assembles
-each byte as `{second_sample, first_sample}`, which makes
-"lower-first" the correct slave drive order; driving "upper-first"
-(the default JEDEC assumption) appears on the master as a per-byte
-nibble swap (`0x01` shows up as `0x10`). Each nibble is presented
-on the preceding SCLK falling edge so the master samples stable
-data on the rising edge (mode 0). Each data byte therefore takes
-2 SCLK cycles = 2 `bit_cnt` increments = a quarter of a
-single-lane byte period; `byte_cnt` still counts single-lane
-SCLK-bytes, so sixteen quad data bytes show up as four `byte_cnt`
-increments in the printer's `bytes=` field.
+the data phase at one nibble per SCLK cycle. The real 0x6B stream
+drives the UPPER and LOWER nibbles of each logical byte in pad-visible
+order, matching the STM32MP1 QUADSPI byte assembly seen on hardware.
+Diagnostic opcodes 0x6C, 0x6D, 0x6E, and 0x6F keep their existing
+pad-visible nibble order so their lane
+and phase probes remain comparable across builds. Each nibble is presented on the
+preceding SCLK falling edge so the master samples stable data on the
+rising edge (mode 0). Each data byte therefore takes 2 SCLK cycles =
+2 `bit_cnt` increments = a quarter of a single-lane byte period;
+`byte_cnt` still counts single-lane SCLK-bytes, so sixteen quad data
+bytes show up as four `byte_cnt` increments in the printer's
+`bytes=` field.
 
-The engine partitions into state, the data-phase qualifier
-`quad_data`, and a negedge presenter that slices `data_byte`
-directly into nibbles. There is no separate `quad_byte` mirror
-register: `data_byte` (which already holds the running pattern
-value as a single sclk-domain register written by the shift
-engine) is sliced live by the presenter on each negedge.
-Eliminating the mirror also eliminates the off-by-one byte that
-arose when the mirror's load edge and the presenter's slice
-edge were not phase-locked, which the iCE40 silicon exposed as
-a `{byte_N_lower, byte_N_upper}` nibble swap on every
-post-first byte of a streamed 0x6B read.
+The engine partitions into state, the data-phase qualifiers, the
+posedge-precomputed pad source, and the fabric negedge presenter.
+For 0x6B, `quad_start` loads the captured address-low pattern seed
+into `quad_data_byte` and emits the upper nibble first. The shared
+byte-oriented quad cadence then emits the lower nibble, advances the
+byte, and emits the next upper nibble. This keeps 0x6B independent
+from the single-lane `data_byte` update path while preserving the
+diagnostic opcodes' original nibble cadence.
 
 <<SPI: quad output engine>>=
 <<SPI: quad output state>>
 <<SPI: quad output qualifiers>>
-<<SPI: quad output nibble precompute>>
-<<SPI: quad output negedge presenter>>
+<<SPI: quad output pad source>>
+<<SPI: quad output pad presenter>>
 @
 
-`quad_out` is the registered nibble the presenter places on
-`io[3:0]` each negedge of the data phase. No additional state
-is needed: the upper-vs-lower nibble select reads `bit_cnt[0]`
-(the same per-rise counter the shift engine already maintains)
-and the byte being driven is the live `data_byte` value.
+`quad_next_nibble` is the precomputed nibble the pad data mux drives
+on `io[3:0]` during the quad data phase. `quad_data_byte` and
+`quad_hi_next` track the byte-oriented 0x6B stream and diagnostic
+streams such as 0x6E.
+`quad_diag_idx` advances the 0x6C and
+0x6D diagnostic nibble sequences.
 
 <<SPI: quad output state>>=
-reg [3:0] quad_out;
 reg [3:0] quad_next_nibble;
+reg [7:0] quad_data_byte;
+reg       quad_data_drive_r;
+reg       quad_hi_next;
+reg       quad_active;
+reg [3:0] quad_diag_idx;
+wire [3:0] quad_diag6d_nibble =
+   quad_diag_idx[0] ? (4'h6 + {1'b0, quad_diag_idx[3:1]}) : 4'h0;
 initial begin
-   quad_out         = 0;
-   quad_next_nibble = 0;
+   quad_next_nibble   = 0;
+   quad_data_byte     = 0;
+   quad_data_drive_r  = 0;
+   quad_hi_next        = 0;
+   quad_active         = 0;
+   quad_diag_idx       = 0;
 end
+
+function automatic [3:0] quad_onehot(input [1:0] idx);
+   case (idx)
+      2'd0: quad_onehot = 4'h1;
+      2'd1: quad_onehot = 4'h2;
+      2'd2: quad_onehot = 4'h4;
+      default: quad_onehot = 4'h8;
+   endcase
+endfunction
 @
 
-`quad_data` is high during the 0x6B data phase only --- after
+`quad_data` is high during the quad output data phase only --- after
 the opcode, three address bytes, and dummy byte (five
-single-lane SCLK-bytes). `phase_cnt` saturates at 7, which
-still satisfies `>= 5` for every subsequent byte, so the
-qualifier needs no additional latch.
-
-`quad_advance` fires once per quad byte at the rise that
-completes the byte's lower-nibble sample (the rise immediately
-after the negedge that drove the lower nibble). With the data
-phase aligned to a single-lane byte boundary --- both
-`bit_cnt` and `phase_cnt` advance in lockstep with the
-single-lane shift engine --- `bit_cnt[0]` is high on rises 1,
-3, 5, 7 of the eight-rise span, which are exactly the second
-rises of consecutive two-rise quad bytes. Using `bit_cnt[0]`
-directly removes the dedicated `quad_byte_phase` toggle and
-collapses the increment trigger and the negedge nibble-select
-onto the same well-defined sclk-domain bit.
+single-lane SCLK-bytes). `quad_start` fires on the byte boundary
+that ends the 0x6B/0x6C/0x6D/0x6E/0x6F dummy byte; that one-cycle transition primes
+the first pad nibble, sets `quad_active`, and enables the quad
+output drivers before the first data-phase negedge. The latched
+active qualifier then stays high for the rest of the selected
+frame instead of being re-derived from the saturating byte-phase
+counter. `quad_data_byte_inc` and `quad_hold_byte_inc` advance the
+byte-oriented diagnostic streams.
 
 <<SPI: quad output qualifiers>>=
-wire quad_data    = (opcode == 8'h6B) && (phase_cnt >= 3'd5);
-wire quad_advance = quad_data && bit_cnt[0];
+wire       quad_data     = quad_active;
+wire       quad_start    = byte_done && phase_cnt == 3'd4
+                        && (opcode == 8'h6B || opcode == 8'h6C
+                         || opcode == 8'h6D || opcode == 8'h6E
+                         || opcode == 8'h6F);
+wire [7:0] quad_data_byte_seed = data_byte;
+wire [7:0] quad_data_byte_inc = quad_data_byte + 8'd1;
+wire [7:0] quad_hold_byte_inc = (quad_data_byte == 8'hFF)
+                              ? 8'h00 : (quad_data_byte + 8'h11);
 @
 
-The negedge presenter is split into a posedge precompute and
-a half-cycle-later registered drive. The precompute runs in
-the sclk-posedge process and produces `quad_next_nibble` ---
-the 4-bit value the next negedge will place on `io[3:0]`. By
-the time the next negedge fires, the value is already a stable
-posedge-domain register output; the negedge presenter is a
-trivial `quad_out <= quad_next_nibble`, which keeps the
-posedge-to-negedge path (the half-period-budget critical path)
-down to a single flop hop.
+The pad source is fed by a posedge precompute inside the shift engine.
+The precompute produces `quad_next_nibble` --- the 4-bit quad value
+driven directly on `io[3:0]` during the quad data phase. Lane 1 selects
+either that quad bit or the serial `shift_out[7]` bit; outside quad data,
+the serial response path still uses the falling-edge presenter.
 
-The precompute decides upper-vs-lower from `~bit_cnt[0]`
-(the value `bit_cnt[0]` will have post-rise: the upcoming
-negedge sees that). It selects the nibble out of `data_byte`,
-biased by an unconditional advance increment when `quad_advance`
-is asserted on this same edge --- so the byte index used by
-the precompute matches the byte index `data_byte` will hold
-post-rise, eliminating the off-by-one byte that any
-non-coherent prefetch arrangement leaks.
+The precompute uses explicit phase flops to select upper-vs-lower
+nibbles. The dummy-to-data `quad_start` edge stages the captured
+address-low seed and prepares the first pad nibble. For 0x6B that
+first nibble is the seed upper nibble; diagnostics keep their
+established pad-visible cadence.
 
-<<SPI: quad output nibble precompute>>=
-// `data_byte_next_quad` is the value `data_byte` will hold
-// after this posedge (which `quad_next_nibble` must slice
-// from, so the negedge half a cycle later drives a value
-// consistent with the new byte index).
-wire [7:0] data_byte_next_quad =
-   data_byte + (quad_advance ? 8'd1 : 8'd0);
+<<SPI: quad output pad source>>=
+wire [3:0] io_pad_src = {
+   quad_next_nibble[3],
+   quad_next_nibble[2],
+   quad_data_drive ? quad_next_nibble[1] : shift_out[7],
+   quad_next_nibble[0]
+};
+@
 
-// `quad_data_post` is the post-rise value of `quad_data`. It
-// is needed to prime `quad_next_nibble` on the rise that ENDS
-// the dummy byte (where `quad_data` is still 0 pre-rise but 1
-// post-rise) so the very first negedge of the data phase has
-// a valid upper-nibble of byte 0 already loaded into the
-// presenter's source register.
-wire quad_data_post = quad_data
-   || (byte_done && phase_cnt == 3'd4 && opcode == 8'h6B);
+The falling-edge presenter is the registered launch point for all
+slave-driven data. It captures the posedge-precomputed `io_pad_src`
+for single-lane and quad responses. `io_pad_selected` names the
+registered source connected to the pad data wires, so the debug
+sampler and physical output mux stay consistent.
 
-always @(posedge sclk or posedge cs_async_rst) begin
-   if (cs_async_rst) begin
-      quad_next_nibble <= 4'b0;
-   end else if (quad_data_post) begin
-      // STM32MP1 QUADSPI indirect-read assembles each byte as
-      // {second_sample[3:0], first_sample[3:0]} -- the FIRST
-      // negedge of a byte cycle drives the LOWER nibble and the
-      // second drives the UPPER. Post-rise bit_cnt[0] is the
-      // inverse of the pre-rise value: pre-rise 1 (the rise that
-      // completes the dummy byte or a quad-byte cycle) gives
-      // post-rise 0, which is the "first negedge of the next
-      // byte" slot, and the lower nibble is what we drive there.
-      if (bit_cnt[0] == 1'b1) quad_next_nibble <= data_byte_next_quad[3:0];
-      else                    quad_next_nibble <= data_byte_next_quad[7:4];
-   end
+<<SPI: quad output pad presenter>>=
+reg [3:0] io_pad_out;
+initial begin
+   io_pad_out = 0;
 end
-@
-
-<<SPI: quad output negedge presenter>>=
 always @(negedge sclk or posedge cs_async_rst) begin
-   if (cs_async_rst) quad_out <= 4'b0;
-   else if (quad_data) quad_out <= quad_next_nibble;
+   if (cs_async_rst) begin
+      io_pad_out <= 0;
+   end else begin
+      io_pad_out <= io_pad_src;
+   end
 end
 @
 
@@ -735,30 +816,31 @@ above holds the prose, and there is nothing left to tangle.
 <<SPI: quad input engine>>=
 @
 
-Four tri-state drivers, one per lane. Only `io[1]` carries a
-useful single-lane response (`shift_out[7]` gated by
-`resp_window`); the other lanes stay Hi-Z until the 0x6B quad
-data phase, when all four outputs drive `quad_out`. The drivers
+Four explicit iCE40 `SB_IO` drivers, one per lane. Only `io[1]`
+carries a useful single-lane response (`shift_out[7]` gated by
+`resp_window`); the other lanes stay Hi-Z until a quad-output
+data phase, when all four outputs drive the precomputed lane value
+through the pads. The drivers
 split into the two qualifiers, the per-lane data and OE wires,
-the inferred tri-state assigns, and the testbench-visible
-aggregate views.
+the pad cells, and the testbench-visible aggregate views.
 
 Each lane gets its own named OE wire. Bundling all four lanes
 through a single OE expression lets yosys collapse `io[0]`,
 `io[2]`, and `io[3]` onto one shared `$_TBUF_` in an intermediate
 pass, dropping OE on the collapsed lanes in the placed bitstream.
-Naming the OE wires per lane prevents that sharing.
+Instantiating the four pad cells directly prevents that sharing
+and makes the lane-to-package-pin mapping explicit.
 
 <<SPI: IO drivers>>=
 <<SPI: IO drive qualifiers>>
 <<SPI: IO per-lane OE and data>>
-<<SPI: IO tri-state assigns>>
+<<SPI: IO pad drivers>>
 <<SPI: IO testbench views>>
 @
 
 `resp_window` is the single-lane MISO window on `io[1]` for any
 opcode that returns a serial response. `quad_data_drive` covers
-the 0x6B quad data phase across all four lanes. Both are gated
+the quad-output data phase across all four lanes. Both are gated
 on the raw `cs_n` pin so the bus snaps to Hi-Z the instant CS
 rises, before the fclk-domain synchroniser of `cs_n` has even
 settled.
@@ -770,7 +852,8 @@ wire resp_window = (!cs_n)
                   || ((opcode == 8'h03) && (phase_cnt >= 3'd4))
                   || ((opcode == 8'h0B) && (phase_cnt >= 3'd5))
                   || ((opcode == 8'h5A) && (phase_cnt >= 3'd5)) );
-wire quad_data_drive = (!cs_n) && quad_data;
+wire quad_data_drive = (!cs_n) && quad_data_drive_r;
+wire [3:0] io_pad_selected = io_pad_out;
 @
 
 Per-lane OE wires. `io_oe_1` is the only lane that aggregates
@@ -782,29 +865,64 @@ wire io_oe_0    = quad_data_drive;
 wire io_oe_1    = quad_data_drive | resp_window;
 wire io_oe_2    = quad_data_drive;
 wire io_oe_3    = quad_data_drive;
-wire io_d_out_0 = quad_out[0];
-wire io_d_out_1 = quad_data_drive ? quad_out[1] : shift_out[7];
-wire io_d_out_2 = quad_out[2];
-wire io_d_out_3 = quad_out[3];
+wire io_d_out_0 = io_pad_selected[0];
+wire io_d_out_1 = io_pad_selected[1];
+wire io_d_out_2 = io_pad_selected[2];
+wire io_d_out_3 = io_pad_selected[3];
 @
 
-Each lane's tri-state `assign` references its own OE wire so the
-inferred `SB_IO` instances keep four distinct OE signals.
+Each lane instantiates its own bidirectional pad cell. The output side
+uses the unregistered iCE40 bidirectional form (`PIN_TYPE = 6'b101001`);
+the data mux above always selects the registered presenter. The input
+side routes through `D_IN_0` so all MOSI and quad-write sampling sees
+the same pad view that the hardware uses.
 
-<<SPI: IO tri-state assigns>>=
-assign io[0] = io_oe_0 ? io_d_out_0 : 1'bz;
-assign io[1] = io_oe_1 ? io_d_out_1 : 1'bz;
-assign io[2] = io_oe_2 ? io_d_out_2 : 1'bz;
-assign io[3] = io_oe_3 ? io_d_out_3 : 1'bz;
+<<SPI: IO pad drivers>>=
+wire io_d_in_0;
+wire io_d_in_1;
+wire io_d_in_2;
+wire io_d_in_3;
+SB_IO #(
+   .PIN_TYPE(6'b101001)
+) io0_iob (
+   .PACKAGE_PIN(io[0]),
+   .OUTPUT_ENABLE(io_oe_0),
+   .D_OUT_0(io_d_out_0),
+   .D_IN_0(io_d_in_0)
+);
+SB_IO #(
+   .PIN_TYPE(6'b101001)
+) io1_iob (
+   .PACKAGE_PIN(io[1]),
+   .OUTPUT_ENABLE(io_oe_1),
+   .D_OUT_0(io_d_out_1),
+   .D_IN_0(io_d_in_1)
+);
+SB_IO #(
+   .PIN_TYPE(6'b101001)
+) io2_iob (
+   .PACKAGE_PIN(io[2]),
+   .OUTPUT_ENABLE(io_oe_2),
+   .D_OUT_0(io_d_out_2),
+   .D_IN_0(io_d_in_2)
+);
+SB_IO #(
+   .PIN_TYPE(6'b101001)
+) io3_iob (
+   .PACKAGE_PIN(io[3]),
+   .OUTPUT_ENABLE(io_oe_3),
+   .D_OUT_0(io_d_out_3),
+   .D_IN_0(io_d_in_3)
+);
 @
 
 `io_oe` packs the per-lane OE wires into a 4-bit bus for the
-testbench to probe. `io_d_in` is just the `inout` port itself
-(combinational input view).
+testbench to probe. `io_d_in` is the combinational input view
+reported by the four pad cells.
 
 <<SPI: IO testbench views>>=
 wire [3:0] io_oe   = {io_oe_3, io_oe_2, io_oe_1, io_oe_0};
-wire [3:0] io_d_in = io;
+wire [3:0] io_d_in = {io_d_in_3, io_d_in_2, io_d_in_1, io_d_in_0};
 @
 
 MOSI CRC-32 (IEEE-802.3 reflected, poly 0xEDB88320, init 0xFFFFFFFF,
@@ -828,7 +946,7 @@ The qualifier decision for the just-completed byte at pre-increment
   data N >= 5 excluded (the master tri-states MOSI during dummy);
 - opcode == 0x5A: N <= 3 (opcode + 3 addr); dummy byte N==4 and
   data N >= 5 excluded (same cadence as 0x0B);
-- opcode == 0x6B: N <= 3 (opcode + 3 addr); dummy N==4 and quad
+- opcode == 0x6B / 0x6C / 0x6D / 0x6E / 0x6F: N <= 3 (opcode + 3 addr); dummy N==4 and quad
   data N >= 5 excluded (master tri-states all four IO pins during
   dummy and quad data);
 - everything else (0x02, 0x06, 0xBB, unknown): all bytes master-driven.
@@ -884,6 +1002,10 @@ wire master_driven_byte =
      (opcode == 8'h0B)                                 ? (phase_cnt <= 3'd3) :
      (opcode == 8'h5A)                                 ? (phase_cnt <= 3'd3) :
      (opcode == 8'h6B)                                 ? (phase_cnt <= 3'd3) :
+     (opcode == 8'h6C)                                 ? (phase_cnt <= 3'd3) :
+     (opcode == 8'h6D)                                 ? (phase_cnt <= 3'd3) :
+     (opcode == 8'h6E)                                 ? (phase_cnt <= 3'd3) :
+     (opcode == 8'h6F)                                 ? (phase_cnt <= 3'd3) :
      (opcode == 8'h32)                                 ? (phase_cnt <= 3'd3) :
                                                          1'b1;
 @
@@ -948,15 +1070,16 @@ wire [7:0]  unused_frame_cnt_hi  = frame_cnt_pre_full[15:8];
 
 The snapshot is clocked synchronously by `clk` and fires on the
 `cs_rise_pulse` --- the fclk-domain rising-edge detector for
-`cs_s`. The CDC chain has been arranged so `cs_async_rst` lags
-`cs_s_d` by one fclk: when `cs_rise_pulse` is asserted (the
-fclk window between `cs_s` rising and `cs_s_d` catching up),
-the upcoming fclk edge both snapshots the source registers
-*and* loads `cs_async_rst <= cs_s_d`. But because that load is
-sampling the pre-edge `cs_s_d = 0`, the asynchronous clear of
-the source flops does not fire on the snapshot edge; it fires
-one fclk later. The snapshot therefore observes the source
-flops in their post-frame state, before any clear propagates.
+`cs_s`. Raw `cs_n` falling releases `cs_async_rst` immediately
+for the next frame, but CS-rise reassertion still follows the
+delayed synchronized path. When `cs_rise_pulse` is asserted (the
+fclk window between `cs_s` rising and `cs_s_d` catching up), the
+upcoming fclk edge both snapshots the source registers *and*
+loads `cs_async_rst <= cs_s_d`. Because that load samples the
+pre-edge `cs_s_d = 0`, the asynchronous clear of the source flops
+does not fire on the snapshot edge; it fires one fclk later. The
+snapshot therefore observes the source flops in their post-frame
+state, before any clear propagates.
 
 The earlier formulation used `always @(posedge cs_async_rst)` and
 relied on Verilog non-blocking semantics to sample the source
@@ -1103,9 +1226,8 @@ the byte count into tens and units for the `bytes=` field.
 <<Printer: helpers>>=
 function [7:0] hexchar(input [3:0] n);
    hexchar = (n < 4'd10) ? (8'h30 + {4'h0, n})
-                         : (8'h61 + {4'h0, n} - 8'd10);
+                          : (8'h61 + {4'h0, n} - 8'd10);
 endfunction
-
 wire [3:0] d1, d0;
 wire [3:0] unused_d1_hi, unused_d0_hi;
 assign {unused_d1_hi, d1} = p_cnt / 8'd10;
@@ -1242,20 +1364,58 @@ set_io io[3]   48
 
 Two Verilog sources tangle into the build: `qspi.v` for the slave
 itself and `uart_tx.v` reused verbatim from the UART chapter.
+The simulator also needs a local `SB_IO` model for the falling-edge
+fabric launch path and unregistered bidirectional pads used by qspi;
+synthesis uses yosys' built-in iCE40 primitive instead.
 
 <<qspi.mk>>=
 QSPI_VS := verilog/qspi.v verilog/uart_tx.v
+QSPI_SIM_LIB := build/qspi/SB_IO.v
 
 build/qspi/qspi.json: $(QSPI_VS) | build/qspi
 	cd build/qspi && yosys -q -p "read_verilog ../../verilog/qspi.v ../../verilog/uart_tx.v; synth_ice40 -top qspi -json qspi.json"
 
-build/qspi/sim: tb/tb_qspi.sv $(QSPI_VS) verilog/uart_rx.v | build/qspi
-	cd build/qspi && verilator --Mdir obj_dir -Wall --binary --top-module tb_qspi ../../tb/tb_qspi.sv ../../verilog/qspi.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v
+build/qspi/SB_IO.v: src/qspi.nw | build/qspi
+	cd build/qspi && tangle SB_IO.v < ../../$<
+
+build/qspi/sim: tb/tb_qspi.sv $(QSPI_VS) verilog/uart_rx.v $(QSPI_SIM_LIB) | build/qspi
+	cd build/qspi && verilator --Mdir obj_dir -Wall --binary --top-module tb_qspi ../../tb/tb_qspi.sv ../../verilog/qspi.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v SB_IO.v
 	cd build/qspi && obj_dir/Vtb_qspi
 	@touch $@
 
 bitstream: build/qspi/qspi.bin
 sim: build/qspi/sim
+@
+
+=== `SB_IO` simulation model
+
+The qspi slave uses unregistered bidirectional pads
+(`PIN_TYPE = 6'b101001`) with the falling-edge launch register in
+fabric. This model is intentionally scoped to that configuration: it
+drives `D_OUT_0` directly when `OUTPUT_ENABLE` is asserted, otherwise
+releases the bus, and `D_IN_0` always mirrors the package pin.
+
+<<SB_IO.v>>=
+module SB_IO #(
+      parameter [5:0] PIN_TYPE    = 6'b000000,
+      parameter [0:0] NEG_TRIGGER = 1'b0
+   ) (
+      inout  PACKAGE_PIN,
+      input  OUTPUT_ENABLE,
+      input  D_OUT_0,
+      output D_IN_0
+   );
+   initial begin
+      if (!(PIN_TYPE === 6'b101001 && NEG_TRIGGER === 1'b0)) begin
+         $display("ERROR qspi SB_IO sim model only supports PIN_TYPE=101001 NEG_TRIGGER=0, got %b %b",
+                  PIN_TYPE, NEG_TRIGGER);
+         $finish;
+      end
+   end
+
+   assign PACKAGE_PIN = OUTPUT_ENABLE ? D_OUT_0 : 1'bz;
+   assign D_IN_0 = PACKAGE_PIN;
+endmodule
 @
 
 === Testbench
@@ -1430,36 +1590,56 @@ module tb_qspi;
       end
    endtask
 
-   // 0x6B data byte: master tri-states all four IO lines and
+   // Quad data byte: master tri-states all four IO lines and
    // samples IO[3:0] on each SCLK rise. Two rises per data byte.
-   // STM32MP1 QUADSPI indirect-read assembles each byte as
-   // {second_sample, first_sample} -- the slave drives LOWER
-   // nibble on the first negedge and UPPER on the second.
+   // Diagnostics and 0x6B drive UPPER nibble on the first negedge
+   // and LOWER on the second.
    //
-   // Sampling cadence matches a real QSPI master: the bus value
-   // is captured AT THE END of the high pulse, after `t_h` of
-   // slave-side hold time has elapsed since the previous negedge
-   // drive. Sampling earlier (immediately at the rising edge)
-   // hides off-by-one slave cadence bugs that show up only once
-   // the master demands stable data through the full clock-high
-   // window.
-   task automatic spi_quad_data_byte(output [7:0] got);
-      reg [3:0] first_nib, second_nib;
+   // Sampling cadence matches a real QSPI master and also asserts
+   // the bus does not change while SCLK is high. Each nibble is read
+   // immediately after the rising edge and again at the end of the
+   // high pulse; the two samples must match, and the end sample is
+   // what the byte assembler consumes.
+   task automatic spi_quad_data_byte_ordered(input low_first, output [7:0] got);
+      reg [3:0] first_start, first_nib;
+      reg [3:0] second_start, second_nib;
       begin
          tb_io_oe  = 4'b0000;
          tb_io_out = 4'b0000;
          #(t_q);
          sclk = 1;
-         #(t_h);
-         first_nib = io[3:0];   // LOWER nibble of the byte
+         #1;
+         first_start = io[3:0];
+         if (t_h > 1) #(t_h - 1);
+         first_nib = io[3:0];
+         if (first_start !== first_nib)
+            $fatal(1, "FAIL: quad first nibble changed while SCLK high: start=%b end=%b",
+                   first_start, first_nib);
          sclk = 0;
          #(t_q);
          sclk = 1;
-         #(t_h);
-         second_nib = io[3:0];  // UPPER nibble of the byte
+         #1;
+         second_start = io[3:0];
+         if (t_h > 1) #(t_h - 1);
+         second_nib = io[3:0];
+         if (second_start !== second_nib)
+            $fatal(1, "FAIL: quad second nibble changed while SCLK high: start=%b end=%b",
+                   second_start, second_nib);
          sclk = 0;
          #(t_q);
-         got = {second_nib, first_nib};
+         got = low_first ? {second_nib, first_nib} : {first_nib, second_nib};
+      end
+   endtask
+
+   task automatic spi_quad_data_byte(output [7:0] got);
+      begin
+         spi_quad_data_byte_ordered(1'b0, got);
+      end
+   endtask
+
+   task automatic spi_quad_data_byte_6b(output [7:0] got);
+      begin
+         spi_quad_data_byte_ordered(1'b0, got);
       end
    endtask
 
@@ -1800,7 +1980,7 @@ module tb_qspi;
             $fatal(1, "FAIL: 6B io_oe must drive all 4 lanes after dummy, got %b",
                    dut.io_oe);
          for (k = 0; k < 16; k = k + 1) begin
-            spi_quad_data_byte(got_arr[k]);
+            spi_quad_data_byte_6b(got_arr[k]);
             if (dut.io_oe !== 4'b1111)
                $fatal(1, "FAIL: 6B io_oe dropped during data byte %0d: %b",
                       k, dut.io_oe);
@@ -1822,6 +2002,107 @@ module tb_qspi;
                $fatal(1, "FAIL: 6B pattern data[%0d]=%02h want %02h",
                       k, got_arr[k], 8'hFE + k[7:0]);
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 11b: 0x6C Quad Output Read -- same framing as 0x6B
+      // but emits one-hot nibbles 1,2,4,8,... for lane/phase
+      // diagnostics. Upper-first byte assembly yields 12 48 ...
+      begin : frame11b
+         reg [7:0] got_arr [0:15];
+         integer   k;
+         reg [7:0] want;
+         oracle_crc      = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+
+         release_io();
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h6C, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         if (dut.io_oe !== 4'b0000)
+            $fatal(1, "FAIL: 6C io_oe asserted during dummy: %b",
+                   dut.io_oe);
+         spi_dummy_quad();
+         if (dut.io_oe !== 4'b1111)
+            $fatal(1, "FAIL: 6C io_oe must drive all 4 lanes after dummy, got %b",
+                   dut.io_oe);
+         for (k = 0; k < 16; k = k + 1) begin
+            spi_quad_data_byte(got_arr[k]);
+            if (dut.io_oe !== 4'b1111)
+               $fatal(1, "FAIL: 6C io_oe dropped during data byte %0d: %b",
+                      k, dut.io_oe);
+         end
+         #200 cs_n = 1;
+
+         #100;
+         if (io !== 4'bzzzz)
+            $fatal(1, "FAIL: DUT did not release IO after 6C CS rise, io=%b", io);
+         if (dut.io_oe !== 4'b0000)
+            $fatal(1, "FAIL: 6C io_oe must drop after CS rise: %b",
+                   dut.io_oe);
+
+         $write("QUAD trace (6C one-hot nibbles):");
+         for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
+         $display("");
+         for (k = 0; k < 16; k = k + 1) begin
+            want = k[0] ? 8'h48 : 8'h12;
+            if (got_arr[k] !== want)
+               $fatal(1, "FAIL: 6C one-hot data[%0d]=%02h want %02h",
+                      k, got_arr[k], want);
+         end
+         expect_line("op=6c bytes=9", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 11c: 0x6D Quad Output Read -- same framing as 0x6B
+      // but emits byte diagnostics 06..0d repeatedly.
+      begin : frame11c
+         reg [7:0] got_arr [0:15];
+         integer   k;
+         reg [7:0] want;
+         oracle_crc      = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+
+         release_io();
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h6D, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         if (dut.io_oe !== 4'b0000)
+            $fatal(1, "FAIL: 6D io_oe asserted during dummy: %b",
+                   dut.io_oe);
+         spi_dummy_quad();
+         if (dut.io_oe !== 4'b1111)
+            $fatal(1, "FAIL: 6D io_oe must drive all 4 lanes after dummy, got %b",
+                   dut.io_oe);
+         for (k = 0; k < 16; k = k + 1) begin
+            spi_quad_data_byte(got_arr[k]);
+            if (dut.io_oe !== 4'b1111)
+               $fatal(1, "FAIL: 6D io_oe dropped during data byte %0d: %b",
+                      k, dut.io_oe);
+         end
+         #200 cs_n = 1;
+
+         #100;
+         if (io !== 4'bzzzz)
+            $fatal(1, "FAIL: DUT did not release IO after 6D CS rise, io=%b", io);
+         if (dut.io_oe !== 4'b0000)
+            $fatal(1, "FAIL: 6D io_oe must drop after CS rise: %b",
+                   dut.io_oe);
+
+         $write("QUAD trace (6D byte sequence):");
+         for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
+         $display("");
+         for (k = 0; k < 16; k = k + 1) begin
+            want = 8'h06 + {5'b0, k[2:0]};
+            if (got_arr[k] !== want)
+               $fatal(1, "FAIL: 6D sequence data[%0d]=%02h want %02h",
+                      k, got_arr[k], want);
+         end
+         expect_line("op=6d bytes=9", oracle_crc ^ 32'hFFFFFFFF);
       end
 
       // Frame 12: 0x32 WITHOUT prior 0x06 -- WEL is clear, so the
@@ -1934,11 +2215,9 @@ module tb_qspi;
 
       // Frame 16b: 0x6B quad-output readback at addr 0 -- expect
       // pattern 0x00..0x0F. Nibble-alignment regression: the
-      // negedge presenter must drive `{byte_N_upper, byte_N_lower}`
-      // for byte N (not the silicon-observed
-      // `{byte_N_lower, byte_N_upper}` swap of the first revision,
-      // which was caused by a phase-shift between the prefetch
-      // mirror and the negedge slice).
+      // 0x6B now intentionally drives `{byte_N_upper, byte_N_lower}`
+      // on the pads so the testbench assembles the logical byte
+      // expected by the master.
       begin : frame16b
          reg [7:0] got_arr [0:15];
          integer   k;
@@ -1958,7 +2237,7 @@ module tb_qspi;
             $fatal(1, "FAIL: 6B/CF data-phase io_oe=%b, want 1111",
                    dut.io_oe);
          for (k = 0; k < 16; k = k + 1) begin
-            spi_quad_data_byte(got_arr[k]);
+            spi_quad_data_byte_6b(got_arr[k]);
             if (dut.io_oe !== 4'b1111)
                $fatal(1, "FAIL: 6B/CF io_oe dropped during byte %0d: %b",
                       k, dut.io_oe);
@@ -2154,7 +2433,7 @@ module tb_qspi;
          spi_send(8'h40, 1'b1);
          spi_dummy_quad();
          for (k = 0; k < 16; k = k + 1)
-            spi_quad_data_byte(got_arr[k]);
+            spi_quad_data_byte_6b(got_arr[k]);
          #200 cs_n = 1;
          $write("HS 6B pattern from 0x40:");
          for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
@@ -2287,7 +2566,7 @@ module tb_qspi;
          spi_send(8'h00, 1'b1);  // addr LSB = 0x00
          spi_dummy_quad();
          for (k = 0; k < 1024; k = k + 1)
-            spi_quad_data_byte(got_arr[k]);
+            spi_quad_data_byte_6b(got_arr[k]);
          #200 cs_n = 1;
          for (k = 0; k < 1024; k = k + 1)
             if (got_arr[k] !== k[7:0])
@@ -2313,7 +2592,7 @@ module tb_qspi;
          spi_send(8'hFE, 1'b1);  // addr LSB = 0xFE -- wrap mid-frame
          spi_dummy_quad();
          for (k = 0; k < 256; k = k + 1)
-            spi_quad_data_byte(got_arr[k]);
+            spi_quad_data_byte_6b(got_arr[k]);
          #200 cs_n = 1;
          for (k = 0; k < 256; k = k + 1)
             if (got_arr[k] !== (8'hFE + k[7:0]))
@@ -2410,7 +2689,7 @@ module tb_qspi;
          spi_send(8'h00, 1'b1);
          spi_dummy_quad();
          for (k = 0; k < 256; k = k + 1)
-            spi_quad_data_byte(got_arr[k]);
+            spi_quad_data_byte_6b(got_arr[k]);
          #200 cs_n = 1;
          for (k = 0; k < 256; k = k + 1)
             if (got_arr[k] !== k[7:0])

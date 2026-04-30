@@ -18,8 +18,10 @@ QUADSPI raw read samples IO0 in 1-line data mode even though
 conventional SPI labels often call IO1/MISO the slave-output lane.
 Mirroring the pattern avoids making the raw-read benchmark depend
 on that naming ambiguity.
-`LANES=4` drives all four lanes combinationally; the bench
-command is `b <len> 1 1`. The 4-lane case follows the convention
+`LANES=4` drives all four lanes through the same registered IOB output
+mode on the falling SCLK edge, fed by the posedge-stable stream state;
+the bench command is `b <len> 1 1`.
+The 4-lane case follows the convention
 the rest of this codebase has settled on: the STM32MP1 QUADSPI
 indirect-read engine assembles each byte as
 `{first_sample, second_sample}`, so the first sample of a byte
@@ -49,13 +51,11 @@ but not in others.
 The fix is to bypass tri-state inference entirely and
 instantiate `SB_IO` cells directly. The 1-lane pads are configured
 as `PIN_TYPE = 6'b100101` (output registered with output enable)
-and `NEG_TRIGGER = 1` so the IOB's output flop captures
-`D_OUT_0` on `negedge OUTPUT_CLK`. The 4-lane pads use
-`PIN_TYPE = 6'b101001`, keeping the explicit output enable but
-driving the fabric-presented nibble without the IOB output flop.
-`OUTPUT_CLK = sclk`, `OUTPUT_ENABLE = ~cs_n`. In 1-lane mode the
-IOB flop is the negedge presenter: it captures the next bit half a
-cycle ahead of the master's mode-0 rising-edge sample point.
+and `NEG_TRIGGER = 1`, with `OUTPUT_CLK = sclk`, so the IOB's output
+flop captures `D_OUT_0` on direct SCLK falling edges. The 4-lane pads
+use the same registered IOB output mode and falling-edge capture, so
+quad data does not update on the same rising edge the master samples.
+`OUTPUT_ENABLE = ~cs_n` in both modes.
 
 === Lane data path
 
@@ -63,27 +63,28 @@ The byte-pattern counter `data_byte` advances after the master has
 sampled the final bit or nibble of each byte. In 1-lane mode that state
 update happens on the sampling `posedge sclk`, and the pad flop presents
 the next bit on the following falling edge. In 4-lane mode the stream
-state also advances on the sampling `posedge sclk`, and a small
-presenter register captures the next nibble on the following falling
-edge so it is stable for the next mode-0 rising edge sample. The output
+state also advances on the sampling `posedge sclk`; a posedge-loaded
+`dout_quad` register presents the nibble intended for the next
+falling-edge pad-flop capture. The output
 starts at the first bit/nibble of byte 0, so the first rising edge in a
 frame samples valid data. The `phase` counter narrows per variant:
 3 bits for 1-lane (eight rises per byte, MSB-first), 1 bit for 4-lane
 (two rises per byte, upper nibble first then lower).
 
-The `dout_lane[3:0]` bus carries the current lane value. For 4-lane,
-every lane carries a registered bit of the current nibble directly to
-an unregistered pad. For 1-lane, `dout_lane[0]` and `dout_lane[1]` both
+The `dout_lane[3:0]` bus carries the value driven into the pad flop. For
+4-lane, every lane carries one bit of the selected nibble. For
+1-lane, `dout_lane[0]` and `dout_lane[1]` both
 carry the data bit that the IOB flop will latch at the next negedge; the
 other two lanes are held low when enabled.
-Both variants feed a
-single shared genvar loop that instantiates one `SB_IO` per pad, so
-the synthesis netlist contains exactly four explicit pad drivers and
-no fabric tri-state cells regardless of `LANES`.
+Both variants feed variant-specific genvar loops that instantiate one
+`SB_IO` per pad, so the synthesis netlist contains exactly four
+explicit pad drivers and no fabric tri-state cells regardless of
+`LANES`.
 
 <<spi.v>>=
 module spi #(
-      parameter LANES = 1
+      parameter LANES = 1,
+      parameter START_DELAY_CLKS = 0
    ) (
       input        cs_n,
       input        sclk,
@@ -100,17 +101,27 @@ are the wires the IOB driver loop reads.
 
 <<SPI streaming: state>>=
 reg [7:0] data_byte;
+reg [15:0] start_delay_count;
 initial data_byte = 8'd0;
+initial start_delay_count = 16'd0;
 wire [3:0] dout_lane;
-wire oe = ~cs_n;
+wire start_ready = (START_DELAY_CLKS == 0) ||
+                   (start_delay_count >= START_DELAY_CLKS);
+wire oe = ~cs_n && start_ready;
+always @(posedge cs_n or posedge sclk) begin
+   if (cs_n)
+      start_delay_count <= 16'd0;
+   else if (!start_ready)
+      start_delay_count <= start_delay_count + 16'd1;
+end
 @
 
 The lane logic chunk holds the per-variant `phase` register,
-the edge counter, and the assignment that drives `dout_lane`
+the edge counter, and the logic that drives `dout_lane`
 from `data_byte` and `phase`. The stream state advances only after each
 mode-0 rising-edge sample point has observed the current value. In
-4-lane mode a presenter register, not the stream counter, updates on the
-following falling edge. Raising `cs_n` asynchronously returns both
+4-lane mode the pad flop updates on the following falling edge from a
+posedge-loaded presenter register. Raising `cs_n` asynchronously returns both
 variants to byte zero for the next transaction.
 
 <<SPI streaming: lane logic>>=
@@ -121,40 +132,31 @@ end else begin : g_one
 end endgenerate
 @
 
-For 4-lane the nibble mux picks the upper nibble when
-`phase == 0` and the lower nibble when `phase == 1`, matching
+For 4-lane the presenter preloads the lower nibble after the
+`phase == 0` sample, and the next byte's upper nibble after the
+`phase == 1` sample, matching
 the STM32MP1 QUADSPI indirect-read assembly of
 `{first_sample, second_sample}`.
 
 <<SPI streaming: quad lane>>=
 reg phase;
-reg [3:0] dout_next;
-reg [3:0] dout_present;
+reg [3:0] dout_quad;
+wire [3:0] next_byte_upper = data_byte[7:4] + {3'b000, &data_byte[3:0]};
 initial phase = 1'b0;
-initial dout_next = 4'd0;
-initial dout_present = 4'd0;
+initial dout_quad = 4'd0;
 always @(posedge cs_n or posedge sclk) begin
    if (cs_n) begin
       data_byte <= 8'd0;
       phase     <= 1'b0;
-      dout_next <= 4'd0;
-   end else begin
+      dout_quad <= 4'd0;
+   end else if (start_ready) begin
+      dout_quad <= phase ? next_byte_upper : data_byte[3:0];
       phase <= ~phase;
-      if (phase) begin
+      if (phase)
          data_byte <= data_byte + 8'd1;
-         dout_next <= data_byte[7:4] + {3'b000, &data_byte[3:0]};
-      end else begin
-         dout_next <= data_byte[3:0];
-      end
    end
 end
-always @(posedge cs_n or negedge sclk) begin
-   if (cs_n)
-      dout_present <= 4'd0;
-   else
-      dout_present <= dout_next;
-end
-assign dout_lane = dout_present;
+assign dout_lane = dout_quad;
 @
 
 For 1-lane the bit mux picks `data_byte[7 - phase]`, MSB-first,
@@ -169,7 +171,7 @@ always @(posedge cs_n or posedge sclk) begin
    if (cs_n) begin
       data_byte <= 8'd0;
       phase     <= 3'd0;
-   end else begin
+   end else if (start_ready) begin
       phase <= phase + 3'd1;
       if (phase == 3'd7) data_byte <= data_byte + 8'd1;
    end
@@ -182,28 +184,46 @@ assign dout_lane[3] = 1'b0;
 
 The IO driver uses one explicit iCE40 `SB_IO` per pad. In 1-lane
 mode, `NEG_TRIGGER` makes each output flop capture `dout_lane[g]` on
-SCLK falling edges, so pad transitions happen half a cycle ahead of
+direct SCLK falling edges, so pad transitions happen half a cycle ahead of
 the MP135 rising-edge sample without making the stream counter itself
-sensitive to falling edges. In 4-lane mode the pads are unregistered
-so the fabric presenter output reaches the pins directly; that presenter
-updates on falling edges, launching each nibble half a cycle ahead of
-the MP135 rising-edge sample. Keeping the stream counters on rising
+sensitive to falling edges. Quad mode uses the same registered pad output
+mode and falling-edge IOB capture; `D_OUT_0` comes from the posedge-loaded
+`dout_quad` presenter. CS high asynchronously restores that state to byte
+zero before the next selected SCLK rising edge.
+Keeping the stream counters on rising
 edges matters for long peripheral reads where SCLK can pause: repeated
 or idle falling-edge observations re-present the same computed value
 instead of advancing the byte stream.
 
 <<SPI streaming: io drivers>>=
 genvar g;
-generate for (g = 0; g < 4; g = g + 1) begin : g_io
-   SB_IO #(
-      .PIN_TYPE(LANES == 4 ? 6'b101001 : 6'b100101),
-      .NEG_TRIGGER(1'b1)
-   ) iob (
-      .PACKAGE_PIN(io[g]),
-      .OUTPUT_CLK(sclk),
-      .OUTPUT_ENABLE(oe),
-      .D_OUT_0(dout_lane[g])
-   );
+wire [3:0] io_d_in_unused;
+generate if (LANES == 4) begin : g_quad_io
+   for (g = 0; g < 4; g = g + 1) begin : g_io
+      SB_IO #(
+         .PIN_TYPE(6'b100101),
+         .NEG_TRIGGER(1'b1)
+      ) iob (
+         .PACKAGE_PIN(io[g]),
+         .OUTPUT_CLK(sclk),
+         .OUTPUT_ENABLE(oe),
+         .D_OUT_0(dout_lane[g]),
+         .D_IN_0(io_d_in_unused[g])
+      );
+   end
+end else begin : g_one_io
+   for (g = 0; g < 4; g = g + 1) begin : g_io
+      SB_IO #(
+         .PIN_TYPE(6'b100101),
+         .NEG_TRIGGER(1'b1)
+      ) iob (
+         .PACKAGE_PIN(io[g]),
+         .OUTPUT_CLK(sclk),
+         .OUTPUT_ENABLE(oe),
+         .D_OUT_0(dout_lane[g]),
+         .D_IN_0(io_d_in_unused[g])
+      );
+   end
 end endgenerate
 @
 
@@ -262,6 +282,7 @@ module spi_pin_walk #(
          count <= count + 1'b1;
 
    wire drive = count >= BOOT_TICKS;
+   wire [5:0] unused_d_in;
    wire [27:0] after_boot = count - BOOT_TICKS;
    wire [2:0] slot =
       (after_boot < 1 * STEP_TICKS) ? 3'd0 :
@@ -286,17 +307,17 @@ module spi_pin_walk #(
 
    SB_IO #(.PIN_TYPE(6'b100101)) i_sclk (
       .PACKAGE_PIN(sclk), .OUTPUT_CLK(clk),
-      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[0])
+      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[0]), .D_IN_0(unused_d_in[0])
    );
    SB_IO #(.PIN_TYPE(6'b100101)) i_cs_n (
       .PACKAGE_PIN(cs_n), .OUTPUT_CLK(clk),
-      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[1])
+      .OUTPUT_ENABLE(drive), .D_OUT_0(mask[1]), .D_IN_0(unused_d_in[1])
    );
    genvar w;
    generate for (w=0; w<4; w=w+1) begin : w_io
       SB_IO #(.PIN_TYPE(6'b100101)) iob (
          .PACKAGE_PIN(io[w]), .OUTPUT_CLK(clk),
-         .OUTPUT_ENABLE(drive), .D_OUT_0(mask[w + 2])
+         .OUTPUT_ENABLE(drive), .D_OUT_0(mask[w + 2]), .D_IN_0(unused_d_in[w + 2])
       );
    end endgenerate
 endmodule
@@ -530,18 +551,16 @@ set_io io[3]   48
 yosys recognises `SB_IO` as a built-in iCE40 primitive and
 needs no help from us during synthesis. verilator does not, so
 the testbench is compiled against a stand-alone behavioural
-model that covers exactly the configurations our DUT uses
-(`PIN_TYPE = 6'b100101` for registered 1-lane pads and
-`PIN_TYPE = 6'b101001` for unregistered quad pads, both with
-`NEG_TRIGGER = 1`). Any other configuration is rejected at
+model that covers exactly the pad configuration our DUT uses
+(`PIN_TYPE = 6'b100101` with `NEG_TRIGGER = 1`). Any other configuration is rejected at
 elaboration so a future change to the DUT does not silently desync
 the sim from the synth path.
 
-The model owns one negedge-clocked register per registered pad and
-otherwise forwards `D_OUT_0` directly, then gates the selected output
-through `OUTPUT_ENABLE`. When the slave releases the bus the inout
-port is driven to `1'bz`, and the testbench attaches a `pullup` per
-lane to model the master-side MISO pull-up.
+The model owns one falling-edge output register, then gates the
+registered output through `OUTPUT_ENABLE`. When the slave releases the
+bus the inout port is driven to `1'bz`, and `D_IN_0` mirrors the package
+pin for pad readback. The testbench attaches a `pullup` per lane to
+model the master-side MISO pull-up.
 
 <<SB_IO.v>>=
 module SB_IO #(
@@ -551,12 +570,12 @@ module SB_IO #(
       inout  PACKAGE_PIN,
       input  OUTPUT_CLK,
       input  OUTPUT_ENABLE,
-      input  D_OUT_0
+      input  D_OUT_0,
+      output D_IN_0
    );
    initial begin
-      if ((PIN_TYPE !== 6'b100101 && PIN_TYPE !== 6'b101001) ||
-            NEG_TRIGGER !== 1'b1) begin
-         $display("ERROR SB_IO sim model only supports PIN_TYPE=100101/101001 NEG_TRIGGER=1, got %b %b",
+      if (!(PIN_TYPE === 6'b100101 && NEG_TRIGGER === 1'b1)) begin
+         $display("ERROR SB_IO sim model only supports PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
                   PIN_TYPE, NEG_TRIGGER);
          $finish;
       end
@@ -565,8 +584,8 @@ module SB_IO #(
    initial dout_reg = 1'b0;
    always @(negedge OUTPUT_CLK)
       dout_reg <= D_OUT_0;
-   wire dout = (PIN_TYPE == 6'b101001) ? D_OUT_0 : dout_reg;
-   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout : 1'bz;
+   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_reg : 1'bz;
+   assign D_IN_0 = PACKAGE_PIN;
 endmodule
 @
 
@@ -590,8 +609,9 @@ Two testbenches, one per `LANES` variant, share the same shape:
   - **Quad paused frame.** The 4-lane bench also holds SCLK high and
     low inside a short frame, modelling peripheral backpressure without
     adding extra sample edges.
-  - **CS-high quiet check, again.** Re-asserts that the slave
-    releases the bus after the long frame closes.
+  - **CS-high quiet checks between frames and at the end.** Re-assert
+    that the slave releases the bus and let registered pads preload
+    byte-zero data before the next selected frame.
 
 Each TB is built from named chunks: signals (with master-side
 pull-ups), a per-byte sampler that owns the mode-0 sample
@@ -826,7 +846,9 @@ initial begin
    cs_high_quiet();
    cs_high_quiet();
    frame(256);
+   cs_high_quiet();
    paused_frame(32);
+   cs_high_quiet();
    frame(4096);
    cs_high_quiet();
    cs_high_quiet();
@@ -846,9 +868,9 @@ prove that the synthesized netlist still contains the IOB drivers
 that make that model relevant. The netlist checker closes that gap
 without trying to model board timing: after yosys, each variant must
 have exactly four explicit `SB_IO` pads, each pad must be tied to
-the matching `io[n]` port bit, each pad must use the direct-output
-configuration, and every output enable must be driven by the named
-`oe = ~cs_n` net. This is the structural condition the hardware
+the matching `io[n]` port bit, every pad must use the registered
+negedge-output configuration, and every output enable must be driven
+by the named `oe = ~cs_n` net. This is the structural condition the hardware
 failure violated when the lanes floated to the master pull-ups and
 the MP135 read `0xff`.
 
@@ -878,6 +900,10 @@ def check(path, lanes):
 
     ports = module["ports"]
     io_bits = ports["io"]["bits"]
+    sclk_bits = ports["sclk"]["bits"]
+    if len(sclk_bits) != 1:
+        raise AssertionError(f"{path}: sclk port is {len(sclk_bits)} bits, expected 1")
+    sclk_bit = sclk_bits[0]
     oe_bit = bits_of(module, "oe")
 
     cells = module["cells"]
@@ -903,17 +929,19 @@ def check(path, lanes):
         name, cell = pads[key]
         params = cell.get("parameters", {})
         conns = cell.get("connections", {})
-        expected_pin_type = "101001" if lanes == 4 else "100101"
+        expected_pin_type = "100101"
         if params.get("PIN_TYPE") != expected_pin_type:
             raise AssertionError(
                 f"{path}: {name} PIN_TYPE={params.get('PIN_TYPE')}, "
                 f"expected {expected_pin_type}")
         if params.get("NEG_TRIGGER") != "1":
-            raise AssertionError(f"{path}: {name} NEG_TRIGGER={params.get('NEG_TRIGGER')}, expected 1")
+            raise AssertionError(
+                f"{path}: {name} NEG_TRIGGER={params.get('NEG_TRIGGER')}, "
+                f"expected 1")
         if conns.get("OUTPUT_ENABLE") != [oe_bit]:
             raise AssertionError(f"{path}: {name} OUTPUT_ENABLE is not oe")
-        if "OUTPUT_CLK" not in conns:
-            raise AssertionError(f"{path}: {name} missing OUTPUT_CLK")
+        if conns.get("OUTPUT_CLK") != [sclk_bit]:
+            raise AssertionError(f"{path}: {name} OUTPUT_CLK is not sclk")
         dout = conns.get("D_OUT_0", [])
         if lanes == 1:
             should_drive_pattern = lane in (0, 1)
@@ -959,6 +987,9 @@ build/spi/spi_1lane.json: $(SPI_VS) | build/spi
 build/spi/spi_quad.json: $(SPI_VS) | build/spi
 	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 spi; synth_ice40 -top spi -json spi_quad.json"
 
+build/spi/spi_quad_framed.json: $(SPI_VS) | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set START_DELAY_CLKS 40 spi; synth_ice40 -top spi -json spi_quad_framed.json"
+
 verilog/spi_pin_drive.v: src/spi.nw | verilog
 	cd verilog && tangle spi_pin_drive.v < ../$<
 
@@ -998,11 +1029,20 @@ build/spi/spi_1lane.asc: build/spi/spi_1lane.json verilog/spi.pcf
 build/spi/spi_quad.asc: build/spi/spi_quad.json verilog/spi.pcf
 	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_quad.json --pcf ../../verilog/spi.pcf --asc spi_quad.asc --freq 100 -q
 
+build/spi/spi_quad_framed.asc: build/spi/spi_quad_framed.json verilog/spi.pcf
+	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_quad_framed.json --pcf ../../verilog/spi.pcf --asc spi_quad_framed.asc --freq 100 -q
+
 build/spi/spi_1lane.bin: build/spi/spi_1lane.asc
 	cd build/spi && icepack spi_1lane.asc spi_1lane.bin
 
 build/spi/spi_quad.bin: build/spi/spi_quad.asc
 	cd build/spi && icepack spi_quad.asc spi_quad.bin
+
+build/spi/spi_quad_framed.bin: build/spi/spi_quad_framed.asc
+	cd build/spi && icepack spi_quad_framed.asc spi_quad_framed.bin
+
+build/spi/qspi.bin: build/qspi/qspi.bin | build/spi
+	ln -sf ../qspi/qspi.bin $@
 
 build/spi/gpio.bin: build/gpio/gpio.bin | build/spi
 	cp $< $@
@@ -1047,11 +1087,11 @@ build/spi/sim_quad: tb/tb_spi_quad.sv $(SPI_VS) $(SPI_SIM_LIB) | build/spi
 	cd build/spi && obj_quad/Vtb_spi_quad
 	@touch $@
 
-build/spi/netlist_check: build/spi/check_spi_netlist.py build/spi/spi_1lane.json build/spi/spi_quad.json
-	cd build/spi && python3 check_spi_netlist.py spi_1lane.json:1 spi_quad.json:4
+build/spi/netlist_check: build/spi/check_spi_netlist.py build/spi/spi_1lane.json build/spi/spi_quad.json build/spi/spi_quad_framed.json
+	cd build/spi && python3 check_spi_netlist.py spi_1lane.json:1 spi_quad.json:4 spi_quad_framed.json:4
 	@touch $@
 
-bitstream: build/spi/spi_1lane.bin build/spi/spi_quad.bin
+bitstream: build/spi/spi_1lane.bin build/spi/spi_quad.bin build/spi/qspi.bin
 sim: build/spi/sim_1lane build/spi/sim_quad build/spi/netlist_check
 @
 
@@ -1438,61 +1478,129 @@ mp135:uart_close
 
 - Check 1lane stream @ presc=5 512 MB stream_xfer wall rate >= 100 Mbps within 45 s, then pattern correct
 
-Preflight -- quad software bit-bang read returns the SPI stream.
+Diagnostic -- quad peripheral 0x6C one-hot nibble read.
 
-Program the quad FPGA image here so the bit-bang diagnostic starts from
-a known lane-width bitstream before the peripheral path is exercised.
+Program the quad FPGA image here and issue the diagnostic opcode that
+uses 0x6B framing but returns one-hot nibbles on IO[3:0].
 
 ```
-fpga:program bin=@spi_quad.bin
+fpga:open
+fpga:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="k 16 1\r"
-mp135:uart_expect sentinel="bb read 16 (quad)" timeout_ms=5000
+fpga:uart_open
+mp135:uart_write data="p 203 1\r"
+delay ms=100
+mp135:uart_write data="Y 32\r"
+mp135:uart_expect sentinel="op=6c read 32 @ 0x00000000" timeout_ms=5000
+delay ms=1500
+fpga:uart_close
+fpga:close
 delay ms=1000
 mp135:uart_close
 ```
 
-- Check quad bit-bang read returns incrementing pattern
+- Check quad peripheral 0x6C one-hot diagnostic returns 12 48 pattern
 
-Preflight -- quad peripheral raw read returns the SPI stream.
+Diagnostic -- quad peripheral 0x6E nibble-value hold read.
+
+Issue the third diagnostic opcode with the same 0x6B framing but a
+repeated 00,11,22,...,ff byte sequence. Each byte holds one nibble
+value across both quad sample edges.
+
+```
+fpga:open
+fpga:program bin=@qspi.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+fpga:uart_open
+mp135:uart_write data="p 203 1\r"
+delay ms=100
+mp135:uart_write data="W 32\r"
+mp135:uart_expect sentinel="op=6e read 32 @ 0x00000000" timeout_ms=5000
+delay ms=1500
+fpga:uart_close
+fpga:close
+delay ms=1000
+mp135:uart_close
+```
+
+- Check quad peripheral 0x6E nibble-hold diagnostic returns 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff pattern
+
+Diagnostic -- quad peripheral 0x6F nibble ramp read.
+
+Issue the fourth diagnostic opcode with the same 0x6B framing but a
+continuous 0,1,2,...,f nibble ramp. STM32 byte assembly should return
+01,23,45,67,89,ab,cd,ef repeatedly.
+
+```
+fpga:open
+fpga:program bin=@qspi.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+fpga:uart_open
+mp135:uart_write data="p 203 1\r"
+delay ms=100
+mp135:uart_write data="U 32\r"
+mp135:uart_expect sentinel="op=6f read 32 @ 0x00000000" timeout_ms=5000
+delay ms=1500
+fpga:uart_close
+fpga:close
+delay ms=1000
+mp135:uart_close
+```
+
+- Check quad peripheral 0x6F nibble-ramp diagnostic returns 01 23 45 67 89 ab cd ef pattern
+
+Preflight -- quad peripheral framed read returns the SPI stream.
 
 Program the quad FPGA image here so the following 1 MiB sweep starts from
 a known lane-width bitstream.
 
 ```
-fpga:program bin=@spi_quad.bin
+fpga:open
+fpga:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 203\r"
+fpga:uart_open
+mp135:uart_write data="p 203 1\r"
 delay ms=100
-mp135:uart_write data="j 1024 1\r"
-mp135:uart_expect sentinel="raw read 1024 (quad)" timeout_ms=5000
+mp135:uart_write data="q 0 1024\r"
+mp135:uart_expect sentinel="op=6b read 1024 @ 0x00000000" timeout_ms=5000
+delay ms=1500
+fpga:uart_close
+fpga:close
 delay ms=1000
 mp135:uart_close
 ```
 
-- Check quad peripheral raw read returns 1024-byte incrementing pattern
+- Check quad peripheral read returns 1024-byte incrementing pattern
 
 Phase 2 -- 4-lane sweep at presc=203.
 
 ```
-fpga:program bin=@spi_quad.bin
+fpga:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 203\r"
+mp135:uart_write data="p 203 1\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_write data="b 1048576 1 0\r"
 mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mark tag=bench_done
 mp135:uart_close
@@ -1503,7 +1611,7 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=63.
 
 ```
-fpga:program bin=@spi_quad.bin
+fpga:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1512,7 +1620,7 @@ delay ms=300
 mp135:uart_write data="p 63\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_write data="b 1048576 1 0\r"
 mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
 mark tag=bench_done
 mp135:uart_close
@@ -1523,7 +1631,7 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=15.
 
 ```
-fpga:program bin=@spi_quad.bin
+fpga:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1532,7 +1640,7 @@ delay ms=300
 mp135:uart_write data="p 15\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_write data="b 1048576 1 0\r"
 mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
 mark tag=bench_done
 mp135:uart_close
@@ -1543,7 +1651,7 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=5.
 
 ```
-fpga:program bin=@spi_quad.bin
+fpga:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
@@ -1552,13 +1660,64 @@ delay ms=300
 mp135:uart_write data="p 5\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 1 1\r"
+mp135:uart_write data="b 1048576 1 0\r"
 mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=5000
 mark tag=bench_done
 mp135:uart_close
 ```
 
 - Check quad @ presc=5 pattern correct
+
+Diagnostic -- quad peripheral 0x6D byte sequence read.
+
+Issue the second diagnostic opcode with the same 0x6B framing but a
+short repeated byte sequence around the failing 06/07/08 region.
+
+```
+fpga:open
+fpga:program bin=@qspi.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+fpga:uart_open
+mp135:uart_write data="p 203 1\r"
+delay ms=100
+mp135:uart_write data="Z 32\r"
+mp135:uart_expect sentinel="op=6d read 32 @ 0x00000000" timeout_ms=5000
+delay ms=1500
+fpga:uart_close
+fpga:close
+delay ms=1000
+mp135:uart_close
+```
+
+- Check quad peripheral 0x6D byte diagnostic returns 06 07 08 09 0a 0b 0c 0d pattern
+
+Preflight -- quad software bit-bang read returns the SPI stream.
+
+Program the command-aware QSPI FPGA image here so the bit-bang diagnostic
+exercises the same slave protocol used by the peripheral path.
+
+```
+fpga:open
+fpga:program bin=@qspi.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+fpga:uart_open
+mp135:uart_write data="K 16\r"
+mp135:uart_expect sentinel="bb 6b read 16 @ 0x00000000" timeout_ms=5000
+delay ms=1500
+fpga:uart_close
+fpga:close
+mp135:uart_close
+```
+
+- Check quad bit-bang 6b command drives expected held pad nibbles
 
 MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=203.
 
@@ -1725,6 +1884,12 @@ XOR128_RE = re.compile(
     rb"cached=(\d+)\s+ms\s+cached_us_x1000=(\d+)\s+"
     rb"cold=(\d+)\s+ms\s+cold_us_x1000=(\d+)")
 DEBUG_RE = re.compile(rb"SPI E=([0-9a-f]{4}) S=([0-9a-f]{8})")
+Q6B0_RE = re.compile(
+    rb"q60 pn=([0-9a-f]{8}) io=([0-9a-f]{8})")
+Q6B1_RE = re.compile(
+    rb"q61 pn=([0-9a-f]{8}) io=([0-9a-f]{8})")
+Q6B_RE = re.compile(rb"q6b pn=([0-9a-f]{8}) io=([0-9a-f]{8})")
+Q6B_EXPECT = 0x0708090a
 HEXLINE_RE = re.compile(rb"[0-9a-f]{8}:(?:\s+[0-9a-f]{2}){1,16}")
 HEXBYTE_RE = re.compile(rb"\b([0-9a-f]{2})\b")
 
@@ -1787,6 +1952,54 @@ def _last_debug_line():
     return last
 
 
+def _last_q6b():
+    raw = _read_fpga_uart()
+    if raw is None:
+        return None
+    last = None
+    for m in Q6B_RE.finditer(raw):
+        last = (int(m.group(1), 16), int(m.group(2), 16))
+    if last is None:
+        sys.stderr.write("no FPGA q6b line matching q6b pn=xxxxxxxx io=xxxxxxxx\n")
+        sys.stderr.write("--- FPGA UART tail ---\n")
+        sys.stderr.write(raw[-1024:].decode("ascii", "replace"))
+        sys.stderr.write("\n")
+    return last
+
+
+def _last_q6b_if_present():
+    raw = _read_fpga_uart()
+    if raw is None:
+        return None
+    last = None
+    for m in Q6B_RE.finditer(raw):
+        last = (int(m.group(1), 16), int(m.group(2), 16))
+    return last
+
+
+def _last_q6b0():
+    raw = _read_fpga_uart()
+    if raw is None:
+        return None
+    last0 = None
+    last1 = None
+    for m in Q6B0_RE.finditer(raw):
+        last0 = (int(m.group(1), 16), int(m.group(2), 16))
+    for m in Q6B1_RE.finditer(raw):
+        last1 = (int(m.group(1), 16), int(m.group(2), 16))
+    if last0 is None:
+        return None
+    return last0, last1
+
+
+def _write_q6b0_if_present(stream):
+    q6b0 = _last_q6b0()
+    if q6b0 is not None:
+        stream.write(f"q60 pn={q6b0[0][0]:08x} io={q6b0[0][1]:08x}\n")
+        if q6b0[1] is not None:
+            stream.write(f"q61 pn={q6b0[1][0]:08x} io={q6b0[1][1]:08x}\n")
+
+
 def check_gpio_wiring():
     if not v.check_no_errors():
         return False
@@ -1831,15 +2044,33 @@ def _bytes_after(header):
     return out
 
 
+def _line_after(header, prefix):
+    raw = _read_uart()
+    if raw is None:
+        return None
+    pos = raw.find(header)
+    if pos < 0:
+        return None
+    for line in raw[pos + len(header):].splitlines():
+        if line.startswith(prefix):
+            return line.decode("ascii", "replace")
+    return None
+
+
 def check_bitbang_pattern(mode):
     if not v.check_no_errors():
         return False
     if mode == "quad":
-        header = b"bb read 16 (quad)"
+        header = b"bb 6b read 16 @ 0x00000000"
     else:
         header = b"bb read 16 (1lane io=1)"
     got = _bytes_after(header)
     if got is None:
+        if mode == "quad":
+            _write_q6b0_if_present(sys.stderr)
+            q6b = _last_q6b()
+            if q6b is not None:
+                sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
         return False
     expect = list(range(16))
     sys.stdout.write(
@@ -1848,6 +2079,64 @@ def check_bitbang_pattern(mode):
         sys.stderr.write(
             f"{mode} bit-bang pattern mismatch; expected "
             f"{' '.join(f'{b:02x}' for b in expect)}\n")
+        if mode == "quad":
+            line = _line_after(header, b"bb 6b nibbles:")
+            if line is not None:
+                sys.stderr.write(f"{line}\n")
+            _write_q6b0_if_present(sys.stderr)
+            q6b = _last_q6b()
+            if q6b is not None:
+                sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    return True
+
+
+def check_quad_bitbang_pad_drive():
+    if not v.check_no_errors():
+        return False
+    header = b"bb 6b read 16 @ 0x00000000"
+    got = _bytes_after(header)
+    if got is None:
+        return False
+    expect = list(range(16))
+    sys.stdout.write(
+        "quad bit-bang MP135 bytes: "
+        + " ".join(f"{b:02x}" for b in got[:16]) + "\n")
+    if got[:16] != expect:
+        sys.stderr.write(
+            "quad bit-bang MP135 byte mismatch; expected "
+            + " ".join(f"{b:02x}" for b in expect)
+            + "; validating nibble diagnostic\n")
+    line = _line_after(header, b"bb 6b nibbles:")
+    if line is not None:
+        sys.stdout.write(f"{line}\n")
+    else:
+        sys.stderr.write("missing MP135 bb 6b nibbles diagnostic\n")
+        return False
+    got_nibbles = []
+    for m in re.finditer(r"\b[0-9a-f]{1,8}\b", line.split(":", 1)[1]):
+        token = m.group(0)
+        if len(token) == 8:
+            packed = int(token, 16)
+            got_nibbles.extend(
+                (packed >> shift) & 0xff for shift in (24, 16, 8, 0))
+        elif len(token) <= 2:
+            got_nibbles.append(int(token, 16))
+        else:
+            sys.stderr.write(f"unexpected MP135 bb 6b nibble token {token}\n")
+            return False
+    expect_nibbles = [
+        0x0, 0x0, 0x1, 0x0, 0x2, 0x0, 0x3, 0x0,
+        0x4, 0x0, 0x5, 0x0, 0x6, 0x0, 0x7, 0x0,
+        0x8, 0x0, 0x9, 0x0, 0xa, 0x0, 0xb, 0x0,
+        0xc, 0x0, 0xd, 0x0, 0xe, 0x0, 0xf, 0x0,
+    ]
+    if got_nibbles != expect_nibbles:
+        sys.stderr.write(
+            "MP135 bb 6b nibble mismatch; expected "
+            + " ".join(f"{x:02x}" for x in expect_nibbles)
+            + ", got "
+            + " ".join(f"{x:02x}" for x in got_nibbles) + "\n")
         return False
     return True
 
@@ -1856,7 +2145,7 @@ def check_raw_read_pattern(mode, count):
     if not v.check_no_errors():
         return False
     if mode == "quad":
-        header = f"raw read {count} (quad)".encode("ascii")
+        header = f"op=6b read {count} @ 0x00000000".encode("ascii")
     else:
         header = f"raw read {count} (1lane)".encode("ascii")
     got = _bytes_after(header)
@@ -1877,6 +2166,180 @@ def check_raw_read_pattern(mode, count):
                     f"{mode} raw mismatch at {i}: got {g:02x}, "
                     f"expected {e:02x}\n")
                 break
+        if mode == "quad":
+            _write_q6b0_if_present(sys.stderr)
+            q6b = _last_q6b()
+            if q6b is not None:
+                sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    return True
+
+
+def check_quad_onehot_read(count):
+    if not v.check_no_errors():
+        return False
+    header = f"op=6c read {count} @ 0x00000000".encode("ascii")
+    got = _bytes_after(header)
+    if got is None:
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    expect = [0x12 if (i & 1) == 0 else 0x48 for i in range(count)]
+    sys.stdout.write(
+        f"quad 6c got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+    if len(got) < count:
+        sys.stderr.write(
+            f"quad 6c short capture: got {len(got)} bytes, "
+            f"expected {count}\n")
+        sys.stderr.write(
+            f"quad 6c raw got: {' '.join(f'{b:02x}' for b in got)}\n")
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    if got[:count] != expect:
+        for i, (g, e) in enumerate(zip(got[:count], expect)):
+            if g != e:
+                sys.stderr.write(
+                    f"quad 6c mismatch at {i}: got {g:02x}, "
+                    f"expected {e:02x}\n")
+                break
+        sys.stderr.write(
+            f"quad 6c raw got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    return True
+
+
+def check_quad_byte_diag_read(count):
+    if not v.check_no_errors():
+        return False
+    header = f"op=6d read {count} @ 0x00000000".encode("ascii")
+    got = _bytes_after(header)
+    if got is None:
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    expect = [0x06 + (i & 0x07) for i in range(count)]
+    sys.stdout.write(
+        f"quad 6d got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+    if len(got) < count:
+        sys.stderr.write(
+            f"quad 6d short capture: got {len(got)} bytes, "
+            f"expected {count}\n")
+        sys.stderr.write(
+            f"quad 6d raw got: {' '.join(f'{b:02x}' for b in got)}\n")
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    if got[:count] != expect:
+        for i, (g, e) in enumerate(zip(got[:count], expect)):
+            if g != e:
+                sys.stderr.write(
+                    f"quad 6d mismatch at {i}: got {g:02x}, "
+                    f"expected {e:02x}\n")
+                break
+        sys.stderr.write(
+            f"quad 6d raw got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    return True
+
+
+def check_quad_nibble_hold_read(count):
+    if not v.check_no_errors():
+        return False
+    header = f"op=6e read {count} @ 0x00000000".encode("ascii")
+    got = _bytes_after(header)
+    if got is None:
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    expect = [((i & 0x0f) * 0x11) for i in range(count)]
+    sys.stdout.write(
+        f"quad 6e got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+    if len(got) < count:
+        sys.stderr.write(
+            f"quad 6e short capture: got {len(got)} bytes, "
+            f"expected {count}\n")
+        sys.stderr.write(
+            f"quad 6e raw got: {' '.join(f'{b:02x}' for b in got)}\n")
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    if got[:count] != expect:
+        for i, (g, e) in enumerate(zip(got[:count], expect)):
+            if g != e:
+                sys.stderr.write(
+                    f"quad 6e mismatch at {i}: got {g:02x}, "
+                    f"expected {e:02x}\n")
+                break
+        sys.stderr.write(
+            f"quad 6e raw got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    return True
+
+
+def check_quad_nibble_ramp_read(count):
+    if not v.check_no_errors():
+        return False
+    header = f"op=6f read {count} @ 0x00000000".encode("ascii")
+    got = _bytes_after(header)
+    if got is None:
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    expect = [(((2 * i) & 0x0f) << 4) | ((2 * i + 1) & 0x0f)
+              for i in range(count)]
+    sys.stdout.write(
+        f"quad 6f got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+    if len(got) < count:
+        sys.stderr.write(
+            f"quad 6f short capture: got {len(got)} bytes, "
+            f"expected {count}\n")
+        sys.stderr.write(
+            f"quad 6f raw got: {' '.join(f'{b:02x}' for b in got)}\n")
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
+        return False
+    if got[:count] != expect:
+        for i, (g, e) in enumerate(zip(got[:count], expect)):
+            if g != e:
+                sys.stderr.write(
+                    f"quad 6f mismatch at {i}: got {g:02x}, "
+                    f"expected {e:02x}\n")
+                break
+        sys.stderr.write(
+            f"quad 6f raw got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+        _write_q6b0_if_present(sys.stderr)
+        q6b = _last_q6b_if_present()
+        if q6b is not None:
+            sys.stderr.write(f"q6b pn={q6b[0]:08x} io={q6b[1]:08x}\n")
         return False
     return True
 
@@ -2473,9 +2936,13 @@ def _make_dispatch():
                                                 512000000, 45000,
                                                 expected_chunk=16777216,
                                                 min_chunks=31))
-    out["Check quad bit-bang read returns incrementing pattern"] = (
-        lambda: check_bitbang_pattern("quad"))
-    out["Check quad peripheral raw read returns 1024-byte incrementing pattern"] = (
+    out["Check quad peripheral 0x6C one-hot diagnostic returns 12 48 pattern"] = (
+        lambda: check_quad_onehot_read(32))
+    out["Check quad peripheral 0x6E nibble-hold diagnostic returns 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff pattern"] = (
+        lambda: check_quad_nibble_hold_read(32))
+    out["Check quad peripheral 0x6F nibble-ramp diagnostic returns 01 23 45 67 89 ab cd ef pattern"] = (
+        lambda: check_quad_nibble_ramp_read(32))
+    out["Check quad peripheral read returns 1024-byte incrementing pattern"] = (
         lambda: check_raw_read_pattern("quad", 1024))
     out["Check FPGA UART debug reports first 32 SCLK edges"] = (
         check_debug_edges)
@@ -2485,6 +2952,10 @@ def _make_dispatch():
         for p in presc_steps:
             key = f"Check {mode} @ presc={p} pattern correct"
             out[key] = (lambda m=mode, pr=p: check_pattern(m, pr))
+    out["Check quad peripheral 0x6D byte diagnostic returns 06 07 08 09 0a 0b 0c 0d pattern"] = (
+        lambda: check_quad_byte_diag_read(32))
+    out["Check quad bit-bang 6b command drives expected held pad nibbles"] = (
+        check_quad_bitbang_pad_drive)
     return out
 
 
@@ -2520,7 +2991,7 @@ test: all bitstreams
 	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi --log run_md.log
 
 bitstreams:
-	$(MAKE) -C ../.. build/spi/pin_preflight build/spi/spi_1lane.bin build/spi/spi_quad.bin
+	$(MAKE) -C ../.. build/spi/pin_preflight build/spi/spi_1lane.bin build/spi/spi_quad.bin build/spi/qspi.bin
 
 bitstream: bitstreams
 

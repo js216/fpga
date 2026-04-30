@@ -162,34 +162,42 @@ module tb_qspi;
 
    // 0x6B data byte: master tri-states all four IO lines and
    // samples IO[3:0] on each SCLK rise. Two rises per data byte.
-   // STM32MP1 QUADSPI indirect-read assembles each byte as
-   // {second_sample, first_sample} -- the slave drives LOWER
-   // nibble on the first negedge and UPPER on the second.
+   // The slave drives UPPER nibble on the first negedge and LOWER
+   // on the second.
    //
-   // Sampling cadence matches a real QSPI master: the bus value
-   // is captured AT THE END of the high pulse, after `t_h` of
-   // slave-side hold time has elapsed since the previous negedge
-   // drive. Sampling earlier (immediately at the rising edge)
-   // hides off-by-one slave cadence bugs that show up only once
-   // the master demands stable data through the full clock-high
-   // window.
+   // Sampling cadence matches a real QSPI master and also asserts
+   // the bus does not change while SCLK is high. Each nibble is read
+   // immediately after the rising edge and again at the end of the
+   // high pulse; the two samples must match, and the end sample is
+   // what the byte assembler consumes.
    task automatic spi_quad_data_byte(output [7:0] got);
-      reg [3:0] first_nib, second_nib;
+      reg [3:0] first_start, first_nib;
+      reg [3:0] second_start, second_nib;
       begin
          tb_io_oe  = 4'b0000;
          tb_io_out = 4'b0000;
          #(t_q);
          sclk = 1;
-         #(t_h);
-         first_nib = io[3:0];   // LOWER nibble of the byte
+         #1;
+         first_start = io[3:0];
+         if (t_h > 1) #(t_h - 1);
+         first_nib = io[3:0];   // UPPER nibble of the byte
+         if (first_start !== first_nib)
+            $fatal(1, "FAIL: 6B upper nibble changed while SCLK high: start=%b end=%b",
+                   first_start, first_nib);
          sclk = 0;
          #(t_q);
          sclk = 1;
-         #(t_h);
-         second_nib = io[3:0];  // UPPER nibble of the byte
+         #1;
+         second_start = io[3:0];
+         if (t_h > 1) #(t_h - 1);
+         second_nib = io[3:0];  // LOWER nibble of the byte
+         if (second_start !== second_nib)
+            $fatal(1, "FAIL: 6B lower nibble changed while SCLK high: start=%b end=%b",
+                   second_start, second_nib);
          sclk = 0;
          #(t_q);
-         got = {second_nib, first_nib};
+         got = {first_nib, second_nib};
       end
    endtask
 
@@ -552,6 +560,107 @@ module tb_qspi;
                $fatal(1, "FAIL: 6B pattern data[%0d]=%02h want %02h",
                       k, got_arr[k], 8'hFE + k[7:0]);
          expect_line("op=6b bytes=9", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 11b: 0x6C Quad Output Read -- same framing as 0x6B
+      // but emits one-hot nibbles 1,2,4,8,... for lane/phase
+      // diagnostics. Upper-first byte assembly yields 12 48 ...
+      begin : frame11b
+         reg [7:0] got_arr [0:15];
+         integer   k;
+         reg [7:0] want;
+         oracle_crc      = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+
+         release_io();
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h6C, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         if (dut.io_oe !== 4'b0000)
+            $fatal(1, "FAIL: 6C io_oe asserted during dummy: %b",
+                   dut.io_oe);
+         spi_dummy_quad();
+         if (dut.io_oe !== 4'b1111)
+            $fatal(1, "FAIL: 6C io_oe must drive all 4 lanes after dummy, got %b",
+                   dut.io_oe);
+         for (k = 0; k < 16; k = k + 1) begin
+            spi_quad_data_byte(got_arr[k]);
+            if (dut.io_oe !== 4'b1111)
+               $fatal(1, "FAIL: 6C io_oe dropped during data byte %0d: %b",
+                      k, dut.io_oe);
+         end
+         #200 cs_n = 1;
+
+         #100;
+         if (io !== 4'bzzzz)
+            $fatal(1, "FAIL: DUT did not release IO after 6C CS rise, io=%b", io);
+         if (dut.io_oe !== 4'b0000)
+            $fatal(1, "FAIL: 6C io_oe must drop after CS rise: %b",
+                   dut.io_oe);
+
+         $write("QUAD trace (6C one-hot nibbles):");
+         for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
+         $display("");
+         for (k = 0; k < 16; k = k + 1) begin
+            want = k[0] ? 8'h48 : 8'h12;
+            if (got_arr[k] !== want)
+               $fatal(1, "FAIL: 6C one-hot data[%0d]=%02h want %02h",
+                      k, got_arr[k], want);
+         end
+         expect_line("op=6c bytes=9", oracle_crc ^ 32'hFFFFFFFF);
+      end
+
+      // Frame 11c: 0x6D Quad Output Read -- same framing as 0x6B
+      // but emits byte diagnostics 06..0d repeatedly.
+      begin : frame11c
+         reg [7:0] got_arr [0:15];
+         integer   k;
+         reg [7:0] want;
+         oracle_crc      = 32'hFFFFFFFF;
+         repeat (200) @(posedge clk);
+
+         release_io();
+         @(posedge clk);
+         cs_n = 0; #200;
+         spi_send(8'h6D, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         spi_send(8'h00, 1'b1);
+         if (dut.io_oe !== 4'b0000)
+            $fatal(1, "FAIL: 6D io_oe asserted during dummy: %b",
+                   dut.io_oe);
+         spi_dummy_quad();
+         if (dut.io_oe !== 4'b1111)
+            $fatal(1, "FAIL: 6D io_oe must drive all 4 lanes after dummy, got %b",
+                   dut.io_oe);
+         for (k = 0; k < 16; k = k + 1) begin
+            spi_quad_data_byte(got_arr[k]);
+            if (dut.io_oe !== 4'b1111)
+               $fatal(1, "FAIL: 6D io_oe dropped during data byte %0d: %b",
+                      k, dut.io_oe);
+         end
+         #200 cs_n = 1;
+
+         #100;
+         if (io !== 4'bzzzz)
+            $fatal(1, "FAIL: DUT did not release IO after 6D CS rise, io=%b", io);
+         if (dut.io_oe !== 4'b0000)
+            $fatal(1, "FAIL: 6D io_oe must drop after CS rise: %b",
+                   dut.io_oe);
+
+         $write("QUAD trace (6D byte sequence):");
+         for (k = 0; k < 16; k = k + 1) $write(" %02h", got_arr[k]);
+         $display("");
+         for (k = 0; k < 16; k = k + 1) begin
+            want = 8'h06 + {5'b0, k[2:0]};
+            if (got_arr[k] !== want)
+               $fatal(1, "FAIL: 6D sequence data[%0d]=%02h want %02h",
+                      k, got_arr[k], want);
+         end
+         expect_line("op=6d bytes=9", oracle_crc ^ 32'hFFFFFFFF);
       end
 
       // Frame 12: 0x32 WITHOUT prior 0x06 -- WEL is clear, so the

@@ -50,6 +50,12 @@ module qspi (
          quad_in_cnt <= 0;
          nibble_buf  <= 0;
          sfdp_idx    <= 0;
+         quad_active       <= 0;
+         quad_next_nibble  <= 0;
+         quad_data_byte    <= 0;
+         quad_data_drive_r <= 0;
+         quad_hi_next      <= 0;
+         quad_diag_idx     <= 0;
       end else begin
          shift_in <= {shift_in[5:0], io_d_in[0]};
          bit_cnt  <= bit_cnt + 3'd1;
@@ -63,7 +69,70 @@ module qspi (
                quad_in_cnt <= quad_in_cnt + 20'd1;
             end
          end
-         if (quad_advance) data_byte <= data_byte + 8'd1;
+         if (quad_start) begin
+            quad_active       <= 1'b1;
+            quad_data_drive_r <= 1'b1;
+            if (opcode == 8'h6C) begin
+               quad_next_nibble  <= quad_onehot(2'd0);
+               quad_diag_idx     <= 4'd1;
+               quad_data_byte    <= 8'h00;
+            end else if (opcode == 8'h6D) begin
+               quad_next_nibble  <= 4'h0;
+               quad_diag_idx     <= 4'd1;
+            end else if (opcode == 8'h6E) begin
+               quad_next_nibble  <= 4'h0;
+               quad_diag_idx     <= 4'd0;
+               quad_data_byte    <= 8'h00;
+            end else if (opcode == 8'h6F) begin
+               quad_next_nibble  <= 4'h0;
+               quad_diag_idx     <= 4'd0;
+               quad_data_byte    <= 8'h00;
+            end else begin
+               quad_next_nibble  <= quad_data_byte_seed[7:4];
+               quad_diag_idx     <= 4'd0;
+               quad_data_byte    <= quad_data_byte_seed;
+            end
+            quad_hi_next      <= 1'b0;
+         end else if (quad_data) begin
+            quad_data_drive_r <= 1'b1;
+            if (opcode == 8'h6C) begin
+               quad_next_nibble <= quad_onehot(quad_diag_idx[1:0]);
+               quad_diag_idx    <= quad_diag_idx + 4'd1;
+            end else if (opcode == 8'h6D) begin
+               quad_next_nibble <= quad_diag6d_nibble;
+               quad_diag_idx    <= quad_diag_idx + 4'd1;
+            end else if (opcode == 8'h6F) begin
+               quad_next_nibble <= quad_next_nibble + 4'd1;
+            end else if (opcode == 8'h6B) begin
+               if (quad_hi_next) begin
+                  quad_next_nibble <= quad_data_byte_inc[7:4];
+                  quad_data_byte   <= quad_data_byte_inc;
+                  quad_hi_next     <= 1'b0;
+               end else begin
+                  quad_next_nibble <= quad_data_byte[3:0];
+                  quad_hi_next     <= 1'b1;
+               end
+            end else begin
+               if (quad_hi_next) begin
+                  if (opcode == 8'h6E) begin
+                     quad_next_nibble <= quad_hold_byte_inc[7:4];
+                     quad_data_byte   <= quad_hold_byte_inc;
+                  end else begin
+                     quad_next_nibble <= quad_data_byte_inc[7:4];
+                     quad_data_byte   <= quad_data_byte_inc;
+                  end
+                  quad_hi_next     <= 1'b0;
+               end else begin
+                  quad_next_nibble <= quad_data_byte[3:0];
+                  quad_hi_next     <= 1'b1;
+               end
+            end
+         end else begin
+            quad_active       <= 1'b0;
+            quad_data_drive_r <= 1'b0;
+            quad_hi_next      <= 1'b0;
+            quad_diag_idx     <= 4'd0;
+         end
          if (byte_done && (   (opcode == 8'h03 && phase_cnt >  3'd3)
                            || (opcode == 8'h0B && phase_cnt >= 3'd4)))
             data_byte <= data_byte + 8'd1;
@@ -152,49 +221,56 @@ module qspi (
       sfdp_rom[7'h6A] = 8'h8F;
    end
    wire [7:0] sfdp_rd = sfdp_rom[sfdp_idx];
-   reg [3:0] quad_out;
    reg [3:0] quad_next_nibble;
+   reg [7:0] quad_data_byte;
+   reg       quad_data_drive_r;
+   reg       quad_hi_next;
+   reg       quad_active;
+   reg [3:0] quad_diag_idx;
+   wire [3:0] quad_diag6d_nibble =
+      quad_diag_idx[0] ? (4'h6 + {1'b0, quad_diag_idx[3:1]}) : 4'h0;
    initial begin
-      quad_out         = 0;
-      quad_next_nibble = 0;
+      quad_next_nibble   = 0;
+      quad_data_byte     = 0;
+      quad_data_drive_r  = 0;
+      quad_hi_next        = 0;
+      quad_active         = 0;
+      quad_diag_idx       = 0;
    end
-   wire quad_data    = (opcode == 8'h6B) && (phase_cnt >= 3'd5);
-   wire quad_advance = quad_data && bit_cnt[0];
-   // `data_byte_next_quad` is the value `data_byte` will hold
-   // after this posedge (which `quad_next_nibble` must slice
-   // from, so the negedge half a cycle later drives a value
-   // consistent with the new byte index).
-   wire [7:0] data_byte_next_quad =
-      data_byte + (quad_advance ? 8'd1 : 8'd0);
    
-   // `quad_data_post` is the post-rise value of `quad_data`. It
-   // is needed to prime `quad_next_nibble` on the rise that ENDS
-   // the dummy byte (where `quad_data` is still 0 pre-rise but 1
-   // post-rise) so the very first negedge of the data phase has
-   // a valid upper-nibble of byte 0 already loaded into the
-   // presenter's source register.
-   wire quad_data_post = quad_data
-      || (byte_done && phase_cnt == 3'd4 && opcode == 8'h6B);
-   
-   always @(posedge sclk or posedge cs_async_rst) begin
-      if (cs_async_rst) begin
-         quad_next_nibble <= 4'b0;
-      end else if (quad_data_post) begin
-         // STM32MP1 QUADSPI indirect-read assembles each byte as
-         // {second_sample[3:0], first_sample[3:0]} -- the FIRST
-         // negedge of a byte cycle drives the LOWER nibble and the
-         // second drives the UPPER. Post-rise bit_cnt[0] is the
-         // inverse of the pre-rise value: pre-rise 1 (the rise that
-         // completes the dummy byte or a quad-byte cycle) gives
-         // post-rise 0, which is the "first negedge of the next
-         // byte" slot, and the lower nibble is what we drive there.
-         if (bit_cnt[0] == 1'b1) quad_next_nibble <= data_byte_next_quad[3:0];
-         else                    quad_next_nibble <= data_byte_next_quad[7:4];
-      end
+   function automatic [3:0] quad_onehot(input [1:0] idx);
+      case (idx)
+         2'd0: quad_onehot = 4'h1;
+         2'd1: quad_onehot = 4'h2;
+         2'd2: quad_onehot = 4'h4;
+         default: quad_onehot = 4'h8;
+      endcase
+   endfunction
+   wire       quad_data     = quad_active;
+   wire       quad_start    = byte_done && phase_cnt == 3'd4
+                           && (opcode == 8'h6B || opcode == 8'h6C
+                            || opcode == 8'h6D || opcode == 8'h6E
+                            || opcode == 8'h6F);
+   wire [7:0] quad_data_byte_seed = data_byte;
+   wire [7:0] quad_data_byte_inc = quad_data_byte + 8'd1;
+   wire [7:0] quad_hold_byte_inc = (quad_data_byte == 8'hFF)
+                                 ? 8'h00 : (quad_data_byte + 8'h11);
+   wire [3:0] io_pad_src = {
+      quad_next_nibble[3],
+      quad_next_nibble[2],
+      quad_data_drive ? quad_next_nibble[1] : shift_out[7],
+      quad_next_nibble[0]
+   };
+   reg [3:0] io_pad_out;
+   initial begin
+      io_pad_out = 0;
    end
    always @(negedge sclk or posedge cs_async_rst) begin
-      if (cs_async_rst) quad_out <= 4'b0;
-      else if (quad_data) quad_out <= quad_next_nibble;
+      if (cs_async_rst) begin
+         io_pad_out <= 0;
+      end else begin
+         io_pad_out <= io_pad_src;
+      end
    end
    wire resp_window = (!cs_n)
                    && ( ((opcode == 8'h9F) && (phase_cnt >= 3'd1) && (phase_cnt <= 3'd3))
@@ -202,21 +278,54 @@ module qspi (
                      || ((opcode == 8'h03) && (phase_cnt >= 3'd4))
                      || ((opcode == 8'h0B) && (phase_cnt >= 3'd5))
                      || ((opcode == 8'h5A) && (phase_cnt >= 3'd5)) );
-   wire quad_data_drive = (!cs_n) && quad_data;
+   wire quad_data_drive = (!cs_n) && quad_data_drive_r;
+   wire [3:0] io_pad_selected = io_pad_out;
    wire io_oe_0    = quad_data_drive;
    wire io_oe_1    = quad_data_drive | resp_window;
    wire io_oe_2    = quad_data_drive;
    wire io_oe_3    = quad_data_drive;
-   wire io_d_out_0 = quad_out[0];
-   wire io_d_out_1 = quad_data_drive ? quad_out[1] : shift_out[7];
-   wire io_d_out_2 = quad_out[2];
-   wire io_d_out_3 = quad_out[3];
-   assign io[0] = io_oe_0 ? io_d_out_0 : 1'bz;
-   assign io[1] = io_oe_1 ? io_d_out_1 : 1'bz;
-   assign io[2] = io_oe_2 ? io_d_out_2 : 1'bz;
-   assign io[3] = io_oe_3 ? io_d_out_3 : 1'bz;
+   wire io_d_out_0 = io_pad_selected[0];
+   wire io_d_out_1 = io_pad_selected[1];
+   wire io_d_out_2 = io_pad_selected[2];
+   wire io_d_out_3 = io_pad_selected[3];
+   wire io_d_in_0;
+   wire io_d_in_1;
+   wire io_d_in_2;
+   wire io_d_in_3;
+   SB_IO #(
+      .PIN_TYPE(6'b101001)
+   ) io0_iob (
+      .PACKAGE_PIN(io[0]),
+      .OUTPUT_ENABLE(io_oe_0),
+      .D_OUT_0(io_d_out_0),
+      .D_IN_0(io_d_in_0)
+   );
+   SB_IO #(
+      .PIN_TYPE(6'b101001)
+   ) io1_iob (
+      .PACKAGE_PIN(io[1]),
+      .OUTPUT_ENABLE(io_oe_1),
+      .D_OUT_0(io_d_out_1),
+      .D_IN_0(io_d_in_1)
+   );
+   SB_IO #(
+      .PIN_TYPE(6'b101001)
+   ) io2_iob (
+      .PACKAGE_PIN(io[2]),
+      .OUTPUT_ENABLE(io_oe_2),
+      .D_OUT_0(io_d_out_2),
+      .D_IN_0(io_d_in_2)
+   );
+   SB_IO #(
+      .PIN_TYPE(6'b101001)
+   ) io3_iob (
+      .PACKAGE_PIN(io[3]),
+      .OUTPUT_ENABLE(io_oe_3),
+      .D_OUT_0(io_d_out_3),
+      .D_IN_0(io_d_in_3)
+   );
    wire [3:0] io_oe   = {io_oe_3, io_oe_2, io_oe_1, io_oe_0};
-   wire [3:0] io_d_in = io;
+   wire [3:0] io_d_in = {io_d_in_3, io_d_in_2, io_d_in_1, io_d_in_0};
    reg [31:0] crc_reg;
    initial crc_reg = 32'hFFFFFFFF;
    
@@ -238,6 +347,10 @@ module qspi (
         (opcode == 8'h0B)                                 ? (phase_cnt <= 3'd3) :
         (opcode == 8'h5A)                                 ? (phase_cnt <= 3'd3) :
         (opcode == 8'h6B)                                 ? (phase_cnt <= 3'd3) :
+        (opcode == 8'h6C)                                 ? (phase_cnt <= 3'd3) :
+        (opcode == 8'h6D)                                 ? (phase_cnt <= 3'd3) :
+        (opcode == 8'h6E)                                 ? (phase_cnt <= 3'd3) :
+        (opcode == 8'h6F)                                 ? (phase_cnt <= 3'd3) :
         (opcode == 8'h32)                                 ? (phase_cnt <= 3'd3) :
                                                             1'b1;
    wire quad_in_byte_done = quad_in_phase && (qin_phase == 1'b1);
@@ -254,6 +367,7 @@ module qspi (
    initial begin
       wel = 0;
    end
+   /* verilator lint_off SYNCASYNCNET */
    reg [1:0] cs_sync;
    initial cs_sync = 2'b11;
    always @(posedge clk) cs_sync <= {cs_sync[0], cs_n};
@@ -265,7 +379,13 @@ module qspi (
    
    reg cs_async_rst;
    initial cs_async_rst = 1'b1;
-   always @(posedge clk) cs_async_rst <= cs_s_d;
+   always @(posedge clk or negedge cs_n) begin
+      if (!cs_n)
+         cs_async_rst <= 1'b0;
+      else
+         cs_async_rst <= cs_s_d;
+   end
+   /* verilator lint_on SYNCASYNCNET */
    always @(posedge clk) begin
       if (frame_done) begin
          if (snap_op == 8'h06 && snap_byte_cnt == 8'd1)
@@ -356,9 +476,8 @@ module qspi (
    end
    function [7:0] hexchar(input [3:0] n);
       hexchar = (n < 4'd10) ? (8'h30 + {4'h0, n})
-                            : (8'h61 + {4'h0, n} - 8'd10);
+                             : (8'h61 + {4'h0, n} - 8'd10);
    endfunction
-   
    wire [3:0] d1, d0;
    wire [3:0] unused_d1_hi, unused_d0_hi;
    assign {unused_d1_hi, d1} = p_cnt / 8'd10;
