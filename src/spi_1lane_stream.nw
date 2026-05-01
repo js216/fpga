@@ -1,0 +1,666 @@
+% spi_1lane_stream.nw -- 1-lane QUADSPI stream wall-rate validation.
+%
+% Lives as a sibling chapter to src/spi.nw. The parent Makefile auto-
+% discovers it via CHAPTERS := $(notdir $(basename $(wildcard src/*.nw)))
+% and applies CHAP_RULES so a build/spi_1lane_stream/ tree is created
+% without any parent-Makefile changes.
+
+== 1-lane stream wall-rate chapter
+
+This chapter scopes the 1-lane (LANES=1) QUADSPI stream-mode wall-rate
+sweep so the mission-critical >=100 Mbps measurement runs in isolation
+from the larger 1-lane regression in `src/spi.nw`. The mission target
+is sustained FPGA->MP135 stream transfer of at least 100 Mbps in
+1-lane mode with no data errors. The bitstream is `spi_1lane.bin`,
+built by the spi chapter as a side effect of `make -C build/spi
+bitstreams`; no new RTL is introduced here.
+
+The chapter tests three prescaler settings using the auto-consume
+streaming command (`A`), routed through `cmd_auto_stream` (cli.c:1236)
+-> `stream_direct_crc_eligible(quad=0, raw=1) && auto_consume` ->
+`stream_direct_crc_read` -> `qspi_mdma_crc_read` (qspi.c:790). This is
+a DIFFERENT mechanism than `b` (which BLOCKED at spi block 8 due to
+SB_IO timing margin at presc=15): `A` uses hardware MDMA + hardware
+CRC1 drain through DMA, while `b` uses CPU-polled FIFO byte-by-byte.
+The 1-lane peripheral raw read at presc=5 sshift=1 (`j 512 0`)
+already PASSED on this rig in spi block 4, confirming the SCLK
+~109 MHz sample point CAN land in the data eye for that
+prescaler/sshift combo.
+
+A preflight raw read at presc=203 (`j 512 0`) runs first to prove
+the `spi_1lane.bin` bitstream is loaded and that the 1-lane data-phase
+reaches the MP135 with the expected incrementing byte pattern. The
+remaining four blocks order cheap controls first with the mission
+target (`presc=5` >=100 Mbps wall rate over 32 MiB) last. Presc=15
+(SB_IO margin failure, BLOCKED in spi block 8) and presc=255
+(no diagnostic value) are intentionally skipped; the 512 MB stream
+block is deferred to a later iteration if the mission target passes.
+
+<<TEST.md>>=
+Preflight -- 1-lane peripheral raw read at presc=203.
+
+```
+fpga:program bin=@spi_1lane.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=1500
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 203 0\r"
+delay ms=100
+mp135:uart_write data="j 512 0\r"
+mp135:uart_expect sentinel="raw read 512 (1lane)" timeout_ms=5000
+delay ms=700
+mp135:uart_close
+```
+
+- Check 1lane peripheral raw read at presc=203 returns 512-byte incrementing pattern
+
+Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=203.
+
+```
+fpga:program bin=@spi_1lane.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=1500
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 203\r"
+delay ms=100
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mark tag=bench_start
+mp135:uart_write data="A 1000000 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 1000000 B" timeout_ms=40000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=40000
+mp135:uart_close
+```
+
+- Check 1lane stream @ presc=203 pattern correct
+
+Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=63.
+
+```
+fpga:program bin=@spi_1lane.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=1500
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 63\r"
+delay ms=100
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mark tag=bench_start
+mp135:uart_write data="A 2097152 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 2097152 B" timeout_ms=15000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135:uart_close
+```
+
+- Check 1lane stream @ presc=63 pattern correct
+
+Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=5.
+
+```
+fpga:program bin=@spi_1lane.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=1500
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5 1\r"
+delay ms=100
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mark tag=bench_start
+mp135:uart_write data="A 16842752 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 16842752 B" timeout_ms=15000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135:uart_close
+```
+
+- Check 1lane stream @ presc=5 pattern correct
+
+Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=5 wall-rate floor.
+
+```
+fpga:program bin=@spi_1lane.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=1500
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 5 1\r"
+delay ms=100
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mark tag=bench_start
+mp135:uart_write data="A 33554432 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 33554432 B" timeout_ms=15000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135:uart_close
+```
+
+- Check 1lane stream @ presc=5 wall rate >= 100 Mbps
+@
+
+== Verifier
+
+The verifier walks the captured MP135 UART stream
+(`streams/mp135.uart.bin`) for the bench summary line that the
+firmware prints once the streaming read has been validated against
+the incrementing pattern. The line carries `<mode> @ presc=<N>`
+plus elapsed time, effective Mbps, a `firsterr=<offset>` field that
+is `-1` only when every byte matched, and an `auto=on` flag that the
+stream-pattern helper requires. The verifier prints the configured
+SCLK, firmware effective Mbps, test-server wall time between the
+`bench_start` and `bench_done` marks, and a wall-rate computed from
+requested payload bits divided by measured wall time next to each
+prescaler result. The mission target is the final block:
+`check_stream_wall_rate_at_least("1lane", 5, 100.0, 33554432)` --
+gates on CRC + firsterr=-1 + chunk shape + auto=on, then asserts
+wall rate >=100 Mbps from the bench_start/bench_done marks divided
+into 33554432 bytes.
+
+The helpers (`STREAM_RE`, `_stream_pick`, `_stream_rates`,
+`_stream_rate_text`, `check_stream_pattern`,
+`check_stream_wall_rate_at_least`, `check_raw_read_pattern`,
+`_bench_wall_ms`, `_check_rates_with_clock`,
+`_check_physical_floor`, `_check_physical_ceiling`,
+`_physical_max_mbps`, `STREAM_EFFECTIVE_RATE_FLOOR`,
+`STREAM_WALL_RATE_FLOOR`, `QSPI_KER_HZ`) are copied verbatim from
+the `verify.py` chunk in `src/spi.nw`. Quad helpers, MDMA helpers,
+bench `b` helpers, the diagnostic 0x6C/0x6D/0x6E/0x6F helpers, and
+debug-uart parsers are intentionally dropped: this chapter exercises
+only the 1-lane stream `A` path.
+
+<<verify.py>>=
+import os
+import re
+import sys
+import zlib
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
+import verify_lib as v
+
+
+UART = "streams/mp135.uart.bin"
+TIMELINE = "timeline.log"
+QSPI_KER_HZ = 656_000_000
+
+STREAM_RE = re.compile(
+    rb"stream\s+(\d+)\s+B\s+(1lane|quad)\s+in\s+"
+    rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=([0-9a-f]+),\s+"
+    rb"expect=([0-9a-f]+),\s+firsterr=(-?\d+),\s+chunk=(\d+),\s+"
+    rb"chunks=(\d+),\s+(?:buf=(sram|ddr|crc),\s+)?auto=(on|off)"
+    rb"(?:,\s+presc=(\d+),\s+qspi_hz=(\d+))?")
+HEXLINE_RE = re.compile(rb"[0-9a-f]{8}:(?:\s+[0-9a-f]{2}){1,16}")
+HEXBYTE_RE = re.compile(rb"\b([0-9a-f]{2})\b")
+
+
+def _read_uart():
+    if not os.path.isfile(UART):
+        sys.stderr.write(f"{UART} missing\n")
+        return None
+    with open(UART, "rb") as f:
+        return f.read()
+
+
+def _read_timeline():
+    if not os.path.isfile(TIMELINE):
+        sys.stderr.write(f"{TIMELINE} missing\n")
+        return None
+    with open(TIMELINE, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def _bytes_after(header):
+    raw = _read_uart()
+    if raw is None:
+        return None
+    pos = raw.find(header)
+    if pos < 0:
+        sys.stderr.write(f"missing header {header!r}\n")
+        sys.stderr.write("--- last 1024 bytes of UART ---\n")
+        sys.stderr.write(raw[-1024:].decode("ascii", "replace"))
+        sys.stderr.write("\n")
+        return None
+    out = []
+    for line in raw[pos + len(header):].splitlines():
+        if not HEXLINE_RE.match(line):
+            if out:
+                break
+            continue
+        payload = line.split(b":", 1)[1]
+        for m in HEXBYTE_RE.finditer(payload):
+            out.append(int(m.group(1), 16))
+    return out
+
+
+def _stream_pick(mode, byte_count=1048576, presc=None):
+    raw = _read_uart()
+    if raw is None:
+        return None
+    last = None
+    for m in STREAM_RE.finditer(raw):
+        if int(m.group(1)) == byte_count and m.group(2).decode() == mode:
+            if presc is None:
+                last = m
+                continue
+            if m.group(12) is None:
+                continue
+            if int(m.group(12)) == presc:
+                last = m
+    return last
+
+
+def _sclk_mhz(presc):
+    return QSPI_KER_HZ / (presc + 1) / 1_000_000
+
+
+def _mark_time(text, tag):
+    m = re.search(r"^\s*(\d+\.\d+)\s+MARK\s+ctrl\s+" + re.escape(tag) + r"\s*$",
+                  text, flags=re.MULTILINE)
+    return float(m.group(1)) if m else None
+
+
+def _bench_wall_ms():
+    text = _read_timeline()
+    if text is None:
+        return None
+    start = _mark_time(text, "bench_start")
+    done = _mark_time(text, "bench_done")
+    if start is None or done is None:
+        return None
+    return max(0.0, (done - start) * 1000.0)
+
+
+def _wall_rate_mbps(byte_count, wall_ms):
+    if wall_ms is None or wall_ms <= 0.0:
+        return None
+    return byte_count * 8.0 / (wall_ms * 1000.0)
+
+
+STREAM_EFFECTIVE_RATE_FLOOR = 0.90
+STREAM_WALL_RATE_FLOOR = 0.90
+
+
+def _physical_max_mbps(mode, presc, qspi_hz=QSPI_KER_HZ):
+    lanes = 4 if mode == "quad" else 1
+    return (qspi_hz / (presc + 1) / 1_000_000) * lanes
+
+
+def _check_physical_ceiling(label, mode, presc, rate, qspi_hz):
+    max_rate = _physical_max_mbps(mode, presc, qspi_hz)
+    tolerance = max(0.001, max_rate * 0.001)
+    if rate > max_rate + tolerance:
+        sys.stderr.write(
+            f"{label}={rate:.3f}Mbps above physical ceiling "
+            f"{max_rate:.3f}Mbps for {mode} presc={presc}\n")
+        return False
+    return True
+
+
+def _check_physical_floor(label, mode, presc, rate, qspi_hz, floor):
+    max_rate = _physical_max_mbps(mode, presc, qspi_hz)
+    lo = floor * max_rate
+    tolerance = max(0.05, max_rate * 0.005)
+    if rate < lo - tolerance:
+        sys.stderr.write(
+            f"{label}={rate:.3f}Mbps below sanity floor "
+            f"{lo:.3f}Mbps ({floor:.0%} of physical, "
+            f"tolerance {tolerance:.3f}Mbps, "
+            f"{max_rate:.3f}Mbps) for {mode} presc={presc}\n")
+        return False
+    return True
+
+
+def _wall_text(byte_count, wall_ms):
+    if wall_ms is None:
+        return " wall=unknown wall_rate=unknown"
+    rate = _wall_rate_mbps(byte_count, wall_ms)
+    if rate is None:
+        return f" wall={wall_ms:.0f}ms wall_rate=unknown"
+    return f" wall={wall_ms:.0f}ms wall_rate={rate:.3f}Mbps"
+
+
+def _stream_rate_text(mode, presc, match):
+    byte_count = int(match.group(1))
+    ms = int(match.group(3))
+    mbps = match.group(4).decode("ascii")
+    crc = match.group(5).decode("ascii")
+    expect = match.group(6).decode("ascii")
+    wall_ms = _bench_wall_ms()
+    wall = _wall_text(byte_count, wall_ms)
+    qspi = ""
+    buf = match.group(10).decode() if match.group(10) else "unknown"
+    auto = match.group(11).decode()
+    if match.group(13) is not None:
+        qspi = f" qspi_hz={int(match.group(13))}"
+    return (f"{mode} stream @ presc={presc} bytes={byte_count} "
+            f"sclk={_sclk_mhz(presc):.1f}MHz effective={mbps}Mbps "
+            f"bench={ms}ms crc32={crc} expect={expect} "
+            f"chunk={int(match.group(8))} "
+            f"chunks={int(match.group(9))} buf={buf} auto={auto}"
+            f"{qspi}{wall}")
+
+
+def _stream_rates(match):
+    byte_count = int(match.group(1))
+    effective = float(match.group(4).decode("ascii"))
+    wall = _wall_rate_mbps(byte_count, _bench_wall_ms())
+    return effective, wall
+
+
+def _stream_detail_block(mode, presc, match, wall):
+    wall_text = "unknown" if wall is None else f"{wall:.3f}Mbps"
+    buf = match.group(10).decode() if match.group(10) else "unknown"
+    auto = match.group(11).decode()
+    qspi = "unknown" if match.group(13) is None else match.group(13).decode()
+    return (
+        f"stream details:\n"
+        f"  mode={mode} presc={presc} sclk={_sclk_mhz(presc):.3f}MHz "
+        f"qspi_hz={qspi}\n"
+        f"  effective={float(match.group(4).decode('ascii')):.3f}Mbps "
+        f"wall_rate={wall_text} bench={int(match.group(3))}ms\n"
+        f"  crc32={match.group(5).decode('ascii')} "
+        f"expect={match.group(6).decode('ascii')} "
+        f"firsterr={int(match.group(7))}\n"
+        f"  chunk={int(match.group(8))} chunks={int(match.group(9))} "
+        f"buf={buf} auto={auto}\n")
+
+
+def _check_rates_with_clock(rate, mode, presc, effective, wall, qspi_hz,
+                            byte_count=None, print_rate=True,
+                            wall_floor_mbps=None):
+    if not _check_physical_ceiling("effective", mode, presc, effective,
+                                   qspi_hz):
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    if not _check_physical_floor("effective", mode, presc, effective,
+                                 qspi_hz, STREAM_EFFECTIVE_RATE_FLOOR):
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    if wall is None:
+        sys.stderr.write(f"wall_rate=unknown for {mode} presc={presc}\n")
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    if not _check_physical_ceiling("wall_rate", mode, presc, wall, qspi_hz):
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    if wall_floor_mbps is None:
+        if not _check_physical_floor("wall_rate", mode, presc, wall,
+                                     qspi_hz, STREAM_WALL_RATE_FLOOR):
+            if print_rate:
+                sys.stderr.write(rate + "\n")
+            return False
+    elif wall < wall_floor_mbps:
+        sys.stderr.write(
+            f"wall_rate={wall:.3f}Mbps below sanity floor "
+            f"{wall_floor_mbps:.3f}Mbps for {mode} presc={presc}\n")
+        if print_rate:
+            sys.stderr.write(rate + "\n")
+        return False
+    return True
+
+
+def _expected_crc32(byte_count):
+    pattern = bytes(range(256)) * 16
+    whole, rem = divmod(byte_count, len(pattern))
+    crc = 0
+    for _ in range(whole):
+        crc = zlib.crc32(pattern, crc)
+    if rem:
+        crc = zlib.crc32(pattern[:rem], crc)
+    return crc & 0xffffffff
+
+
+def _check_crc(label, byte_count, got_hex):
+    got = int(got_hex, 16)
+    exp = _expected_crc32(byte_count)
+    if got != exp:
+        sys.stderr.write(
+            f"{label} crc32={got:08x} expected={exp:08x}\n")
+        return False
+    return True
+
+
+def _check_stream_shape(rate, match, expected_chunk=None, min_chunks=None):
+    chunk = int(match.group(8))
+    chunks = int(match.group(9))
+    if expected_chunk is not None and chunk != expected_chunk:
+        sys.stderr.write(
+            f"{rate}: chunk={chunk} expected {expected_chunk}\n")
+        return False
+    if min_chunks is not None and chunks < min_chunks:
+        sys.stderr.write(
+            f"{rate}: chunks={chunks} below minimum {min_chunks}\n")
+        return False
+    return True
+
+
+def check_raw_read_pattern(mode, count):
+    if not v.check_no_errors():
+        return False
+    if mode == "quad":
+        header = f"op=6b read {count} @ 0x00000000".encode("ascii")
+    else:
+        header = f"raw read {count} (1lane)".encode("ascii")
+    got = _bytes_after(header)
+    if got is None:
+        return False
+    expect = [i & 0xff for i in range(count)]
+    sys.stdout.write(
+        f"{mode} raw got: {' '.join(f'{b:02x}' for b in got[:count])}\n")
+    if len(got) < count:
+        sys.stderr.write(
+            f"{mode} raw short capture: got {len(got)} bytes, "
+            f"expected {count}\n")
+        return False
+    if got[:count] != expect:
+        for i, (g, e) in enumerate(zip(got[:count], expect)):
+            if g != e:
+                sys.stderr.write(
+                    f"{mode} raw mismatch at {i}: got {g:02x}, "
+                    f"expected {e:02x}\n")
+                break
+        return False
+    return True
+
+
+def check_stream_pattern(mode, presc, byte_count=1048576, max_wall_ms=None,
+                         expected_chunk=None, min_chunks=None,
+                         wall_floor_mbps=None):
+    if not v.check_no_errors():
+        return False
+    m = _stream_pick(mode, byte_count, presc)
+    if m is None:
+        sys.stderr.write(f"no {mode} stream line for {byte_count} bytes\n")
+        raw = _read_uart()
+        if raw:
+            sys.stderr.write("--- last 512 bytes of UART ---\n")
+            sys.stderr.write(raw[-512:].decode("ascii", "replace"))
+            sys.stderr.write("\n")
+        return False
+    byte_count = int(m.group(1))
+    fe = int(m.group(7))
+    rate = _stream_rate_text(mode, presc, m)
+    effective, wall = _stream_rates(m)
+    qspi_hz = int(m.group(13)) if m.group(13) is not None else QSPI_KER_HZ
+    if not _check_rates_with_clock(rate, mode, presc, effective, wall,
+                                   qspi_hz, byte_count,
+                                   print_rate=False,
+                                   wall_floor_mbps=wall_floor_mbps):
+        sys.stderr.write(_stream_detail_block(mode, presc, m, wall))
+        return False
+    if not _check_crc(f"{mode} stream presc={presc}", byte_count,
+                      m.group(5).decode("ascii")):
+        sys.stderr.write(rate + "\n")
+        return False
+    got = int(m.group(5), 16)
+    exp = int(m.group(6), 16)
+    if got != exp:
+        sys.stderr.write(
+            f"{mode} stream crc32={got:08x} expect={exp:08x}\n")
+        sys.stderr.write(rate + "\n")
+        return False
+    if fe != -1:
+        sys.stderr.write(f"{rate}: firsterr={fe} (expected -1)\n")
+        return False
+    if m.group(11) != b"on":
+        sys.stderr.write(f"{rate}: auto-consume is not on\n")
+        return False
+    if not _check_stream_shape(rate, m, expected_chunk, min_chunks):
+        return False
+    if max_wall_ms is not None:
+        wall_ms = _bench_wall_ms()
+        if wall_ms is None:
+            sys.stderr.write(f"{rate}: wall time unknown\n")
+            return False
+        if wall_ms > max_wall_ms:
+            sys.stderr.write(
+                f"{rate}: wall={wall_ms:.0f}ms exceeds "
+                f"{max_wall_ms}ms hard limit\n")
+            return False
+    sys.stdout.write(rate + "\n")
+    return True
+
+
+def check_stream_wall_rate_at_least(mode, presc, min_mbps, byte_count=1000000,
+                                    max_wall_ms=None, expected_chunk=None,
+                                    min_chunks=None):
+    if not check_stream_pattern(mode, presc, byte_count, max_wall_ms,
+                                expected_chunk, min_chunks):
+        return False
+    m = _stream_pick(mode, byte_count, presc)
+    rate = _stream_rate_text(mode, presc, m)
+    _effective, wall = _stream_rates(m)
+    if wall is None:
+        sys.stderr.write(
+            f"{rate}: wall_rate=unknown "
+            f"(expected >= {min_mbps:.3f}Mbps)\n")
+        return False
+    if wall < min_mbps:
+        sys.stderr.write(
+            f"{rate}: wall_rate={wall:.3f}Mbps below {min_mbps:.3f}Mbps\n")
+        return False
+    sys.stdout.write(rate + f" wall_rate_floor={min_mbps:.3f}Mbps\n")
+    return True
+
+
+DISPATCH = {
+    "Check 1lane peripheral raw read at presc=203 returns 512-byte incrementing pattern":
+        (lambda: check_raw_read_pattern("1lane", 512)),
+    "Check 1lane stream @ presc=203 pattern correct":
+        (lambda: check_stream_pattern("1lane", 203, 1000000)),
+    "Check 1lane stream @ presc=63 pattern correct":
+        (lambda: check_stream_pattern("1lane", 63, 2097152)),
+    "Check 1lane stream @ presc=5 pattern correct":
+        (lambda: check_stream_pattern("1lane", 5, 16842752,
+                                      expected_chunk=16777216,
+                                      min_chunks=2)),
+    "Check 1lane stream @ presc=5 wall rate >= 100 Mbps":
+        (lambda: check_stream_wall_rate_at_least("1lane", 5, 100.0, 33554432,
+                                                 expected_chunk=16777216,
+                                                 min_chunks=2)),
+}
+
+
+if __name__ == "__main__":
+    sys.exit(v.main(DISPATCH, sys.argv))
+@
+
+== Test runner
+
+`build/spi_1lane_stream/Makefile` is the entry point invoked from
+`cd build/spi_1lane_stream && make test`. It re-tangles the plan and
+the verifier from `src/spi_1lane_stream.nw` so an edit to this chapter
+is picked up on the next test run, then hands off to the shared
+`run_md.py` driver pointed at by `$TEST_SERV`.
+
+The chapter introduces no new RTL: `bitstream` depends on the canonical
+`spi_1lane.bin` produced under `build/spi/` (the spi chapter's
+`bitstreams` target builds it), and `spi_1lane.bin` is symlinked into
+the chapter's build directory. `flash.tsv` and `main.stm32` are the
+same MP135 host artifacts the spi chapter uses, symlinked from the
+MP135 baremetal qspi build tree. `sim` is a no-op for this chapter.
+
+<<Makefile>>=
+NW := ../../src/spi_1lane_stream.nw
+MP135_QSPI_DIR := /home/claude/stm32mp135_test_board/baremetal/qspi/build
+MP135_QSPI_SRC := /home/claude/stm32mp135_test_board/baremetal/qspi
+
+.PHONY: all test bitstreams sim bitstream
+all: TEST.md verify.py spi_1lane.bin flash.tsv main.stm32
+
+Makefile: $(NW)
+	tangle Makefile < $<
+
+test: all bitstreams
+	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi_1lane_stream --log run_md.log
+
+bitstreams: spi_1lane.bin
+
+bitstream: bitstreams
+
+sim:
+
+TEST.md: $(NW)
+	tangle TEST.md < $<
+
+verify.py: $(NW)
+	tangle verify.py < $<
+
+spi_1lane.bin:
+	$(MAKE) -C ../.. build/spi/spi_1lane.bin
+	ln -sf ../spi/spi_1lane.bin $@
+
+flash.tsv:
+	ln -sf $(MP135_QSPI_SRC)/flash.tsv $@
+
+main.stm32:
+	ln -sf $(MP135_QSPI_DIR)/main.stm32 $@
+@
+
+<<spi_1lane_stream.mk>>=
+# spi_1lane_stream: no new RTL. The bitstream is spi_1lane.bin built
+# under build/spi/. We expose it inside build/spi_1lane_stream/ via a
+# symlink so the in-build-dir Makefile can resolve it relatively.
+
+build/spi_1lane_stream/spi_1lane.bin: build/spi/spi_1lane.bin | build/spi_1lane_stream
+	ln -sf ../spi/spi_1lane.bin $@
+
+build/spi_1lane_stream/flash.tsv: | build/spi_1lane_stream
+	ln -sf $(MP135_QSPI_SRC)/flash.tsv $@
+
+build/spi_1lane_stream/main.stm32: | build/spi_1lane_stream
+	ln -sf $(MP135_QSPI_DIR)/main.stm32 $@
+
+bitstream: build/spi_1lane_stream/spi_1lane.bin
+@
+
+== Summary
+
+This chapter adds a new <ex>=spi_1lane_stream scope to the
+Makefile-driven regression suite: a 5-block TEST.md (preflight + 4
+stream prescaler points) and a verify.py that copies the spi.nw
+stream-parsing helpers verbatim. The chapter introduces no new RTL
+and reuses the spi_1lane.bin bitstream directly. Block 5 (`presc=5`
+wall rate >=100 Mbps over 32 MiB) carries the mission target:
+sustained 1-lane QUADSPI auto-consume stream transfer at >=100 Mbps
+with no data errors.
