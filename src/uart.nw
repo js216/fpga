@@ -1125,16 +1125,16 @@ land, and then closes the capture.
 
 <<TEST.md>>=
 ```
-fpga:uart_close
-fpga:program bin=@uart.bin
+fpga.hx1k:uart_close
+fpga.hx1k:program bin=@uart.bin
 delay ms=2000
-fpga:uart_open
+fpga.hx1k:uart_open
 delay ms=2200
-fpga:uart_write data="x"
+fpga.hx1k:uart_write data="x"
 delay ms=300
-fpga:uart_write data="y"
+fpga.hx1k:uart_write data="y"
 delay ms=300
-fpga:uart_close
+fpga.hx1k:uart_close
 ```
 
 - Check `test_serv` had no errors
