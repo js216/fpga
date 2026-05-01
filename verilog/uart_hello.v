@@ -15,7 +15,7 @@ module uart_hello #(
       msg_idx = 0;
       active  = 0;
    end
-   localparam MSG_LEN = 6'd21;
+   localparam MSG_LEN = 6'd18;
    
    reg [7:0] msg_byte;
    always @* begin
@@ -34,13 +34,10 @@ module uart_hello #(
          6'd11: msg_byte = "i";
          6'd12: msg_byte = "C";
          6'd13: msg_byte = "E";
-         6'd14: msg_byte = "s";
-         6'd15: msg_byte = "t";
-         6'd16: msg_byte = "i";
-         6'd17: msg_byte = "c";
-         6'd18: msg_byte = "k";
-         6'd19: msg_byte = 8'h0d;
-         6'd20: msg_byte = 8'h0a;
+         6'd14: msg_byte = "4";
+         6'd15: msg_byte = "0";
+         6'd16: msg_byte = 8'h0d;
+         6'd17: msg_byte = 8'h0a;
          default: msg_byte = 8'h00;
       endcase
    end

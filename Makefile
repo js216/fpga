@@ -2,9 +2,21 @@ CHAPTERS := $(notdir $(basename $(wildcard src/*.nw)))
 
 chapter_src = src/$(1).nw
 
-# iCEstick defaults; override on command line.
+# Single-target default (used by chapters that don't declare BOARDS_<name>).
+# Override on the command line: `make DEVICE=hx8k PACKAGE=ct256 ...`.
 DEVICE  ?= hx1k
 PACKAGE ?= tq144
+
+# Chapters that build for more than one iCE40 board declare their list
+# below. Each board gets its own subdirectory under build/<chap>/, its
+# own pcf (verilog/<chap>_<board>.pcf), its own bitstream, and its own
+# tangled TEST.md / verify.py. Single-target chapters leave BOARDS_<chap>
+# empty and keep the legacy DEVICE/PACKAGE flow.
+BOARDS_uart := hx1k hx8k
+
+# Per-board nextpnr arguments. Add a row when you add a board.
+nextpnr_pkg_hx1k := tq144
+nextpnr_pkg_hx8k := ct256
 
 .PHONY: all doc sim formal bitstream clean
 
@@ -54,14 +66,6 @@ build/$(1)/$(1).mk: $$(call chapter_src,$(1)) | build/$(1)
 	@cd build/$(1) && tangle $(1).mk < ../../$$< 2>/dev/null
 	@touch $$@
 
-build/$(1)/TEST.md: $$(call chapter_src,$(1)) | build/$(1)
-	@cd build/$(1) && tangle TEST.md < ../../$$< 2>/dev/null
-	@touch $$@
-
-build/$(1)/verify.py: $$(call chapter_src,$(1)) | build/$(1)
-	@cd build/$(1) && tangle verify.py < ../../$$< 2>/dev/null
-	@touch $$@
-
 build/$(1)/Makefile: $$(call chapter_src,$(1)) | build/$(1)
 	@cd build/$(1) && tangle Makefile < ../../$$< 2>/dev/null
 	@touch $$@
@@ -73,6 +77,19 @@ build/$(1)/$(1).typ: $$(call chapter_src,$(1)) style.typ | build/$(1)
 doc/$(1).pdf: build/$(1)/$(1).typ | docdir
 	typst compile $$< $$@
 
+doc: doc/$(1).pdf
+
+ifeq ($$(BOARDS_$(1)),)
+# ---- single-target chapter: legacy DEVICE/PACKAGE flow ----
+
+build/$(1)/TEST.md: $$(call chapter_src,$(1)) | build/$(1)
+	@cd build/$(1) && tangle TEST.md < ../../$$< 2>/dev/null
+	@touch $$@
+
+build/$(1)/verify.py: $$(call chapter_src,$(1)) | build/$(1)
+	@cd build/$(1) && tangle verify.py < ../../$$< 2>/dev/null
+	@touch $$@
+
 build/$(1)/$(1).asc: build/$(1)/$(1).json verilog/$(1).pcf
 	cd build/$(1) && nextpnr-ice40 --$$(DEVICE) --package $$(PACKAGE) \
 		--json $(1).json --pcf ../../verilog/$(1).pcf \
@@ -81,7 +98,37 @@ build/$(1)/$(1).asc: build/$(1)/$(1).json verilog/$(1).pcf
 build/$(1)/$(1).bin: build/$(1)/$(1).asc
 	cd build/$(1) && icepack $(1).asc $(1).bin
 
-doc: doc/$(1).pdf
+else
+# ---- multi-board chapter: one bitstream per board ----
+$$(foreach b,$$(BOARDS_$(1)),$$(eval $$(call CHAP_BOARD_RULES,$(1),$$(b))))
+endif
+
+endef
+
+# Per-(chapter,board) rules. $(1) = chapter, $(2) = board.
+define CHAP_BOARD_RULES
+
+build/$(1)/$(2):
+	mkdir -p $$@
+
+build/$(1)/$(2)/TEST.md: $$(call chapter_src,$(1)) | build/$(1)/$(2)
+	@cd build/$(1)/$(2) && tangle TEST.$(2).md < ../../../$$< 2>/dev/null && \
+		mv TEST.$(2).md TEST.md
+	@touch $$@
+
+build/$(1)/$(2)/verify.py: $$(call chapter_src,$(1)) | build/$(1)/$(2)
+	@cd build/$(1)/$(2) && tangle verify.py < ../../../$$< 2>/dev/null
+	@touch $$@
+
+build/$(1)/$(2)/$(1).asc: build/$(1)/$(1).json verilog/$(1)_$(2).pcf | build/$(1)/$(2)
+	cd build/$(1)/$(2) && nextpnr-ice40 --$(2) --package $$(nextpnr_pkg_$(2)) \
+		--json ../$(1).json --pcf ../../../verilog/$(1)_$(2).pcf \
+		--asc $(1).asc --freq 12 -q
+
+build/$(1)/$(2)/$(1).bin: build/$(1)/$(2)/$(1).asc
+	cd build/$(1)/$(2) && icepack $(1).asc $(1).bin
+
+bitstream: build/$(1)/$(2)/$(1).bin
 
 endef
 
