@@ -10,19 +10,22 @@ module tb_spi_1lane;
    pullup pu3 (io[3]);
    spi #(.LANES(1)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
    integer   errs;
-   reg [7:0] rx;
+   reg [7:0] rx_io0;
+   reg [7:0] rx_io1;
    task automatic clock_byte(input integer expected);
       integer i;
       begin
-         rx = 8'd0;
+         rx_io0 = 8'd0;
+         rx_io1 = 8'd0;
          for (i = 0; i < 8; i = i + 1) begin
             #5 sclk = 1'b1;
-            rx = {rx[6:0], io[1]};
+            rx_io0 = {rx_io0[6:0], io[0]};
+            rx_io1 = {rx_io1[6:0], io[1]};
             #5 sclk = 1'b0;
          end
-         if (rx !== expected[7:0]) begin
-            $display("FAIL byte %0d: got %02x expected %02x",
-                     expected, rx, expected[7:0]);
+         if (rx_io0 !== expected[7:0] || rx_io1 !== expected[7:0]) begin
+            $display("FAIL byte %0d: io0=%02x io1=%02x expected %02x",
+                     expected, rx_io0, rx_io1, expected[7:0]);
             errs = errs + 1;
          end
       end

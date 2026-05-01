@@ -9,8 +9,9 @@ module SB_IO #(
       output D_IN_0
    );
    initial begin
-      if (!(PIN_TYPE === 6'b100101 && NEG_TRIGGER === 1'b1)) begin
-         $display("ERROR SB_IO sim model only supports PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
+      if (!((PIN_TYPE === 6'b101001 && NEG_TRIGGER === 1'b0) ||
+            (PIN_TYPE === 6'b100101 && NEG_TRIGGER === 1'b1))) begin
+         $display("ERROR SB_IO sim model only supports PIN_TYPE=101001 or PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
                   PIN_TYPE, NEG_TRIGGER);
          $finish;
       end
@@ -19,6 +20,7 @@ module SB_IO #(
    initial dout_reg = 1'b0;
    always @(negedge OUTPUT_CLK)
       dout_reg <= D_OUT_0;
-   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_reg : 1'bz;
+   wire dout_selected = (PIN_TYPE === 6'b100101) ? dout_reg : D_OUT_0;
+   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_selected : 1'bz;
    assign D_IN_0 = PACKAGE_PIN;
 endmodule

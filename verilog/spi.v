@@ -28,9 +28,7 @@ module spi #(
       initial dout_quad = 4'd0;
       always @(posedge cs_n or posedge sclk) begin
          if (cs_n) begin
-            data_byte <= 8'd0;
-            phase     <= 1'b0;
-            dout_quad <= 4'd0;
+            phase <= 1'b0;
          end else if (start_ready) begin
             dout_quad <= phase ? next_byte_upper : data_byte[3:0];
             phase <= ~phase;
@@ -41,18 +39,28 @@ module spi #(
       assign dout_lane = dout_quad;
    end else begin : g_one
       reg [2:0] phase;
+      reg dout_one;
+      wire [7:0] data_byte_next = data_byte + 8'd1;
       initial phase = 3'd0;
-      always @(posedge cs_n or posedge sclk) begin
+      initial dout_one = 1'b0;
+      always @(posedge cs_n or negedge sclk) begin
          if (cs_n) begin
             data_byte <= 8'd0;
             phase     <= 3'd0;
+            dout_one  <= 1'b0;
          end else if (start_ready) begin
-            phase <= phase + 3'd1;
-            if (phase == 3'd7) data_byte <= data_byte + 8'd1;
+            if (phase == 3'd7) begin
+               data_byte <= data_byte_next;
+               phase     <= 3'd0;
+               dout_one  <= data_byte_next[3'd7];
+            end else begin
+               phase    <= phase + 3'd1;
+               dout_one <= data_byte[3'd6 - phase];
+            end
          end
       end
-      assign dout_lane[0] = data_byte[3'd7 - phase];
-      assign dout_lane[1] = data_byte[3'd7 - phase];
+      assign dout_lane[0] = dout_one;
+      assign dout_lane[1] = dout_one;
       assign dout_lane[2] = 1'b0;
       assign dout_lane[3] = 1'b0;
    end endgenerate
@@ -74,8 +82,7 @@ module spi #(
    end else begin : g_one_io
       for (g = 0; g < 4; g = g + 1) begin : g_io
          SB_IO #(
-            .PIN_TYPE(6'b100101),
-            .NEG_TRIGGER(1'b1)
+            .PIN_TYPE(6'b101001)
          ) iob (
             .PACKAGE_PIN(io[g]),
             .OUTPUT_CLK(sclk),

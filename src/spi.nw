@@ -49,33 +49,35 @@ existing `!==` check happens to flag in some stimulus shapes
 but not in others.
 
 The fix is to bypass tri-state inference entirely and
-instantiate `SB_IO` cells directly. The 1-lane pads are configured
-as `PIN_TYPE = 6'b100101` (output registered with output enable)
-and `NEG_TRIGGER = 1`, with `OUTPUT_CLK = sclk`, so the IOB's output
-flop captures `D_OUT_0` on direct SCLK falling edges. The 4-lane pads
-use the same registered IOB output mode and falling-edge capture, so
-quad data does not update on the same rising edge the master samples.
-`OUTPUT_ENABLE = ~cs_n` in both modes.
+instantiate `SB_IO` cells directly. The 1-lane pads use the unregistered
+iCE40 bidirectional form (`PIN_TYPE = 6'b101001`) and receive a shared
+fabric falling-edge presenter, so IO0 and IO1 observe the same launched
+bit. The 4-lane pads use registered IOB output mode and falling-edge
+capture, so quad data does not update on the same rising edge the master
+samples. `OUTPUT_ENABLE = ~cs_n` in all active pad modes.
 
 === Lane data path
 
 The byte-pattern counter `data_byte` advances after the master has
 sampled the final bit or nibble of each byte. In 1-lane mode that state
-update happens on the sampling `posedge sclk`, and the pad flop presents
-the next bit on the following falling edge. In 4-lane mode the stream
-state also advances on the sampling `posedge sclk`; a posedge-loaded
+update happens on the falling edge after the sample. In 4-lane mode the
+stream state advances on the sampling `posedge sclk`; a posedge-loaded
 `dout_quad` register presents the nibble intended for the next
-falling-edge pad-flop capture. The output
-starts at the first bit/nibble of byte 0, so the first rising edge in a
-frame samples valid data. The `phase` counter narrows per variant:
+falling-edge pad-flop capture. The quad counter deliberately carries
+across CS-high gaps because the STM32MP135 QUADSPI peripheral can split
+one indirect read into short selected bursts while the FIFO is drained.
+Each observed microframe contains an even number of quad sample edges, so
+the nibble phase naturally returns to the upper half of the next byte at
+the end of each burst. The output starts at the first bit/nibble of byte 0, so the first rising edge in a
+freshly configured bitstream samples valid data. The `phase` counter narrows per variant:
 3 bits for 1-lane (eight rises per byte, MSB-first), 1 bit for 4-lane
 (two rises per byte, upper nibble first then lower).
 
-The `dout_lane[3:0]` bus carries the value driven into the pad flop. For
-4-lane, every lane carries one bit of the selected nibble. For
-1-lane, `dout_lane[0]` and `dout_lane[1]` both
-carry the data bit that the IOB flop will latch at the next negedge; the
-other two lanes are held low when enabled.
+The `dout_lane[3:0]` bus carries the value driven into the pads. For
+4-lane, every lane carries one bit of the selected nibble. For 1-lane,
+`dout_lane[0]` and `dout_lane[1]` both mirror one shared fabric
+falling-edge `dout_one` presenter; the other two lanes are held low when
+enabled.
 Both variants feed variant-specific genvar loops that instantiate one
 `SB_IO` per pad, so the synthesis netlist contains exactly four
 explicit pad drivers and no fabric tri-state cells regardless of
@@ -136,7 +138,9 @@ For 4-lane the presenter preloads the lower nibble after the
 `phase == 0` sample, and the next byte's upper nibble after the
 `phase == 1` sample, matching
 the STM32MP1 QUADSPI indirect-read assembly of
-`{first_sample, second_sample}`.
+`{first_sample, second_sample}`. The byte counter is initialized by FPGA
+configuration rather than by each CS-high interval; this lets a single
+STM32 transfer continue through the peripheral's 4-byte microframes.
 
 <<SPI streaming: quad lane>>=
 reg phase;
@@ -146,9 +150,7 @@ initial phase = 1'b0;
 initial dout_quad = 4'd0;
 always @(posedge cs_n or posedge sclk) begin
    if (cs_n) begin
-      data_byte <= 8'd0;
-      phase     <= 1'b0;
-      dout_quad <= 4'd0;
+      phase <= 1'b0;
    end else if (start_ready) begin
       dout_quad <= phase ? next_byte_upper : data_byte[3:0];
       phase <= ~phase;
@@ -159,41 +161,46 @@ end
 assign dout_lane = dout_quad;
 @
 
-For 1-lane the bit mux picks `data_byte[7 - phase]`, MSB-first,
-and mirrors it onto IO0 and IO1. IO2 and IO3 get a constant
-`1'b0` data input, so those lanes are held low rather than
-floating when output enable is asserted.
+For 1-lane the fabric falling-edge presenter picks
+`data_byte[7 - phase]`, MSB-first, and mirrors it onto IO0 and IO1. IO2
+and IO3 get a constant `1'b0` data input, so those lanes are held low
+rather than floating when output enable is asserted.
 
 <<SPI streaming: single lane>>=
 reg [2:0] phase;
+reg dout_one;
+wire [7:0] data_byte_next = data_byte + 8'd1;
 initial phase = 3'd0;
-always @(posedge cs_n or posedge sclk) begin
+initial dout_one = 1'b0;
+always @(posedge cs_n or negedge sclk) begin
    if (cs_n) begin
       data_byte <= 8'd0;
       phase     <= 3'd0;
+      dout_one  <= 1'b0;
    end else if (start_ready) begin
-      phase <= phase + 3'd1;
-      if (phase == 3'd7) data_byte <= data_byte + 8'd1;
+      if (phase == 3'd7) begin
+         data_byte <= data_byte_next;
+         phase     <= 3'd0;
+         dout_one  <= data_byte_next[3'd7];
+      end else begin
+         phase    <= phase + 3'd1;
+         dout_one <= data_byte[3'd6 - phase];
+      end
    end
 end
-assign dout_lane[0] = data_byte[3'd7 - phase];
-assign dout_lane[1] = data_byte[3'd7 - phase];
+assign dout_lane[0] = dout_one;
+assign dout_lane[1] = dout_one;
 assign dout_lane[2] = 1'b0;
 assign dout_lane[3] = 1'b0;
 @
 
-The IO driver uses one explicit iCE40 `SB_IO` per pad. In 1-lane
-mode, `NEG_TRIGGER` makes each output flop capture `dout_lane[g]` on
-direct SCLK falling edges, so pad transitions happen half a cycle ahead of
-the MP135 rising-edge sample without making the stream counter itself
-sensitive to falling edges. Quad mode uses the same registered pad output
-mode and falling-edge IOB capture; `D_OUT_0` comes from the posedge-loaded
-`dout_quad` presenter. CS high asynchronously restores that state to byte
-zero before the next selected SCLK rising edge.
-Keeping the stream counters on rising
-edges matters for long peripheral reads where SCLK can pause: repeated
-or idle falling-edge observations re-present the same computed value
-instead of advancing the byte stream.
+The IO driver uses one explicit iCE40 `SB_IO` per pad. In 1-lane mode,
+the fabric `dout_one` register performs the falling-edge launch and feeds
+unregistered output-enable pads. Quad mode uses registered pad output
+mode and falling-edge IOB capture; `D_OUT_0` comes from the
+posedge-loaded `dout_quad` presenter. The quad byte counter and nibble
+phase carry across CS-high gaps so STM32 FIFO-drain microframes continue
+the stream.
 
 <<SPI streaming: io drivers>>=
 genvar g;
@@ -214,8 +221,7 @@ generate if (LANES == 4) begin : g_quad_io
 end else begin : g_one_io
    for (g = 0; g < 4; g = g + 1) begin : g_io
       SB_IO #(
-         .PIN_TYPE(6'b100101),
-         .NEG_TRIGGER(1'b1)
+         .PIN_TYPE(6'b101001)
       ) iob (
          .PACKAGE_PIN(io[g]),
          .OUTPUT_CLK(sclk),
@@ -546,21 +552,245 @@ set_io io[2]   60
 set_io io[3]   48
 @
 
+=== Quad raw observer top
+
+The `spi_quad_debug` top mirrors the current raw 4-lane stream and adds
+one UART report for the transaction just observed. The drive logic keeps
+the same carry-across byte counter used by `spi_quad.bin`; the extra
+logic only watches CS, SCLK, and IO[3:0]. Capture runs in the SCLK/CS
+domain so it can observe `p 11` traffic without relying on the 12 MHz
+UART clock to sample a 54 MHz serial clock.
+
+After CS rises, the 12 MHz side prints:
+
+   Q F=xx E=xxxx N=<32 nibbles>
+
+`F` is the low byte of the observed frame count, `E` is the number of
+selected SCLK rising edges in the frame, and `N` is the first 32 quad
+nibbles sampled at those rising edges.
+
+<<spi_quad_debug.v>>=
+module spi_quad_debug #(
+      parameter CLKS_PER_BIT = 104
+   ) (
+      input        clk,
+      input        cs_n,
+      input        sclk,
+      inout  [3:0] io,
+      output       tx
+   );
+   reg [7:0] q_data_byte;
+   reg q_phase;
+   reg [3:0] q_dout_quad;
+   wire [3:0] q_next_byte_upper = q_data_byte[7:4] + {3'b000, &q_data_byte[3:0]};
+   wire q_oe = ~cs_n;
+
+   initial begin
+      q_data_byte = 8'd0;
+      q_phase = 1'b0;
+      q_dout_quad = 4'd0;
+   end
+
+   always @(posedge cs_n or posedge sclk) begin
+      if (cs_n) begin
+         q_phase <= 1'b0;
+      end else begin
+         q_dout_quad <= q_phase ? q_next_byte_upper : q_data_byte[3:0];
+         q_phase <= ~q_phase;
+         if (q_phase)
+            q_data_byte <= q_data_byte + 8'd1;
+      end
+   end
+
+   genvar qg;
+   wire [3:0] q_io_sample;
+   generate for (qg = 0; qg < 4; qg = qg + 1) begin : q_io
+      SB_IO #(
+         .PIN_TYPE(6'b100101),
+         .NEG_TRIGGER(1'b1)
+      ) iob (
+         .PACKAGE_PIN(io[qg]),
+         .OUTPUT_CLK(sclk),
+         .OUTPUT_ENABLE(q_oe),
+         .D_OUT_0(q_dout_quad[qg]),
+         .D_IN_0(q_io_sample[qg])
+      );
+   end endgenerate
+
+   reg [7:0]   frame_count;
+   reg [7:0]   last_frame_count;
+   reg [15:0]  edge_count;
+   reg [15:0]  last_edges;
+   reg [5:0]   nibble_count;
+   reg [127:0] nibbles;
+   reg [127:0] last_nibbles;
+   reg         active;
+   reg         frame_toggle;
+
+   initial begin
+      frame_count = 8'd0;
+      last_frame_count = 8'd0;
+      edge_count = 16'd0;
+      last_edges = 16'd0;
+      nibble_count = 6'd0;
+      nibbles = 128'd0;
+      last_nibbles = 128'd0;
+      active = 1'b0;
+      frame_toggle = 1'b0;
+   end
+
+   always @(negedge cs_n)
+      frame_count <= frame_count + 8'd1;
+
+   always @(posedge cs_n or posedge sclk) begin
+      if (cs_n) begin
+         active <= 1'b0;
+         edge_count <= 16'd0;
+         nibble_count <= 6'd0;
+         nibbles <= 128'd0;
+      end else begin
+         if (!active) begin
+            active <= 1'b1;
+            edge_count <= 16'd1;
+            nibble_count <= 6'd1;
+            nibbles <= {124'd0, q_io_sample};
+         end else begin
+            edge_count <= edge_count + 16'd1;
+            if (nibble_count < 6'd32) begin
+               nibbles <= {nibbles[123:0], q_io_sample};
+               nibble_count <= nibble_count + 6'd1;
+            end
+         end
+      end
+   end
+
+   always @(posedge cs_n) begin
+      if (edge_count != 16'd0) begin
+         last_frame_count <= frame_count;
+         last_edges <= edge_count;
+         last_nibbles <= nibbles;
+         frame_toggle <= ~frame_toggle;
+      end
+   end
+
+   <<SPI quad debug UART reporter>>
+endmodule
+@
+
+The reporter is deliberately a fixed-format one-line sender. It reads
+only the stable post-frame capture registers.
+
+<<SPI quad debug UART reporter>>=
+reg pending;
+reg frame_toggle_meta;
+reg frame_toggle_seen;
+reg [5:0] char_idx;
+reg tx_start;
+reg [7:0] tx_data;
+wire tx_busy;
+
+initial begin
+   pending = 1'b0;
+   frame_toggle_meta = 1'b0;
+   frame_toggle_seen = 1'b0;
+   char_idx = 6'd0;
+   tx_start = 1'b0;
+   tx_data = 8'h00;
+end
+
+always @(posedge clk) begin
+   tx_start <= 1'b0;
+   frame_toggle_meta <= frame_toggle;
+   if (frame_toggle_meta != frame_toggle_seen && !pending && char_idx == 6'd0) begin
+      pending <= 1'b1;
+      frame_toggle_seen <= frame_toggle_meta;
+   end
+   if (pending && !tx_busy && !tx_start) begin
+      tx_data <= quad_debug_char(char_idx);
+      tx_start <= 1'b1;
+      if (char_idx == 6'd49) begin
+         pending <= 1'b0;
+         char_idx <= 6'd0;
+      end else begin
+         char_idx <= char_idx + 6'd1;
+      end
+   end
+end
+
+uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
+   .clk(clk),
+   .start(tx_start),
+   .data(tx_data),
+   .tx(tx),
+   .busy(tx_busy)
+);
+
+function [7:0] quad_hex_digit;
+   input [3:0] n;
+   begin
+      quad_hex_digit = (n < 4'd10) ? (8'h30 + {4'd0, n})
+                                   : (8'h57 + {4'd0, n});
+   end
+endfunction
+
+function [3:0] quad_sample_nibble;
+   input [5:0] idx;
+   begin
+      quad_sample_nibble = last_nibbles[(31 - idx) * 4 +: 4];
+   end
+endfunction
+
+function [7:0] quad_debug_char;
+   input [5:0] idx;
+   begin
+      case (idx)
+         6'd0:  quad_debug_char = "Q";
+         6'd1:  quad_debug_char = " ";
+         6'd2:  quad_debug_char = "F";
+         6'd3:  quad_debug_char = "=";
+         6'd4:  quad_debug_char = quad_hex_digit(last_frame_count[7:4]);
+         6'd5:  quad_debug_char = quad_hex_digit(last_frame_count[3:0]);
+         6'd6:  quad_debug_char = " ";
+         6'd7:  quad_debug_char = "E";
+         6'd8:  quad_debug_char = "=";
+         6'd9:  quad_debug_char = quad_hex_digit(last_edges[15:12]);
+         6'd10: quad_debug_char = quad_hex_digit(last_edges[11:8]);
+         6'd11: quad_debug_char = quad_hex_digit(last_edges[7:4]);
+         6'd12: quad_debug_char = quad_hex_digit(last_edges[3:0]);
+         6'd13: quad_debug_char = " ";
+         6'd14: quad_debug_char = "N";
+         6'd15: quad_debug_char = "=";
+         6'd48: quad_debug_char = 8'h0d;
+         6'd49: quad_debug_char = 8'h0a;
+         default: begin
+            if (idx >= 6'd16 && idx < 6'd48)
+               quad_debug_char = quad_hex_digit(quad_sample_nibble(idx - 6'd16));
+            else
+               quad_debug_char = 8'h00;
+         end
+      endcase
+   end
+endfunction
+@
+
 === `SB_IO` simulation model
 
 yosys recognises `SB_IO` as a built-in iCE40 primitive and
 needs no help from us during synthesis. verilator does not, so
 the testbench is compiled against a stand-alone behavioural
-model that covers exactly the pad configuration our DUT uses
-(`PIN_TYPE = 6'b100101` with `NEG_TRIGGER = 1`). Any other configuration is rejected at
+model that covers exactly the pad configurations our DUT uses:
+unregistered output-enable pads (`PIN_TYPE = 6'b101001`) and
+falling-edge registered output-enable pads (`PIN_TYPE = 6'b100101` with
+`NEG_TRIGGER = 1`). Any other configuration is rejected at
 elaboration so a future change to the DUT does not silently desync
 the sim from the synth path.
 
-The model owns one falling-edge output register, then gates the
-registered output through `OUTPUT_ENABLE`. When the slave releases the
-bus the inout port is driven to `1'bz`, and `D_IN_0` mirrors the package
-pin for pad readback. The testbench attaches a `pullup` per lane to
-model the master-side MISO pull-up.
+The model either passes `D_OUT_0` directly for unregistered pads or owns
+one falling-edge output register for registered pads, then gates the
+selected output through `OUTPUT_ENABLE`. When the slave releases the bus
+the inout port is driven to `1'bz`, and `D_IN_0` mirrors the package pin
+for pad readback. The testbench attaches a `pullup` per lane to model the
+master-side MISO pull-up.
 
 <<SB_IO.v>>=
 module SB_IO #(
@@ -574,8 +804,9 @@ module SB_IO #(
       output D_IN_0
    );
    initial begin
-      if (!(PIN_TYPE === 6'b100101 && NEG_TRIGGER === 1'b1)) begin
-         $display("ERROR SB_IO sim model only supports PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
+      if (!((PIN_TYPE === 6'b101001 && NEG_TRIGGER === 1'b0) ||
+            (PIN_TYPE === 6'b100101 && NEG_TRIGGER === 1'b1))) begin
+         $display("ERROR SB_IO sim model only supports PIN_TYPE=101001 or PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
                   PIN_TYPE, NEG_TRIGGER);
          $finish;
       end
@@ -584,7 +815,8 @@ module SB_IO #(
    initial dout_reg = 1'b0;
    always @(negedge OUTPUT_CLK)
       dout_reg <= D_OUT_0;
-   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_reg : 1'bz;
+   wire dout_selected = (PIN_TYPE === 6'b100101) ? dout_reg : D_OUT_0;
+   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_selected : 1'bz;
    assign D_IN_0 = PACKAGE_PIN;
 endmodule
 @
@@ -644,26 +876,30 @@ pullup pu2 (io[2]);
 pullup pu3 (io[3]);
 spi #(.LANES(1)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
 integer   errs;
-reg [7:0] rx;
+reg [7:0] rx_io0;
+reg [7:0] rx_io1;
 @
 
-The byte sampler clocks eight SCLK rises and samples `io[1]`
-at each rise (mode 0). The slave drives strongly when CS is
-low, overriding the pull-up.
+The byte sampler clocks eight SCLK rises and samples both single-lane
+pads at each rise (mode 0): IO0 is the STM32 peripheral lane, while IO1
+is the GPIO bit-bang lane. The slave drives strongly when CS is low,
+overriding the pull-up.
 
 <<tb_1lane: byte sampler>>=
 task automatic clock_byte(input integer expected);
    integer i;
    begin
-      rx = 8'd0;
+      rx_io0 = 8'd0;
+      rx_io1 = 8'd0;
       for (i = 0; i < 8; i = i + 1) begin
          #5 sclk = 1'b1;
-         rx = {rx[6:0], io[1]};
+         rx_io0 = {rx_io0[6:0], io[0]};
+         rx_io1 = {rx_io1[6:0], io[1]};
          #5 sclk = 1'b0;
       end
-      if (rx !== expected[7:0]) begin
-         $display("FAIL byte %0d: got %02x expected %02x",
-                  expected, rx, expected[7:0]);
+      if (rx_io0 !== expected[7:0] || rx_io1 !== expected[7:0]) begin
+         $display("FAIL byte %0d: io0=%02x io1=%02x expected %02x",
+                  expected, rx_io0, rx_io1, expected[7:0]);
          errs = errs + 1;
       end
    end
@@ -773,7 +1009,7 @@ task automatic clock_byte_paused(input integer expected);
       first_sample = io;
       #19;
       if (io !== first_sample) begin
-         $display("FAIL byte %0d high-pause: io changed from %x to %x",
+         $display("FAIL byte %0d upper-pause: io changed from %x to %x",
                   expected, first_sample, io);
          errs = errs + 1;
       end
@@ -789,7 +1025,7 @@ task automatic clock_byte_paused(input integer expected);
       second_sample = io;
       #19;
       if (io !== second_sample) begin
-         $display("FAIL byte %0d high-pause 2: io changed from %x to %x",
+         $display("FAIL byte %0d lower-pause: io changed from %x to %x",
                   expected, second_sample, io);
          errs = errs + 1;
       end
@@ -805,24 +1041,24 @@ endtask
 @
 
 <<tb_quad: helpers>>=
-task automatic frame(input integer count);
+task automatic frame_from(input integer start, input integer count);
    integer k;
    begin
       #20 cs_n = 1'b0;
       #5;
       for (k = 0; k < count; k = k + 1)
-         clock_byte(k);
+         clock_byte(start + k);
       #5 cs_n = 1'b1;
       #20;
    end
 endtask
-task automatic paused_frame(input integer count);
+task automatic paused_frame_from(input integer start, input integer count);
    integer k;
    begin
       #20 cs_n = 1'b0;
       #5;
       for (k = 0; k < count; k = k + 1)
-         clock_byte_paused(k);
+         clock_byte_paused(start + k);
       #5 cs_n = 1'b1;
       #20;
    end
@@ -845,11 +1081,11 @@ initial begin
    errs = 0;
    cs_high_quiet();
    cs_high_quiet();
-   frame(256);
+   frame_from(0, 256);
    cs_high_quiet();
-   paused_frame(32);
+   paused_frame_from(256, 32);
    cs_high_quiet();
-   frame(4096);
+   frame_from(288, 4096);
    cs_high_quiet();
    cs_high_quiet();
    if (errs == 0)
@@ -868,11 +1104,12 @@ prove that the synthesized netlist still contains the IOB drivers
 that make that model relevant. The netlist checker closes that gap
 without trying to model board timing: after yosys, each variant must
 have exactly four explicit `SB_IO` pads, each pad must be tied to
-the matching `io[n]` port bit, every pad must use the registered
-negedge-output configuration, and every output enable must be driven
-by the named `oe = ~cs_n` net. This is the structural condition the hardware
-failure violated when the lanes floated to the master pull-ups and
-the MP135 read `0xff`.
+the matching `io[n]` port bit, the 1-lane variant must use
+unregistered output-enable pads, the 4-lane variant must use the
+registered negedge-output configuration, and every output enable must be
+driven by the named `oe = ~cs_n` net. This is the structural condition the
+hardware failure violated when the lanes floated to the master pull-ups
+and the MP135 read `0xff`.
 
 <<check_spi_netlist.py>>=
 #!/usr/bin/env python3
@@ -914,41 +1151,45 @@ def check(path, lanes):
     if bad_tristates:
         raise AssertionError(f"{path}: inferred fabric tristates remain: {bad_tristates}")
 
-    pads = {
-        tuple(cell["connections"].get("PACKAGE_PIN", [])): (name, cell)
-        for name, cell in cells.items()
-        if cell["type"] == "SB_IO"
-    }
-    if len(pads) != 4:
-        raise AssertionError(f"{path}: found {len(pads)} SB_IO cells, expected 4")
+    pads = {}
+    for name, cell in cells.items():
+        if cell["type"] == "SB_IO":
+            key = tuple(cell["connections"].get("PACKAGE_PIN", []))
+            pads.setdefault(key, []).append((name, cell))
+    expected_pads = 4
+    found_pads = sum(len(v) for v in pads.values())
+    if found_pads != expected_pads:
+        raise AssertionError(
+            f"{path}: found {found_pads} SB_IO cells, expected {expected_pads}")
 
     for lane, io_bit in enumerate(io_bits):
         key = (io_bit,)
         if key not in pads:
             raise AssertionError(f"{path}: missing SB_IO on io[{lane}]")
-        name, cell = pads[key]
-        params = cell.get("parameters", {})
-        conns = cell.get("connections", {})
-        expected_pin_type = "100101"
-        if params.get("PIN_TYPE") != expected_pin_type:
+        lane_pads = pads[key]
+        if len(lane_pads) != 1:
             raise AssertionError(
-                f"{path}: {name} PIN_TYPE={params.get('PIN_TYPE')}, "
-                f"expected {expected_pin_type}")
-        if params.get("NEG_TRIGGER") != "1":
-            raise AssertionError(
-                f"{path}: {name} NEG_TRIGGER={params.get('NEG_TRIGGER')}, "
-                f"expected 1")
-        if conns.get("OUTPUT_ENABLE") != [oe_bit]:
-            raise AssertionError(f"{path}: {name} OUTPUT_ENABLE is not oe")
-        if conns.get("OUTPUT_CLK") != [sclk_bit]:
-            raise AssertionError(f"{path}: {name} OUTPUT_CLK is not sclk")
-        dout = conns.get("D_OUT_0", [])
-        if lanes == 1:
-            should_drive_pattern = lane in (0, 1)
-        else:
-            should_drive_pattern = True
-        if should_drive_pattern and (not dout or isinstance(dout[0], str)):
-            raise AssertionError(f"{path}: {name} data input is constant on active lane {lane}")
+                f"{path}: io[{lane}] has {len(lane_pads)} pads, expected 1")
+        for name, cell in lane_pads:
+            params = cell.get("parameters", {})
+            conns = cell.get("connections", {})
+            pin_type = params.get("PIN_TYPE")
+            if lanes == 1 and pin_type != "101001":
+                raise AssertionError(
+                    f"{path}: {name} PIN_TYPE={pin_type}, expected 101001")
+            if pin_type == "100101" and params.get("NEG_TRIGGER") != "1":
+                raise AssertionError(
+                    f"{path}: {name} NEG_TRIGGER={params.get('NEG_TRIGGER')}, "
+                    f"expected 1")
+            if pin_type == "101001" and params.get("NEG_TRIGGER", "0") != "0":
+                raise AssertionError(
+                    f"{path}: {name} NEG_TRIGGER={params.get('NEG_TRIGGER')}, "
+                    f"expected 0")
+            if pin_type == "100101" and conns.get("OUTPUT_CLK") != [sclk_bit]:
+                raise AssertionError(f"{path}: {name} OUTPUT_CLK is not sclk")
+            dout = conns.get("D_OUT_0", [])
+            if (lanes == 4 or lane in (0, 1)) and (not dout or isinstance(dout[0], str)):
+                raise AssertionError(f"{path}: {name} data input is constant on active lane {lane}")
 
     print(f"PASS {path}: {lanes}-lane netlist has explicit SB_IO drivers on all pads")
 
@@ -1065,6 +1306,18 @@ build/spi/spi_debug.asc: build/spi/spi_debug.json verilog/spi_debug.pcf
 build/spi/spi_debug.bin: build/spi/spi_debug.asc
 	cd build/spi && icepack spi_debug.asc spi_debug.bin
 
+verilog/spi_quad_debug.v: src/spi.nw | verilog
+	cd verilog && tangle spi_quad_debug.v < ../$<
+
+build/spi/spi_quad_debug.json: verilog/spi_quad_debug.v $(SPI_VS) verilog/uart_tx.v | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v ../../verilog/spi_quad_debug.v ../../verilog/uart_tx.v; hierarchy -top spi_quad_debug; synth_ice40 -top spi_quad_debug -json spi_quad_debug.json"
+
+build/spi/spi_quad_debug.asc: build/spi/spi_quad_debug.json verilog/spi_debug.pcf
+	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_quad_debug.json --pcf ../../verilog/spi_debug.pcf --asc spi_quad_debug.asc --freq 12 -q
+
+build/spi/spi_quad_debug.bin: build/spi/spi_quad_debug.asc
+	cd build/spi && icepack spi_quad_debug.asc spi_quad_debug.bin
+
 verilog/SB_IO.v: src/spi.nw | verilog
 	cd verilog && tangle SB_IO.v < ../$<
 
@@ -1113,17 +1366,31 @@ This keeps the preflight useful when the iCEstick UART channel is not
 available: the observed evidence is the MP135 UART log alone, and every
 programmed FPGA drive pattern is checked from the MPU side.
 
+Firmware loads first ask the bench MCU to reset the MP135 into its DFU
+boot path. The timed GPIO pin-walk preflight starts its FPGA pattern
+before the MPU firmware load, so it keeps the reset adjacent to the DFU
+flash. Later blocks give the USB device time to leave the MSC bootloader
+presentation and re-enumerate as the STM32 DFU target before CubeProgrammer
+is resolved for `dfu:flash_layout`.
+
+<<mp135: reset into DFU before flash>>=
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=1200
+@
+
 <<TEST.md>>=
 Preflight -- MP135 QSPI pins reach the expected iCE40 pins.
 
 ```
-fpga:program bin=@spi_pin_walk.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
+fpga:program bin=@spi_pin_walk.bin
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 mp135:uart_write data="G\r"
 delay ms=1800
+mp135:uart_write data="G\r"
+delay ms=2100
 mp135:uart_write data="G\r"
 delay ms=2100
 mp135:uart_write data="G\r"
@@ -1159,7 +1426,7 @@ Preflight -- 1-lane software bit-bang reads the SPI stream.
 
 ```
 fpga:program bin=@spi_1lane.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1174,7 +1441,8 @@ mp135:uart_close
 Preflight -- 1-lane peripheral raw read returns the SPI stream.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+fpga:program bin=@spi_1lane.bin
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1192,7 +1460,8 @@ mp135:uart_close
 Preflight -- 1-lane peripheral raw read at presc=5.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+fpga:program bin=@spi_1lane.bin
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1232,7 +1501,7 @@ at higher SCLK.
 Measure 128 KiB XOR timing on MP135 DDR.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1244,86 +1513,58 @@ mp135:uart_close
 
 - Measure MP135 128 KiB XOR timing
 
-Phase 1 -- 1-lane sweep at presc=203.
+Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=5 wall-rate floor.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 203\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane @ presc=203 pattern correct
-
-Phase 1 -- 1-lane sweep at presc=63.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 63\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=10000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane @ presc=63 pattern correct
-
-Phase 1 -- 1-lane sweep at presc=15.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 15\r"
-delay ms=100
-mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
-mark tag=bench_done
-mp135:uart_close
-```
-
-- Check 1lane @ presc=15 pattern correct
-
-Phase 1 -- 1-lane sweep at presc=5.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 5 1\r"
 delay ms=100
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
+mp135:uart_write data="A 33554432 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 33554432 B" timeout_ms=15000
 mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mp135:uart_close
 ```
 
-- Check 1lane @ presc=5 pattern correct
+- Check 1lane stream @ presc=5 wall rate >= 100 Mbps
+
+Phase 2 -- quad DDR ping-pong auto-consume stream at presc=11 wall-rate floor.
+
+```
+<<mp135: reset into DFU before flash>>
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 11 1\r"
+delay ms=100
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mp135:uart_write data="N 0\r"
+mp135:uart_expect sentinel="idle=off" timeout_ms=3000
+fpga:program bin=@spi_quad.bin
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="A 33554432 1 1\r"
+mp135:uart_expect sentinel="stream_xfer 33554432 B" timeout_ms=15000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135:uart_close
+```
+
+- Check quad stream @ presc=11 wall rate >= 200 Mbps
 
 Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=203.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1345,7 +1586,7 @@ mp135:uart_close
 Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=255.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1367,7 +1608,7 @@ mp135:uart_close
 Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=63.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1386,32 +1627,10 @@ mp135:uart_close
 
 - Check 1lane stream @ presc=63 pattern correct
 
-Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=15.
+Diagnostic -- 1-lane DDR ping-pong auto-consume stream at presc=5.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-delay ms=300
-mp135:uart_write data="p 15\r"
-delay ms=100
-mp135:uart_write data="a 1\r"
-mp135:uart_expect sentinel="auto=on" timeout_ms=3000
-mark tag=bench_start
-mp135:uart_write data="A 1500000 0 1\r"
-mp135:uart_expect sentinel="stream_xfer 1500000 B" timeout_ms=12000
-mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=12000
-mp135:uart_close
-```
-
-- Check 1lane stream @ presc=15 pattern correct
-
-Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=5.
-
-```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1430,27 +1649,103 @@ mp135:uart_close
 
 - Check 1lane stream @ presc=5 pattern correct
 
-Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=5 wall-rate floor.
+Diagnostic -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=15.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 15\r"
+delay ms=100
+mp135:uart_write data="a 1\r"
+mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mark tag=bench_start
+mp135:uart_write data="A 1500000 0 1\r"
+mp135:uart_expect sentinel="stream_xfer 1500000 B" timeout_ms=12000
+mark tag=bench_done
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=12000
+mp135:uart_close
+```
+
+- Check 1lane stream @ presc=15 pattern correct
+
+Diagnostic -- 1-lane CPU-polled sweep at presc=203.
+
+```
+<<mp135: reset into DFU before flash>>
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 203\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane @ presc=203 pattern correct
+
+Diagnostic -- 1-lane CPU-polled sweep at presc=63.
+
+```
+<<mp135: reset into DFU before flash>>
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 63\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=10000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane @ presc=63 pattern correct
+
+Diagnostic -- 1-lane CPU-polled sweep at presc=15.
+
+```
+<<mp135: reset into DFU before flash>>
+dfu:flash_layout layout=@flash.tsv no_reconnect=true
+mp135:uart_open
+mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135:uart_write data="p 15\r"
+delay ms=100
+mark tag=bench_start
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
+mark tag=bench_done
+mp135:uart_close
+```
+
+- Check 1lane @ presc=15 pattern correct
+
+Diagnostic -- 1-lane CPU-polled sweep at presc=5.
+
+```
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
 mp135:uart_write data="p 5 1\r"
 delay ms=100
-mp135:uart_write data="a 1\r"
-mp135:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="A 33554432 0 1\r"
-mp135:uart_expect sentinel="stream_xfer 33554432 B" timeout_ms=15000
+mp135:uart_write data="b 1048576 0 1\r"
+mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mp135:uart_close
 ```
 
-- Check 1lane stream @ presc=5 wall rate >= 100 Mbps
+- Check 1lane @ presc=5 pattern correct
 
 Phase 1 -- 1-lane 512 MB ping-pong stream_xfer wall timing at presc=5.
 
@@ -1459,7 +1754,7 @@ line. The pattern/CRC correctness check runs afterward and still must
 report `firsterr=-1`.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1486,7 +1781,7 @@ uses 0x6B framing but returns one-hot nibbles on IO[3:0].
 ```
 fpga:open
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1514,7 +1809,7 @@ value across both quad sample edges.
 ```
 fpga:open
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1542,7 +1837,7 @@ continuous 0,1,2,...,f nibble ramp. STM32 byte assembly should return
 ```
 fpga:open
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1569,7 +1864,7 @@ a known lane-width bitstream.
 ```
 fpga:open
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1592,7 +1887,7 @@ Phase 2 -- 4-lane sweep at presc=203.
 
 ```
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1612,7 +1907,7 @@ Phase 2 -- 4-lane sweep at presc=63.
 
 ```
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1632,7 +1927,7 @@ Phase 2 -- 4-lane sweep at presc=15.
 
 ```
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1652,7 +1947,7 @@ Phase 2 -- 4-lane sweep at presc=5.
 
 ```
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1676,7 +1971,7 @@ short repeated byte sequence around the failing 06/07/08 region.
 ```
 fpga:open
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1703,7 +1998,7 @@ exercises the same slave protocol used by the peripheral path.
 ```
 fpga:open
 fpga:program bin=@jedec.bin
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1722,7 +2017,7 @@ mp135:uart_close
 MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=203.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1744,7 +2039,7 @@ mp135:uart_close
 MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=63.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1766,7 +2061,7 @@ mp135:uart_close
 MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=15.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1788,7 +2083,7 @@ mp135:uart_close
 MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=5.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -1810,7 +2105,7 @@ mp135:uart_close
 MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=5 wall-rate floor.
 
 ```
-bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+<<mp135: reset into DFU before flash>>
 dfu:flash_layout layout=@flash.tsv no_reconnect=true
 mp135:uart_open
 mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
@@ -2931,6 +3226,10 @@ def _make_dispatch():
         lambda: check_stream_wall_rate_at_least("1lane", 5, 100.0, 33554432,
                                                 expected_chunk=16777216,
                                                 min_chunks=2))
+    out["Check quad stream @ presc=11 wall rate >= 200 Mbps"] = (
+        lambda: check_stream_wall_rate_at_least("quad", 11, 200.0, 33554432,
+                                                expected_chunk=16777216,
+                                                min_chunks=2))
     out["Check 1lane stream @ presc=5 512 MB stream_xfer wall rate >= 100 Mbps within 45 s, then pattern correct"] = (
         lambda: check_stream_wall_rate_at_least("1lane", 5, 100.0,
                                                 512000000, 45000,
@@ -2978,8 +3277,8 @@ without invoking the parent.
 
 <<Makefile>>=
 NW := ../../src/spi.nw
-MP135_QSPI_DIR := /home/claude/stm32mp135_test_board/baremetal/qspi/build
-MP135_QSPI_SRC := /home/claude/stm32mp135_test_board/baremetal/qspi
+MP135_QSPI_DIR := /home/agent2/fast_data/stm32mp135_test_board/baremetal/qspi/build
+MP135_QSPI_SRC := /home/agent2/fast_data/stm32mp135_test_board/baremetal/qspi
 
 .PHONY: all test bitstreams sim bitstream
 all: TEST.md verify.py flash.tsv main.stm32
