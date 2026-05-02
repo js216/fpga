@@ -123,7 +123,7 @@ build/$(1)/$(2)/verify.py: $$(call chapter_src,$(1)) | build/$(1)/$(2)
 build/$(1)/$(2)/$(1).asc: build/$(1)/$(1).json verilog/$(1)_$(2).pcf | build/$(1)/$(2)
 	cd build/$(1)/$(2) && nextpnr-ice40 --$(2) --package $$(nextpnr_pkg_$(2)) \
 		--json ../$(1).json --pcf ../../../verilog/$(1)_$(2).pcf \
-		--asc $(1).asc --freq 12 -q
+		--asc $(1).asc --freq 12 -q --pcf-allow-unconstrained
 
 build/$(1)/$(2)/$(1).bin: build/$(1)/$(2)/$(1).asc
 	cd build/$(1)/$(2) && icepack $(1).asc $(1).bin

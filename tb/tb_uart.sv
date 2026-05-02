@@ -8,7 +8,7 @@ module tb_uart;
    always #5 clk <= ~clk;
    reg  rx;
    wire tx;
-   wire [4:0] led;
+   wire [7:0] led;
    
    uart #(
       .CLKS_PER_BIT(CLKS_PER_BIT),
@@ -115,8 +115,8 @@ module tb_uart;
       
       xfer(8'h00, got); // NUL
       if (got !== 8'h00) $fatal(1, "FAIL NUL: got 0x%02h", got);
-      if (led !== 5'h00)
-         $fatal(1, "FAIL led: got %b, want %b (low 5 of NUL)", led, 5'h00);
+      if (led !== 8'h00)
+         $fatal(1, "FAIL led: got %b, want %b (NUL)", led, 8'h00);
       expect_heartbeat();
    
       $display("PASS: echo and heartbeat paths both correct");

@@ -14,7 +14,10 @@ source:
   the single `uart_tx` between the hello heartbeat and an echo loopback
   on the receiver. The same top fits both the iCEstick (iCE40-HX1K)
   and the HX8K-B-EVN breakout (iCE40-HX8K) --- only the pin map and
-  the nextpnr device/package switches differ.
+  the nextpnr device/package switches differ. Eight on-board LEDs
+  display the most recently received byte on the HX8K-B-EVN; on the
+  iCEstick (only five LEDs) the upper three bits are simply not
+  routed to a pin.
 
 The baud rate is a ratio between the input clock and the `CLKS_PER_BIT`
 parameter. Both supported boards run from a 12 MHz oscillator, so the
@@ -627,8 +630,12 @@ The demo top instantiates one `uart_rx`, one `uart_hello`, and one
 stream and the echoed rx byte. Hello wins when both want the
 transmitter in the same cycle --- the echo byte is simply dropped,
 which is acceptable at human typing rates against a 1 Hz heartbeat.
-The low five bits of the last received byte drive the board LEDs so a
-logic-analyzer-free sanity check is possible by watching the board.
+The full byte of the last received character drives an 8-bit LED bus
+so a logic-analyzer-free sanity check is possible by watching the
+board. The HX8K-B-EVN wires all eight bits to its eight LEDs; the
+iCEstick only has five LEDs, so its pcf maps `led[0..4]` and leaves
+the upper three bits unrouted (nextpnr is told not to fault on the
+unconstrained pins).
 
 <<uart.v>>=
 module uart #(
@@ -638,7 +645,7 @@ module uart #(
       input        clk,
       input        rx,
       output       tx,
-      output [4:0] led
+      output [7:0] led
    );
    <<Top: receive path>>
    <<Top: hello instance>>
@@ -728,17 +735,19 @@ uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
 );
 @
 
-A tiny visual-feedback path: the low five bits of each received byte
-are latched into a register that drives the five on-board LEDs. This
-lets us distinguish "bitstream loaded but nothing coming back" from
-"bitstream loaded, receiver working" without a logic analyzer.
+A tiny visual-feedback path: the full received byte is latched into
+an 8-bit register that drives the on-board LED bus. On the
+HX8K-B-EVN all eight bits land on D2..D9, displaying the ASCII code
+of the last character to come down the wire. On the iCEstick only
+the low five (D1..D5) are physically wired; the upper three bits
+fall on the floor inside the chip.
 
 <<Top: LED display>>=
-reg [4:0] led_reg;
+reg [7:0] led_reg;
 initial led_reg = 0;
 always @(posedge clk)
    if (rx_ready)
-      led_reg <= rx_data[4:0];
+      led_reg <= rx_data;
 assign led = led_reg;
 @
 
@@ -804,7 +813,7 @@ happens in the same time step a task is entered.
 <<TB DUT instance>>=
 reg  rx;
 wire tx;
-wire [4:0] led;
+wire [7:0] led;
 
 uart #(
    .CLKS_PER_BIT(CLKS_PER_BIT),
@@ -983,12 +992,12 @@ xfer(8'h00, got); // NUL
 if (got !== 8'h00) $fatal(1, "FAIL NUL: got 0x%02h", got);
 @
 
-LED register. After the NUL frame, the low five bits of the last
-received byte (all zeros) must be visible on the LED output.
+LED register. After the NUL frame, all eight bits of the last
+received byte (all zeros) must be visible on the LED output bus.
 
 <<TB: check LED latch>>=
-if (led !== 5'h00)
-   $fatal(1, "FAIL led: got %b, want %b (low 5 of NUL)", led, 5'h00);
+if (led !== 8'h00)
+   $fatal(1, "FAIL led: got %b, want %b (NUL)", led, 8'h00);
 @
 
 Heartbeat phase. After echo tests the receive line is idle; the next
@@ -1051,7 +1060,10 @@ sit unassigned.
 
 Clock on pin 21 (GBIN6, 12 MHz Discera MEMS oscillator), UART RX on
 pin 9, UART TX on pin 8, five LEDs on pins 95..99. No IrDA or Pmod
-pins used.
+pins used. The top declares an 8-bit `led` bus; this board only has
+five LEDs so the upper three bits stay unconstrained --- nextpnr is
+invoked with `--pcf-allow-unconstrained` and silently leaves them
+unrouted.
 
 <<uart_hx1k.pcf>>=
 set_io clk    21
@@ -1068,9 +1080,9 @@ set_io led[4] 95
 
 Clock on ball J3 (GBIN6/PIO3_26, 12 MHz oscillator U5), UART RX on
 ball B10 (PIO0_14, FT2232H BDBUS0 = `RS232_Rx_TTL` net), UART TX on
-ball B12 (PIO0_13, BDBUS1 = `RS232_Tx_TTL`). Five of the eight on-board
-LEDs (D2..D6) are wired to balls B5/B4/A2/A1/C5; D7..D9 (C4/B3/C3) are
-left unassigned by this design.
+ball B12 (PIO0_13, BDBUS1 = `RS232_Tx_TTL`). All eight on-board LEDs
+(D2..D9) are wired to balls B5/B4/A2/A1/C5/C4/B3/C3, so the full
+ASCII code of the last received byte is visible at a glance.
 
 <<uart_hx8k.pcf>>=
 set_io clk    J3
@@ -1081,6 +1093,9 @@ set_io led[1] B4
 set_io led[2] A2
 set_io led[3] A1
 set_io led[4] C5
+set_io led[5] C4
+set_io led[6] B3
+set_io led[7] C3
 @
 
 === Build fragment

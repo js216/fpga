@@ -5,7 +5,7 @@ module uart #(
       input        clk,
       input        rx,
       output       tx,
-      output [4:0] led
+      output [7:0] led
    );
    wire       rx_ready;
    wire [7:0] rx_data;
@@ -56,10 +56,10 @@ module uart #(
       .tx   (tx),
       .busy (tx_busy)
    );
-   reg [4:0] led_reg;
+   reg [7:0] led_reg;
    initial led_reg = 0;
    always @(posedge clk)
       if (rx_ready)
-         led_reg <= rx_data[4:0];
+         led_reg <= rx_data;
    assign led = led_reg;
 endmodule
