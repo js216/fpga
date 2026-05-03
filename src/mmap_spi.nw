@@ -1,0 +1,305 @@
+% mmap_spi.nw -- QUADSPI memory-mapped (FMODE=11) wall-rate
+% chapter.
+
+== Why this chapter exists
+
+The indirect-read path (MDMA over `QUADSPI->DR`) tops out near
+337 Mbps quad on this rig (`spi_simple` quad mission, presc=3
+sshift=0, single-pass). The bottleneck is the per-word AXI
+handshake the MDMA pays on every FIFO drain --- empirically
+~3 ACLK cycles per byte, additive with the SCLK byte time, and
+not configurable through CK_QSPI / HCLK6 / TLEN / SBURST /
+FTHRES. See the root-cause table in `agent4/TODO.md`.
+
+Memory-mapped mode (FMODE=11) is one of three documented escape
+hatches. In FMODE=11 the QUADSPI peripheral autonomously refills
+its prefetch buffer in response to AHB reads from the
+`QSPI_MM_BASE` window (0x70000000); the master only needs to
+issue reads. Iter 1 proved end-to-end correctness with a byte-by-
+byte CPU loop --- but that variant is dominated by single-byte
+AHB read latency and clocked at 36.63 Mbps, an order of magnitude
+under the quad-MDMA floor.
+
+Iter 2 broadens the read master into a parameterised sweep so the
+firmware-side bottleneck is measurable independently of the
+peripheral. A new optional variant argument selects the copy
+strategy without recompiling between runs:
+
+- `H <len> 0`: byte-by-byte CPU loop (regression baseline).
+- `H <len> 1`: 32-bit word CPU loop (`uint32_t *` cast).
+- `H <len> 2`: `memcpy` with non-volatile aliases (LDM/STM).
+- `H <len> 3`: MDMA mem-to-mem from `QSPI_MM_BASE` into DDR.
+
+The MDMA variant is the headline experiment: with a 64 B per-
+buffer transfer (16 beats of 32-bit), 16-beat source/dest
+bursts and software request mode, every per-byte AHB handshake
+the indirect path paid is hidden behind a 16-beat AXI read of the
+QSPI peripheral's prefetch buffer. If that works the wall-rate
+should comfortably clear the 337 Mbps quad ceiling.
+
+== Test plan
+
+Single FPGA program (`qspi.bin`, the existing 0x6B Quad Output
+Read slave). The DUT firmware is the agent4 baremetal/qspi build
+that exposes the new `H <len> <variant>` command. After bringup
+to the proven quad mission point (`p 3 0`, prescaler 3, sshift
+0), four `H` invocations run in MDMA-first order:
+
+. `H 1048576 3` -- mission-target MDMA path, gates `>337 Mbps`.
+. `H 1048576 2` -- `memcpy` aliases, gates `>100 Mbps`.
+. `H 1048576 1` -- 32-bit word loop, gates `>75 Mbps`.
+. `H 1048576 0` -- byte loop regression check, relaxed to
+  `>30 Mbps` (iter 1 measured 36.63).
+
+The MDMA block runs FIRST so the most informative result lands
+in the UART log even if a later block aborts the suite (`make
+test` halts on the first failing block, so blocks past the first
+failure are not executed).
+
+Each `H` invocation prints a single summary line of the form
+
+  mmap <bytes> B quad in <ms> ms, <X.YZ> Mbps, presc=<p>,
+  qspi_hz=<hz>, variant=<v>[, cisr=..., cesr=...]
+
+The verifier picks the LAST line whose `variant=<v>` matches the
+block's expected variant; that way each block stays independent
+even though all four lines share the same `mmap` prefix.
+
+Cap is 16 MiB (one DDR slot at `DEF_DDR_BASE`); 1 MiB amortises
+prefetch warmup while staying under the 120 s expect timeout
+even if MDMA misbehaves.
+
+<<TEST.md>>=
+mmap MDMA mem-to-mem from QSPI memory-mapped window into DDR at presc=3 sshift=0 expecting wall_rate > 337 Mbps.
+
+```
+fpga.hx1k:program bin=@qspi.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=2500
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135.evb:uart_write data="p 3 0\r"
+delay ms=200
+mark tag=mdma_start
+mp135.evb:uart_write data="H 1048576 3\r"
+mp135.evb:uart_expect sentinel="variant=3" timeout_ms=120000
+mark tag=mdma_done
+delay ms=200
+mark tag=memcpy_start
+mp135.evb:uart_write data="H 1048576 2\r"
+mp135.evb:uart_expect sentinel="variant=2" timeout_ms=120000
+mark tag=memcpy_done
+delay ms=200
+mark tag=word_start
+mp135.evb:uart_write data="H 1048576 1\r"
+mp135.evb:uart_expect sentinel="variant=1" timeout_ms=120000
+mark tag=word_done
+delay ms=200
+mark tag=byte_start
+mp135.evb:uart_write data="H 1048576 0\r"
+mp135.evb:uart_expect sentinel="variant=0" timeout_ms=120000
+mark tag=byte_done
+mp135.evb:uart_close
+```
+
+- Check mmap MDMA mem-to-mem variant=3 wall_rate > 337 Mbps
+- Check mmap memcpy variant=2 wall_rate > 100 Mbps
+- Check mmap word-loop variant=1 wall_rate > 75 Mbps
+- Check mmap byte-loop variant=0 wall_rate > 30 Mbps
+@
+
+== Verifier
+
+Four checks, all parsing the same firmware summary line shape.
+Imports `verify_lib` like `spi_simple.nw`, calls
+`check_no_errors()` for plumbing, then matches
+
+  mmap <N> B quad in <ms> ms, <X.YZ> Mbps, presc=<p>,
+  qspi_hz=<hz>[, variant=<v>][, cisr=..., cesr=...]
+
+The `variant=<v>` group is OPTIONAL so the regex still matches a
+hypothetical iter-1-style line (no variant) for the legacy byte
+loop; when it is missing, the parser treats it as variant 0. Each
+check selects the LAST UART summary line matching its expected
+variant.
+
+<<verify.py>>=
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
+import verify_lib as v
+
+
+UART = "streams/mp135.uart.bin"
+
+MMAP_RE = re.compile(
+    rb"mmap\s+(\d+)\s+B\s+quad\s+in\s+(\d+)\s+ms,\s+"
+    rb"(\d+\.\d+)\s+Mbps,\s+presc=(\d+),\s+qspi_hz=(\d+)"
+    rb"(?:,\s+variant=(\d+))?"
+    rb"(?:,\s+cisr=([0-9A-Fa-f]+),\s+cesr=([0-9A-Fa-f]+))?")
+
+
+def _read(path):
+    if not os.path.isfile(path):
+        sys.stderr.write(f"{path} missing\n")
+        return None
+    with open(path, "rb" if path == UART else "r",
+              encoding=None if path == UART else "utf-8",
+              errors=None if path == UART else "replace") as f:
+        return f.read()
+
+
+def _check_variant(want_variant, floor_mbps, label):
+    if not v.check_no_errors():
+        return False
+    raw = _read(UART)
+    if raw is None:
+        return False
+    last = None
+    for m in MMAP_RE.finditer(raw):
+        var_grp = m.group(6)
+        var_val = int(var_grp) if var_grp is not None else 0
+        if var_val == want_variant:
+            last = m
+    if last is None:
+        sys.stderr.write(
+            f"no mmap summary line found for variant={want_variant}\n")
+        sys.stderr.write(raw[-1024:].decode("ascii", "replace") + "\n")
+        return False
+    nbytes = int(last.group(1))
+    dt_ms = int(last.group(2))
+    mbps = float(last.group(3).decode())
+    presc = int(last.group(4))
+    qspi_hz = int(last.group(5))
+    cisr = last.group(7)
+    cesr = last.group(8)
+    msg = (f"{label} presc={presc} variant={want_variant} bytes={nbytes} "
+           f"dt={dt_ms}ms mbps={mbps:.2f} qspi_hz={qspi_hz}")
+    if cisr is not None and cesr is not None:
+        msg += (f" cisr={cisr.decode()} cesr={cesr.decode()}")
+    sys.stdout.write(msg + "\n")
+    if mbps <= floor_mbps:
+        sys.stderr.write(
+            f"variant={want_variant} mbps={mbps:.2f} not > "
+            f"{floor_mbps:.1f} Mbps floor\n")
+        return False
+    return True
+
+
+def check_mmap_mdma():
+    return _check_variant(3, 337.0, "mmap mdma")
+
+
+def check_mmap_memcpy():
+    return _check_variant(2, 100.0, "mmap memcpy")
+
+
+def check_mmap_word():
+    return _check_variant(1, 75.0, "mmap word")
+
+
+def check_mmap_byte():
+    return _check_variant(0, 30.0, "mmap byte")
+
+
+DISPATCH = {
+    "Check mmap MDMA mem-to-mem variant=3 wall_rate > 337 Mbps":
+        check_mmap_mdma,
+    "Check mmap memcpy variant=2 wall_rate > 100 Mbps":
+        check_mmap_memcpy,
+    "Check mmap word-loop variant=1 wall_rate > 75 Mbps":
+        check_mmap_word,
+    "Check mmap byte-loop variant=0 wall_rate > 30 Mbps":
+        check_mmap_byte,
+}
+
+
+if __name__ == "__main__":
+    sys.exit(v.main(DISPATCH, sys.argv))
+@
+
+== Test runner
+
+`build/mmap_spi/Makefile` is the entry point. It re-tangles plan
+and verifier, symlinks `qspi.bin` from `build/qspi/`, and links
+`flash.tsv` / `main.stm32` from the agent4 baremetal/qspi
+checkout (the firmware tree we own and just rebuilt with the new
+`H` command). Note: this overrides the convention used by
+`spi_simple.nw` (which links from `/home/claude/...`); we need
+the binary that contains the new `cmd_mmap_bench` entry, which
+only exists in our checkout.
+
+<<Makefile>>=
+NW := ../../src/mmap_spi.nw
+MP135_QSPI_DIR := /home/agent4/fast_data/stm32mp135_test_board/baremetal/qspi/build
+MP135_QSPI_SRC := /home/agent4/fast_data/stm32mp135_test_board/baremetal/qspi
+
+.PHONY: all test bitstreams sim bitstream
+all: TEST.md verify.py qspi.bin flash.tsv main.stm32
+
+Makefile: $(NW)
+	tangle Makefile < $<
+
+test: all bitstreams
+	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module mmap_spi --log run_md.log
+
+bitstreams: qspi.bin
+
+bitstream: bitstreams
+
+sim:
+
+TEST.md: $(NW)
+	tangle TEST.md < $<
+
+verify.py: $(NW)
+	tangle verify.py < $<
+
+qspi.bin:
+	$(MAKE) -C ../.. build/qspi/qspi.bin
+	ln -sf ../qspi/qspi.bin $@
+
+flash.tsv:
+	ln -sf $(MP135_QSPI_SRC)/flash.tsv $@
+
+main.stm32:
+	ln -sf $(MP135_QSPI_DIR)/main.stm32 $@
+@
+
+<<mmap_spi.mk>>=
+# mmap_spi: no new RTL. Bitstream is qspi.bin from build/qspi/.
+# Firmware (main.stm32) and flash layout come from the agent4
+# baremetal/qspi checkout because we depend on the new `H`
+# command added to cli.c there. Override the parent Makefile's
+# default `/home/claude/...` paths for these symlinks only.
+
+MMAP_SPI_QSPI_DIR := /home/agent4/fast_data/stm32mp135_test_board/baremetal/qspi/build
+MMAP_SPI_QSPI_SRC := /home/agent4/fast_data/stm32mp135_test_board/baremetal/qspi
+
+build/mmap_spi/qspi.bin: build/qspi/qspi.bin | build/mmap_spi
+	ln -sf ../qspi/qspi.bin $@
+
+build/mmap_spi/flash.tsv: | build/mmap_spi
+	ln -sf $(MMAP_SPI_QSPI_SRC)/flash.tsv $@
+
+build/mmap_spi/main.stm32: | build/mmap_spi
+	ln -sf $(MMAP_SPI_QSPI_DIR)/main.stm32 $@
+
+bitstream: build/mmap_spi/qspi.bin
+@
+
+== Summary
+
+One FPGA bitstream (`qspi.bin`, 0x6B Quad Output Read slave with
+9 dummy cycles), one CLI command (`H <len> <variant>`), four
+verifier checks. The chapter sweeps four CPU/DMA copy strategies
+against a single FMODE=11 source so the iter-2 evidence
+distinguishes "memory-mapped mode is the bottleneck" from "the
+byte-loop master is the bottleneck". MDMA-first ordering
+guarantees the headline number is captured even if downstream
+blocks fail.
