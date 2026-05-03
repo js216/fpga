@@ -108,6 +108,27 @@ mp135.evb:uart_close
 - Check mmap memcpy variant=2 wall_rate > 100 Mbps
 - Check mmap word-loop variant=1 wall_rate > 75 Mbps
 - Check mmap byte-loop variant=0 wall_rate > 30 Mbps
+
+mmap MDMA integrity check 1 GiB ping-pong at presc=3 quad expecting bit-perfect transport > 400 Mbps.
+
+```
+fpga.hx1k:program bin=@qspi.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=2500
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135.evb:uart_write data="p 3 0\r"
+delay ms=200
+mark tag=int_start
+mp135.evb:uart_write data="I 1073741824\r"
+mp135.evb:uart_expect sentinel="mmap_int 1073741824 B" timeout_ms=180000
+mark tag=int_done
+mp135.evb:uart_close
+```
+
+- Check mmap_int 1 GiB firsterr=-1 AND wall_rate > 400 Mbps
 @
 
 == Verifier
@@ -141,6 +162,13 @@ MMAP_RE = re.compile(
     rb"mmap\s+(\d+)\s+B\s+quad\s+in\s+(\d+)\s+ms,\s+"
     rb"(\d+\.\d+)\s+Mbps,\s+presc=(\d+),\s+qspi_hz=(\d+)"
     rb"(?:,\s+variant=(\d+))?"
+    rb"(?:,\s+cisr=([0-9A-Fa-f]+),\s+cesr=([0-9A-Fa-f]+))?")
+
+MMAP_INT_RE = re.compile(
+    rb"mmap_int\s+(\d+)\s+B\s+in\s+(\d+)\s+ms,\s+"
+    rb"(\d+\.\d+)\s+Mbps,\s+firsterr=(-?\d+),\s+chunks=(\d+),\s+"
+    rb"pass2_ms=(\d+),\s+validate=(\d+)\s+ms,\s+"
+    rb"presc=(\d+),\s+qspi_hz=(\d+)"
     rb"(?:,\s+cisr=([0-9A-Fa-f]+),\s+cesr=([0-9A-Fa-f]+))?")
 
 
@@ -207,6 +235,48 @@ def check_mmap_byte():
     return _check_variant(0, 30.0, "mmap byte")
 
 
+def check_mmap_integrity():
+    if not v.check_no_errors():
+        return False
+    raw = _read(UART)
+    if raw is None:
+        return False
+    last = None
+    for m in MMAP_INT_RE.finditer(raw):
+        last = m
+    if last is None:
+        sys.stderr.write("no mmap_int summary line found\n")
+        sys.stderr.write(raw[-1024:].decode("ascii", "replace") + "\n")
+        return False
+    nbytes = int(last.group(1))
+    dt_ms = int(last.group(2))
+    mbps = float(last.group(3).decode())
+    firsterr = int(last.group(4))
+    chunks = int(last.group(5))
+    pass2_ms = int(last.group(6))
+    validate_ms = int(last.group(7))
+    presc = int(last.group(8))
+    qspi_hz = int(last.group(9))
+    cisr = last.group(10)
+    cesr = last.group(11)
+    msg = (f"mmap_int presc={presc} bytes={nbytes} dt={dt_ms}ms "
+           f"mbps={mbps:.2f} firsterr={firsterr} chunks={chunks} "
+           f"pass2_ms={pass2_ms}ms validate={validate_ms}ms "
+           f"qspi_hz={qspi_hz}")
+    if cisr is not None and cesr is not None:
+        msg += f" cisr={cisr.decode()} cesr={cesr.decode()}"
+    sys.stdout.write(msg + "\n")
+    if firsterr != -1:
+        sys.stderr.write(
+            f"mmap_int firsterr={firsterr} (expected -1)\n")
+        return False
+    if mbps <= 400.0:
+        sys.stderr.write(
+            f"mmap_int mbps={mbps:.2f} not > 400.0 Mbps floor\n")
+        return False
+    return True
+
+
 DISPATCH = {
     "Check mmap MDMA mem-to-mem variant=3 wall_rate > 337 Mbps":
         check_mmap_mdma,
@@ -216,6 +286,8 @@ DISPATCH = {
         check_mmap_word,
     "Check mmap byte-loop variant=0 wall_rate > 30 Mbps":
         check_mmap_byte,
+    "Check mmap_int 1 GiB firsterr=-1 AND wall_rate > 400 Mbps":
+        check_mmap_integrity,
 }
 
 
