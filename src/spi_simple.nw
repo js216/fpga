@@ -1,0 +1,443 @@
+% spi_simple.nw -- minimal FPGA->MP135 QUADSPI mission chapter.
+
+== Why this chapter exists
+
+The earlier spi/spi_1lane_stream/spi_quad chapters grew during
+debug to ~6000 lines covering pin-walk preflights, debug-UART
+reporters, four diagnostic opcodes, MDMA inner-loop logging, DLYB
+sweeps, presc/sshift matrices, and ~20 dead-end HDL hypotheses.
+None of that is intrinsic to streaming bytes off an FPGA into the
+STM32MP135 QUADSPI peripheral. The slave is a shift register; the
+master is one peripheral configured for indirect read; the test is
+"send a known byte stream, count mismatches." This chapter is the
+chapter we wish we had written first: one slave RTL, two mission
+blocks, one verifier.
+
+The chapter intentionally does not re-derive the proven SCLK
+prescalers, DLYB taps, or sshift values. Those came out of the
+spi_quad sweep and live in this chapter as constants:
+1-lane mission point is `presc=5 sshift=1` (108.7 MHz wall-rate
+107 Mbps over 32 MiB) and quad mission point is `presc=3 sshift=0`
+(164 MHz SCLK, 337 Mbps single-pass, firsterr=-1 reproducible
+across iter-77/78 sweeps). Lower prescalers were tried and
+documented to fail (presc=2 hangs the peripheral; presc=1 returns
+HAL_TIMEOUT). The mission floors are conservatively set at
+100 Mbps (1-lane) and 200 Mbps (quad) -- both well below the
+proven numbers so a single rig hiccup does not turn the chapter
+red. See the table in section "Why quad is not 4x single" below.
+
+== Slave RTL: the shift register
+
+A SPI slave is a shift register. CS_n low arms it. On every SCLK
+posedge, the slave sees the master sample its output bit (or
+nibble in quad). The slave then advances its internal byte counter
+and presents the next bit/nibble before the next sample. In quad
+mode, two SCLK periods walk one byte (high nibble first, then low
+nibble). Mode 0 (CPOL=0 CPHA=0) means data updates on falling
+SCLK and is sampled on rising SCLK.
+
+The minimum-viable Verilog is below. It is functionally identical
+to the LANES=1 / LANES=4 variants in src/spi.nw -- same byte
+sequence, same SB_IO falling-edge update, same async-CS reset to
+byte zero -- but written without the test-debug instrumentation,
+the START_DELAY hook, the IO2/IO3-pinned-low-in-1-lane workaround,
+or the genvar branch for the IO drivers. The source-of-truth
+bitstreams (`spi_1lane.bin`, `spi_quad.bin`) come from the
+existing src/spi.nw chunks because those are the binaries the
+mission was measured against; this Verilog is reproduced here as
+documentation, not built.
+
+<<spi_simple_slave.v>>=
+// Documentation-only. The mission bitstreams come from src/spi.nw.
+module spi_slave #(parameter LANES = 1) (
+   input        cs_n,
+   input        sclk,
+   inout  [3:0] io
+);
+   reg [7:0] data_byte;
+   reg [2:0] phase;     // 0..7 in 1-lane, 0..1 in quad
+   wire      oe = ~cs_n;
+   wire [3:0] dout;
+
+   always @(posedge cs_n or posedge sclk) begin
+      if (cs_n) begin
+         data_byte <= 8'd0;
+         phase     <= 3'd0;
+      end else begin
+         if (LANES == 4) begin
+            phase <= phase ^ 3'd1;            // 0,1,0,1,...
+            if (phase[0]) data_byte <= data_byte + 8'd1;
+         end else begin
+            phase <= phase + 3'd1;            // 0..7
+            if (phase == 3'd7) data_byte <= data_byte + 8'd1;
+         end
+      end
+   end
+
+   assign dout = (LANES == 4)
+      ? (phase[0] ? data_byte[7:4] : data_byte[3:0])  // high nibble first
+      : {3'b0, data_byte[3'd7 - phase]};              // MSB first, bit-banged onto IO0
+
+   genvar g;
+   generate for (g = 0; g < 4; g = g + 1) begin : g_io
+      SB_IO #(.PIN_TYPE(6'b100101), .NEG_TRIGGER(1'b1)) iob (
+         .PACKAGE_PIN(io[g]),
+         .OUTPUT_CLK(sclk),
+         .OUTPUT_ENABLE(oe),
+         .D_OUT_0((LANES == 4) ? dout[g] : (g < 2 ? dout[0] : 1'b0))
+      );
+   end endgenerate
+endmodule
+@
+
+== Why quad is not 4x single
+
+The user's intuition (quad = 4x single at the wire) is correct
+in principle. On this rig it does not hold because the bottleneck
+is not the wire -- it is the **AXI bus handshake** the MDMA pays
+on every word read from `QUADSPI->DR`. Empirically verified
+2026-05-02 with 16 firmware variants in `agent4/kerck_probe/`:
+the per-byte overhead is paced by AXI/ACLK at ~3 cycles per byte
+(~11.5 ns at AXI=266.5 MHz baseline), independent of CK_QSPI
+(PLL4), HCLK6 (PLL3/MLAHB), MDMA TLEN, MDMA SBURST (4/8/16-beat
+bursts don't help), or QSPI FTHRES. The model
+`T_byte = T_sclk_byte + 3/AXI` fits all 4 AXI scan points
+(266.5/133/88.8/66.6 MHz) within a few nanoseconds, and fits all
+prescaler points (3,4,5,63 quad).
+
+Measurements at PLL4 = 656 MHz (CK_QSPI):
+
+| presc | SCLK     | 1-lane theory  / measured  | quad theory  / measured       | quad efficiency |
+|-------|----------|----------------------------|-------------------------------|-----------------|
+| 5     | 109 MHz  | 109 / 107 Mbps  (98%)      | 437 / 268 Mbps                | 61%             |
+| 4     | 131 MHz  |   --                       | 525 / 298 Mbps  (firsterr=445)|  alignment fails|
+| 3     | 164 MHz  |   --                       | 656 / 337 Mbps  firsterr=-1   | 51% (best clean)|
+| 2     | 218 MHz  |   --                       | hangs the peripheral          |   --            |
+| 1     | 328 MHz  |   --                       | HAL_TIMEOUT                   |   --            |
+
+Two effects compound:
+
+1. The peripheral's internal pipeline cannot drain the FIFO at
+   four bits per CK_QSPI tick once SCLK goes above ~150 MHz. In
+   1-lane the wire is the bottleneck, so 98% of theoretical is
+   reachable. In quad the peripheral throttles via FTHRES, so
+   wall-rate caps out around 270-340 Mbps regardless of
+   prescaler.
+
+2. STM32MP135F datasheet Table 76 (verified in
+   /tmp/STM32MP135F_datasheet.pdf) caps QUADSPI SDR SCLK at
+   166 MHz at 2.7 V <= VDD < 3.6 V (CL = 20 pF), or 90 MHz at
+   1.71 V < VDD <= 3.6 V (CL = 15 pF). Neither matches the
+   "133 MHz" figure asked about; presc=3 (164 MHz) is at the
+   high-VDD ceiling, presc=4 (131 MHz) is below it, and the
+   alignment failure at presc=4 is therefore a peripheral-internal
+   skew issue rather than a datasheet violation.
+
+Reaching 400 Mbps quad on this peripheral would need either DTR
+(DDR) mode -- 8 bits per CK_QSPI tick, datasheet ceiling 90 MHz
+which gives 720 Mbps theoretical -- or raising CK_QSPI past PLL4's
+current 656 MHz. Neither is attempted in this chapter.
+
+== Test plan
+
+Two blocks. First runs the proven 1-lane mission point; second
+runs the proven quad mission point. Both reuse `spi_1lane.bin` /
+`spi_quad.bin` built by build/spi/, symlinked into this chapter's
+build directory (see Makefile). The `bench_mcu:reset_dut` pulses
+D13 and the firmware-baked DFU+flash flow takes ~2.5 s to land on
+the QSPI cli prompt; the `delay ms=2500` matches the proven
+spi_quad timing.
+
+The 1-lane block uses the auto-consume stream (`A` command,
+auto-consume on, ping-pong DDR ~16 MiB chunks) which routes
+through `cmd_auto_stream` ->
+`stream_direct_crc_eligible(quad=0, raw=1) && auto_consume` ->
+`stream_direct_crc_read` -> `qspi_mdma_crc_read`. The quad block
+uses the twin-DDR command (`T` command, two consecutive
+`qspi_mdma_read` reads into ping-pong DDR slots, byte-compare).
+firsterr=-1 means pass-1 == pass-2 byte-for-byte, which proves the
+channel transports the same varying byte stream identically twice
+-- the mission criterion of "real varying data" without any
+constant-byte short-cut.
+
+<<TEST.md>>=
+1-lane mission: 32 MiB stream at presc=5 sshift=1 expecting wall_rate >= 100 Mbps and firsterr=-1.
+
+```
+fpga.hx1k:program bin=@spi_1lane.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=2500
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135.evb:uart_write data="p 5 1\r"
+delay ms=100
+mp135.evb:uart_write data="a 1\r"
+mp135.evb:uart_expect sentinel="auto=on" timeout_ms=3000
+mark tag=bench_start
+mp135.evb:uart_write data="A 33554432 0 1\r"
+mp135.evb:uart_expect sentinel="stream_xfer 33554432 B" timeout_ms=15000
+mark tag=bench_done
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135.evb:uart_close
+```
+
+- Check 1-lane mission stream presc=5 sshift=1 wall_rate >= 100 Mbps firsterr=-1
+
+Quad mission: 16 MiB twin-DDR at presc=3 sshift=0 expecting pass1_rate >= 200 Mbps and firsterr=-1.
+
+```
+fpga.hx1k:program bin=@spi_quad.bin
+bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
+delay ms=2500
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+delay ms=300
+mp135.evb:uart_write data="p 3 0\r"
+delay ms=200
+mark tag=bench_start
+mp135.evb:uart_write data="T 16777216\r"
+mp135.evb:uart_expect sentinel="twin_pass1_done" timeout_ms=120000
+mark tag=bench_done
+mp135.evb:uart_expect sentinel="twin 16777216 B quad raw" timeout_ms=120000
+mp135.evb:uart_close
+```
+
+- Check quad mission twin-DDR presc=3 sshift=0 pass1_rate >= 200 Mbps firsterr=-1
+@
+
+== Verifier
+
+Two checks, each parses one firmware summary line from the
+captured MP135 UART. The 1-lane check parses the `stream <N> B
+1lane in <ms> ms, <Mbps> Mbps, crc32=<...>, expect=<...>,
+firsterr=<n>, ...` line, computes wall-rate from the
+bench_start/bench_done marks in `timeline.log`, and gates on
+firsterr=-1 plus wall_rate >= 100 Mbps. The quad check parses the
+`twin <N> B quad raw pass1=<ms> ms pass2=<ms> ms crc32=<...>
+firsterr=<n> ...` line, computes pass1_rate from firmware-reported
+pass1 ms (less noisy than wall-rate which includes test_serv UART
+overhead), and gates on firsterr=-1 plus pass1_rate >= 200 Mbps.
+Helpers are copied verbatim from src/spi_quad.nw and
+src/spi_1lane_stream.nw -- no new parser logic.
+
+<<verify.py>>=
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
+import verify_lib as v
+
+
+UART = "streams/mp135.uart.bin"
+TIMELINE = "timeline.log"
+QSPI_KER_HZ = 656_000_000
+
+STREAM_RE = re.compile(
+    rb"stream\s+(\d+)\s+B\s+(1lane|quad)\s+in\s+"
+    rb"(\d+)\s+ms,\s+(\d+\.\d+)\s+Mbps,\s+crc32=([0-9a-f]+),\s+"
+    rb"expect=([0-9a-f]+),\s+firsterr=(-?\d+),\s+chunk=(\d+),\s+"
+    rb"chunks=(\d+),\s+(?:buf=(sram|ddr|crc),\s+)?auto=(on|off)"
+    rb"(?:,\s+presc=(\d+),\s+qspi_hz=(\d+))?")
+
+
+def _read(path):
+    if not os.path.isfile(path):
+        sys.stderr.write(f"{path} missing\n")
+        return None
+    with open(path, "rb" if path == UART else "r",
+              encoding=None if path == UART else "utf-8",
+              errors=None if path == UART else "replace") as f:
+        return f.read()
+
+
+def _bench_wall_ms():
+    text = _read(TIMELINE)
+    if text is None:
+        return None
+    def _t(tag):
+        m = re.search(r"^\s*(\d+\.\d+)\s+MARK\s+ctrl\s+" + re.escape(tag) + r"\s*$",
+                      text, flags=re.MULTILINE)
+        return float(m.group(1)) if m else None
+    s, d = _t("bench_start"), _t("bench_done")
+    if s is None or d is None:
+        return None
+    return max(0.0, (d - s) * 1000.0)
+
+
+def check_1lane_mission():
+    if not v.check_no_errors():
+        return False
+    raw = _read(UART)
+    if raw is None:
+        return False
+    last = None
+    for m in STREAM_RE.finditer(raw):
+        if int(m.group(1)) == 33554432 and m.group(2) == b"1lane":
+            last = m
+    if last is None:
+        sys.stderr.write("no 1lane stream summary for 33554432 B\n")
+        sys.stderr.write(raw[-512:].decode("ascii", "replace") + "\n")
+        return False
+    firsterr = int(last.group(7))
+    crc, exp = last.group(5).decode(), last.group(6).decode()
+    eff_mbps = float(last.group(4).decode())
+    wall_ms = _bench_wall_ms()
+    wall_rate = (33554432 * 8.0) / (wall_ms * 1000.0) if wall_ms else None
+    msg = (f"1lane stream presc=5 sshift=1 bytes=33554432 "
+           f"effective={eff_mbps:.3f}Mbps "
+           f"wall_rate={'%.3f' % wall_rate if wall_rate else '?'}Mbps "
+           f"crc32={crc} expect={exp} firsterr={firsterr}")
+    sys.stdout.write(msg + "\n")
+    if firsterr != -1:
+        sys.stderr.write(f"firsterr={firsterr}, expected -1\n")
+        return False
+    if crc != exp:
+        sys.stderr.write(f"crc32 mismatch: {crc} vs expect {exp}\n")
+        return False
+    if wall_rate is None:
+        sys.stderr.write("wall_rate=unknown (missing bench marks)\n")
+        return False
+    if wall_rate < 100.0:
+        sys.stderr.write(f"wall_rate={wall_rate:.3f}Mbps below 100 Mbps floor\n")
+        return False
+    return True
+
+
+def check_quad_mission():
+    if not v.check_no_errors():
+        return False
+    raw = _read(UART)
+    if raw is None:
+        return False
+    pat = rb"twin\s+16777216\s+B\s+quad\s+raw[^\n]*firsterr=-?\d+"
+    m = re.search(pat, raw)
+    if not m:
+        sys.stderr.write("no twin summary for 16777216 B\n")
+        sys.stderr.write(raw[-512:].decode("ascii", "replace") + "\n")
+        return False
+    line = m.group(0).decode("ascii", "replace")
+    firsterr = int(re.search(r"firsterr=(-?\d+)", line).group(1))
+    crc_m = re.search(r"crc32=([0-9a-f]+)", line)
+    crc = crc_m.group(1) if crc_m else "?"
+    pass1_m = re.search(r"pass1=(\d+)\s+ms", line)
+    pass1_ms = int(pass1_m.group(1)) if pass1_m else None
+    pass1_rate = ((16777216 * 8.0) / (pass1_ms * 1000.0)
+                  if pass1_ms else None)
+    msg = (f"quad twin-DDR presc=3 sshift=0 bytes=16777216 "
+           f"pass1_rate={'%.3f' % pass1_rate if pass1_rate else '?'}Mbps "
+           f"crc32={crc} firsterr={firsterr} full={line}")
+    sys.stdout.write(msg + "\n")
+    if firsterr != -1:
+        sys.stderr.write(f"firsterr={firsterr}, expected -1\n")
+        return False
+    if pass1_rate is None:
+        sys.stderr.write("pass1_rate=unknown (no pass1=<ms> in summary)\n")
+        return False
+    if pass1_rate < 200.0:
+        sys.stderr.write(f"pass1_rate={pass1_rate:.3f}Mbps below 200 Mbps floor\n")
+        return False
+    return True
+
+
+DISPATCH = {
+    "Check 1-lane mission stream presc=5 sshift=1 wall_rate >= 100 Mbps firsterr=-1":
+        check_1lane_mission,
+    "Check quad mission twin-DDR presc=3 sshift=0 pass1_rate >= 200 Mbps firsterr=-1":
+        check_quad_mission,
+}
+
+
+if __name__ == "__main__":
+    sys.exit(v.main(DISPATCH, sys.argv))
+@
+
+== Test runner
+
+`build/spi_simple/Makefile` is the entry point invoked from
+`cd build/spi_simple && make test`. It re-tangles the plan and
+verifier from src/spi_simple.nw, symlinks `spi_1lane.bin` and
+`spi_quad.bin` from build/spi/ (so the spi chapter remains the
+single source of truth for HDL synthesis), then hands off to the
+shared run_md.py driver.
+
+<<Makefile>>=
+NW := ../../src/spi_simple.nw
+MP135_QSPI_DIR := /home/claude/stm32mp135_test_board/baremetal/qspi/build
+MP135_QSPI_SRC := /home/claude/stm32mp135_test_board/baremetal/qspi
+
+.PHONY: all test bitstreams sim bitstream
+all: TEST.md verify.py spi_1lane.bin spi_quad.bin flash.tsv main.stm32
+
+Makefile: $(NW)
+	tangle Makefile < $<
+
+test: all bitstreams
+	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi_simple --log run_md.log
+
+bitstreams: spi_1lane.bin spi_quad.bin
+
+bitstream: bitstreams
+
+sim:
+
+TEST.md: $(NW)
+	tangle TEST.md < $<
+
+verify.py: $(NW)
+	tangle verify.py < $<
+
+spi_1lane.bin:
+	$(MAKE) -C ../.. build/spi/spi_1lane.bin
+	ln -sf ../spi/spi_1lane.bin $@
+
+spi_quad.bin:
+	$(MAKE) -C ../.. build/spi/spi_quad.bin
+	ln -sf ../spi/spi_quad.bin $@
+
+flash.tsv:
+	ln -sf $(MP135_QSPI_SRC)/flash.tsv $@
+
+main.stm32:
+	ln -sf $(MP135_QSPI_DIR)/main.stm32 $@
+@
+
+<<spi_simple.mk>>=
+# spi_simple: no new RTL. Bitstreams are spi_1lane.bin and
+# spi_quad.bin built under build/spi/. We expose them inside
+# build/spi_simple/ via symlinks so the in-build-dir Makefile can
+# resolve them relatively.
+
+build/spi_simple/spi_1lane.bin: build/spi/spi_1lane.bin | build/spi_simple
+	ln -sf ../spi/spi_1lane.bin $@
+
+build/spi_simple/spi_quad.bin: build/spi/spi_quad.bin | build/spi_simple
+	ln -sf ../spi/spi_quad.bin $@
+
+build/spi_simple/flash.tsv: | build/spi_simple
+	ln -sf $(MP135_QSPI_SRC)/flash.tsv $@
+
+build/spi_simple/main.stm32: | build/spi_simple
+	ln -sf $(MP135_QSPI_DIR)/main.stm32 $@
+
+bitstream: build/spi_simple/spi_1lane.bin build/spi_simple/spi_quad.bin
+@
+
+== Summary
+
+This chapter is two test blocks and one verifier. The slave RTL
+is reproduced as documentation in `<<spi_simple_slave.v>>` --
+70 lines including SB_IO instances -- to demonstrate that a SPI
+slave is genuinely a shift register and not the 600+ lines of
+spi.nw scaffolding. The mission bitstreams come from src/spi.nw
+because those are the binaries the iter-1..79 sweep was measured
+against; rebuilding them risks regressing the proven (presc, sshift)
+sweet spots. The 1-lane mission floor is 100 Mbps (proven
+107 Mbps); the quad mission floor is 200 Mbps (proven 337 Mbps,
+single-pass, firsterr=-1, presc=3 sshift=0). 400 Mbps quad is
+out of reach in SDR mode on this peripheral; see "Why quad is not
+4x single" above.

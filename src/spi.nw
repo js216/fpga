@@ -1117,28 +1117,28 @@ programmed FPGA drive pattern is checked from the MPU side.
 Preflight -- MP135 QSPI pins reach the expected iCE40 pins.
 
 ```
-fpga:program bin=@spi_pin_walk.bin
+fpga.hx1k:program bin=@spi_pin_walk.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
-mp135:uart_write data="G\r"
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+mp135.evb:uart_write data="G\r"
 delay ms=1800
-mp135:uart_write data="G\r"
+mp135.evb:uart_write data="G\r"
 delay ms=2100
-mp135:uart_write data="G\r"
+mp135.evb:uart_write data="G\r"
 delay ms=2100
-mp135:uart_write data="G\r"
+mp135.evb:uart_write data="G\r"
 delay ms=2100
-mp135:uart_write data="G\r"
+mp135.evb:uart_write data="G\r"
 delay ms=2100
-mp135:uart_write data="G\r"
+mp135.evb:uart_write data="G\r"
 delay ms=2100
-mp135:uart_write data="G\r"
+mp135.evb:uart_write data="G\r"
 delay ms=2100
-mp135:uart_write data="G\r"
+mp135.evb:uart_write data="G\r"
 delay ms=100
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check SPI header wiring via GPIO preflight
@@ -1158,15 +1158,15 @@ raw GPIO wiring preflight, these checks assert the received data bytes:
 Preflight -- 1-lane software bit-bang reads the SPI stream.
 
 ```
-fpga:program bin=@spi_1lane.bin
+fpga.hx1k:program bin=@spi_1lane.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="k 16 0 1\r"
-mp135:uart_expect sentinel="bb read 16 (1lane io=1)" timeout_ms=5000
-mp135:uart_close
+mp135.evb:uart_write data="k 16 0 1\r"
+mp135.evb:uart_expect sentinel="bb read 16 (1lane io=1)" timeout_ms=5000
+mp135.evb:uart_close
 ```
 
 - Check 1lane bit-bang read returns incrementing pattern
@@ -1175,16 +1175,16 @@ Preflight -- 1-lane peripheral raw read returns the SPI stream.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 203 0\r"
+mp135.evb:uart_write data="p 203 0\r"
 delay ms=100
-mp135:uart_write data="j 1024 0\r"
-mp135:uart_expect sentinel="raw read 1024 (1lane)" timeout_ms=5000
+mp135.evb:uart_write data="j 1024 0\r"
+mp135.evb:uart_expect sentinel="raw read 1024 (1lane)" timeout_ms=5000
 delay ms=1000
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check 1lane peripheral raw read returns 1024-byte incrementing pattern
@@ -1193,16 +1193,16 @@ Preflight -- 1-lane peripheral raw read at presc=5.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 5 1\r"
+mp135.evb:uart_write data="p 5 1\r"
 delay ms=100
-mp135:uart_write data="j 512 0\r"
-mp135:uart_expect sentinel="raw read 512 (1lane)" timeout_ms=5000
+mp135.evb:uart_write data="j 512 0\r"
+mp135.evb:uart_expect sentinel="raw read 512 (1lane)" timeout_ms=5000
 delay ms=700
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check 1lane peripheral raw read at presc=5 returns 512-byte incrementing pattern
@@ -1233,13 +1233,13 @@ Measure 128 KiB XOR timing on MP135 DDR.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="y 100\r"
-mp135:uart_expect sentinel="xor128" timeout_ms=20000
-mp135:uart_close
+mp135.evb:uart_write data="y 100\r"
+mp135.evb:uart_expect sentinel="xor128" timeout_ms=20000
+mp135.evb:uart_close
 ```
 
 - Measure MP135 128 KiB XOR timing
@@ -1248,17 +1248,17 @@ Phase 1 -- 1-lane sweep at presc=203.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 203\r"
+mp135.evb:uart_write data="p 203\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135.evb:uart_write data="b 1048576 0 1\r"
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mark tag=bench_done
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check 1lane @ presc=203 pattern correct
@@ -1267,17 +1267,17 @@ Phase 1 -- 1-lane sweep at presc=63.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 63\r"
+mp135.evb:uart_write data="p 63\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=10000
+mp135.evb:uart_write data="b 1048576 0 1\r"
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=10000
 mark tag=bench_done
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check 1lane @ presc=63 pattern correct
@@ -1286,17 +1286,17 @@ Phase 1 -- 1-lane sweep at presc=15.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 15\r"
+mp135.evb:uart_write data="p 15\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
+mp135.evb:uart_write data="b 1048576 0 1\r"
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
 mark tag=bench_done
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check 1lane @ presc=15 pattern correct
@@ -1305,17 +1305,17 @@ Phase 1 -- 1-lane sweep at presc=5.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 5 1\r"
+mp135.evb:uart_write data="p 5 1\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 0 1\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
+mp135.evb:uart_write data="b 1048576 0 1\r"
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
 mark tag=bench_done
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check 1lane @ presc=5 pattern correct
@@ -1324,20 +1324,20 @@ Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=203.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 203\r"
+mp135.evb:uart_write data="p 203\r"
 delay ms=100
-mp135:uart_write data="a 1\r"
-mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mp135.evb:uart_write data="a 1\r"
+mp135.evb:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="A 1000000 0 1\r"
-mp135:uart_expect sentinel="stream_xfer 1000000 B" timeout_ms=40000
+mp135.evb:uart_write data="A 1000000 0 1\r"
+mp135.evb:uart_expect sentinel="stream_xfer 1000000 B" timeout_ms=40000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=40000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=40000
+mp135.evb:uart_close
 ```
 
 - Check 1lane stream @ presc=203 pattern correct
@@ -1346,20 +1346,20 @@ Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=255.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 255\r"
+mp135.evb:uart_write data="p 255\r"
 delay ms=100
-mp135:uart_write data="a 1\r"
-mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mp135.evb:uart_write data="a 1\r"
+mp135.evb:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="A 1048576 0 1\r"
-mp135:uart_expect sentinel="stream_xfer 1048576 B" timeout_ms=20000
+mp135.evb:uart_write data="A 1048576 0 1\r"
+mp135.evb:uart_expect sentinel="stream_xfer 1048576 B" timeout_ms=20000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=20000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=20000
+mp135.evb:uart_close
 ```
 
 - Check 1lane stream @ presc=255 pattern correct
@@ -1368,20 +1368,20 @@ Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=63.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 63\r"
+mp135.evb:uart_write data="p 63\r"
 delay ms=100
-mp135:uart_write data="a 1\r"
-mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mp135.evb:uart_write data="a 1\r"
+mp135.evb:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="A 2097152 0 1\r"
-mp135:uart_expect sentinel="stream_xfer 2097152 B" timeout_ms=15000
+mp135.evb:uart_write data="A 2097152 0 1\r"
+mp135.evb:uart_expect sentinel="stream_xfer 2097152 B" timeout_ms=15000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135.evb:uart_close
 ```
 
 - Check 1lane stream @ presc=63 pattern correct
@@ -1390,20 +1390,20 @@ Phase 1 -- 1-lane single-slot auto-consume stream/CRC/PHY check at presc=15.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 15\r"
+mp135.evb:uart_write data="p 15\r"
 delay ms=100
-mp135:uart_write data="a 1\r"
-mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mp135.evb:uart_write data="a 1\r"
+mp135.evb:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="A 1500000 0 1\r"
-mp135:uart_expect sentinel="stream_xfer 1500000 B" timeout_ms=12000
+mp135.evb:uart_write data="A 1500000 0 1\r"
+mp135.evb:uart_expect sentinel="stream_xfer 1500000 B" timeout_ms=12000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=12000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=12000
+mp135.evb:uart_close
 ```
 
 - Check 1lane stream @ presc=15 pattern correct
@@ -1412,20 +1412,20 @@ Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=5.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 5 1\r"
+mp135.evb:uart_write data="p 5 1\r"
 delay ms=100
-mp135:uart_write data="a 1\r"
-mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mp135.evb:uart_write data="a 1\r"
+mp135.evb:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="A 16842752 0 1\r"
-mp135:uart_expect sentinel="stream_xfer 16842752 B" timeout_ms=15000
+mp135.evb:uart_write data="A 16842752 0 1\r"
+mp135.evb:uart_expect sentinel="stream_xfer 16842752 B" timeout_ms=15000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135.evb:uart_close
 ```
 
 - Check 1lane stream @ presc=5 pattern correct
@@ -1434,20 +1434,20 @@ Phase 1 -- 1-lane DDR ping-pong auto-consume stream at presc=5 wall-rate floor.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 5 1\r"
+mp135.evb:uart_write data="p 5 1\r"
 delay ms=100
-mp135:uart_write data="a 1\r"
-mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mp135.evb:uart_write data="a 1\r"
+mp135.evb:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="A 33554432 0 1\r"
-mp135:uart_expect sentinel="stream_xfer 33554432 B" timeout_ms=15000
+mp135.evb:uart_write data="A 33554432 0 1\r"
+mp135.evb:uart_expect sentinel="stream_xfer 33554432 B" timeout_ms=15000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135.evb:uart_close
 ```
 
 - Check 1lane stream @ presc=5 wall rate >= 100 Mbps
@@ -1460,20 +1460,20 @@ report `firsterr=-1`.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 5 1\r"
+mp135.evb:uart_write data="p 5 1\r"
 delay ms=100
-mp135:uart_write data="a 1\r"
-mp135:uart_expect sentinel="auto=on" timeout_ms=3000
+mp135.evb:uart_write data="a 1\r"
+mp135.evb:uart_expect sentinel="auto=on" timeout_ms=3000
 mark tag=bench_start
-mp135:uart_write data="A 512000000 0 1\r"
-mp135:uart_expect sentinel="stream_xfer 512000000 B" timeout_ms=45000
+mp135.evb:uart_write data="A 512000000 0 1\r"
+mp135.evb:uart_expect sentinel="stream_xfer 512000000 B" timeout_ms=45000
 mark tag=bench_done
-mp135:uart_expect sentinel="stream 512000000 B" timeout_ms=45000
-mp135:uart_close
+mp135.evb:uart_expect sentinel="stream 512000000 B" timeout_ms=45000
+mp135.evb:uart_close
 ```
 
 - Check 1lane stream @ presc=5 512 MB stream_xfer wall rate >= 100 Mbps within 45 s, then pattern correct
@@ -1484,23 +1484,23 @@ Program the quad FPGA image here and issue the diagnostic opcode that
 uses 0x6B framing but returns one-hot nibbles on IO[3:0].
 
 ```
-fpga:open
-fpga:program bin=@qspi.bin
+fpga.hx1k:open
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-fpga:uart_open
-mp135:uart_write data="p 203 1\r"
+fpga.hx1k:uart_open
+mp135.evb:uart_write data="p 203 1\r"
 delay ms=100
-mp135:uart_write data="Y 32\r"
-mp135:uart_expect sentinel="op=6c read 32 @ 0x00000000" timeout_ms=5000
+mp135.evb:uart_write data="Y 32\r"
+mp135.evb:uart_expect sentinel="op=6c read 32 @ 0x00000000" timeout_ms=5000
 delay ms=1500
-fpga:uart_close
-fpga:close
+fpga.hx1k:uart_close
+fpga.hx1k:close
 delay ms=1000
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check quad peripheral 0x6C one-hot diagnostic returns 12 48 pattern
@@ -1512,23 +1512,23 @@ repeated 00,11,22,...,ff byte sequence. Each byte holds one nibble
 value across both quad sample edges.
 
 ```
-fpga:open
-fpga:program bin=@qspi.bin
+fpga.hx1k:open
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-fpga:uart_open
-mp135:uart_write data="p 203 1\r"
+fpga.hx1k:uart_open
+mp135.evb:uart_write data="p 203 1\r"
 delay ms=100
-mp135:uart_write data="W 32\r"
-mp135:uart_expect sentinel="op=6e read 32 @ 0x00000000" timeout_ms=5000
+mp135.evb:uart_write data="W 32\r"
+mp135.evb:uart_expect sentinel="op=6e read 32 @ 0x00000000" timeout_ms=5000
 delay ms=1500
-fpga:uart_close
-fpga:close
+fpga.hx1k:uart_close
+fpga.hx1k:close
 delay ms=1000
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check quad peripheral 0x6E nibble-hold diagnostic returns 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff pattern
@@ -1540,23 +1540,23 @@ continuous 0,1,2,...,f nibble ramp. STM32 byte assembly should return
 01,23,45,67,89,ab,cd,ef repeatedly.
 
 ```
-fpga:open
-fpga:program bin=@qspi.bin
+fpga.hx1k:open
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-fpga:uart_open
-mp135:uart_write data="p 203 1\r"
+fpga.hx1k:uart_open
+mp135.evb:uart_write data="p 203 1\r"
 delay ms=100
-mp135:uart_write data="U 32\r"
-mp135:uart_expect sentinel="op=6f read 32 @ 0x00000000" timeout_ms=5000
+mp135.evb:uart_write data="U 32\r"
+mp135.evb:uart_expect sentinel="op=6f read 32 @ 0x00000000" timeout_ms=5000
 delay ms=1500
-fpga:uart_close
-fpga:close
+fpga.hx1k:uart_close
+fpga.hx1k:close
 delay ms=1000
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check quad peripheral 0x6F nibble-ramp diagnostic returns 01 23 45 67 89 ab cd ef pattern
@@ -1567,23 +1567,23 @@ Program the quad FPGA image here so the following 1 MiB sweep starts from
 a known lane-width bitstream.
 
 ```
-fpga:open
-fpga:program bin=@qspi.bin
+fpga.hx1k:open
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-fpga:uart_open
-mp135:uart_write data="p 203 1\r"
+fpga.hx1k:uart_open
+mp135.evb:uart_write data="p 203 1\r"
 delay ms=100
-mp135:uart_write data="q 0 1024\r"
-mp135:uart_expect sentinel="op=6b read 1024 @ 0x00000000" timeout_ms=5000
+mp135.evb:uart_write data="q 0 1024\r"
+mp135.evb:uart_expect sentinel="op=6b read 1024 @ 0x00000000" timeout_ms=5000
 delay ms=1500
-fpga:uart_close
-fpga:close
+fpga.hx1k:uart_close
+fpga.hx1k:close
 delay ms=1000
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check quad peripheral read returns 1024-byte incrementing pattern
@@ -1591,19 +1591,19 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=203.
 
 ```
-fpga:program bin=@qspi.bin
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 203 1\r"
+mp135.evb:uart_write data="p 203 1\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 1 0\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135.evb:uart_write data="b 1048576 1 0\r"
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
 mark tag=bench_done
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check quad @ presc=203 pattern correct
@@ -1611,19 +1611,19 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=63.
 
 ```
-fpga:program bin=@qspi.bin
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 63\r"
+mp135.evb:uart_write data="p 63\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 1 0\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
+mp135.evb:uart_write data="b 1048576 1 0\r"
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=8000
 mark tag=bench_done
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check quad @ presc=63 pattern correct
@@ -1631,19 +1631,19 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=15.
 
 ```
-fpga:program bin=@qspi.bin
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 15\r"
+mp135.evb:uart_write data="p 15\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 1 0\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
+mp135.evb:uart_write data="b 1048576 1 0\r"
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=6000
 mark tag=bench_done
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check quad @ presc=15 pattern correct
@@ -1651,19 +1651,19 @@ mp135:uart_close
 Phase 2 -- 4-lane sweep at presc=5.
 
 ```
-fpga:program bin=@qspi.bin
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 5\r"
+mp135.evb:uart_write data="p 5\r"
 delay ms=100
 mark tag=bench_start
-mp135:uart_write data="b 1048576 1 0\r"
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=5000
+mp135.evb:uart_write data="b 1048576 1 0\r"
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=5000
 mark tag=bench_done
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check quad @ presc=5 pattern correct
@@ -1674,23 +1674,23 @@ Issue the second diagnostic opcode with the same 0x6B framing but a
 short repeated byte sequence around the failing 06/07/08 region.
 
 ```
-fpga:open
-fpga:program bin=@qspi.bin
+fpga.hx1k:open
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-fpga:uart_open
-mp135:uart_write data="p 203 1\r"
+fpga.hx1k:uart_open
+mp135.evb:uart_write data="p 203 1\r"
 delay ms=100
-mp135:uart_write data="Z 32\r"
-mp135:uart_expect sentinel="op=6d read 32 @ 0x00000000" timeout_ms=5000
+mp135.evb:uart_write data="Z 32\r"
+mp135.evb:uart_expect sentinel="op=6d read 32 @ 0x00000000" timeout_ms=5000
 delay ms=1500
-fpga:uart_close
-fpga:close
+fpga.hx1k:uart_close
+fpga.hx1k:close
 delay ms=1000
-mp135:uart_close
+mp135.evb:uart_close
 ```
 
 - Check quad peripheral 0x6D byte diagnostic returns 06 07 08 09 0a 0b 0c 0d pattern
@@ -1701,20 +1701,20 @@ Program the command-aware QSPI FPGA image here so the bit-bang diagnostic
 exercises the same slave protocol used by the peripheral path.
 
 ```
-fpga:open
-fpga:program bin=@qspi.bin
+fpga.hx1k:open
+fpga.hx1k:program bin=@qspi.bin
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-fpga:uart_open
-mp135:uart_write data="K 16\r"
-mp135:uart_expect sentinel="bb 6b read 16 @ 0x00000000" timeout_ms=5000
+fpga.hx1k:uart_open
+mp135.evb:uart_write data="K 16\r"
+mp135.evb:uart_expect sentinel="bb 6b read 16 @ 0x00000000" timeout_ms=5000
 delay ms=1500
-fpga:uart_close
-fpga:close
-mp135:uart_close
+fpga.hx1k:uart_close
+fpga.hx1k:close
+mp135.evb:uart_close
 ```
 
 - Check quad bit-bang 6b command drives expected held pad nibbles
@@ -1723,20 +1723,20 @@ MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=203.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 203\r"
+mp135.evb:uart_write data="p 203\r"
 delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mp135.evb:uart_write data="o 1000000\r"
+mp135.evb:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=40000
+mp135.evb:uart_write data="m 1000000 0 1\r"
+mp135.evb:uart_expect sentinel="mdma_xfer" timeout_ms=40000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=40000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=40000
+mp135.evb:uart_close
 ```
 
 - Check 1lane single-buffer DDR MDMA @ presc=203 pattern correct
@@ -1745,20 +1745,20 @@ MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=63.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 63\r"
+mp135.evb:uart_write data="p 63\r"
 delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mp135.evb:uart_write data="o 1000000\r"
+mp135.evb:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=15000
+mp135.evb:uart_write data="m 1000000 0 1\r"
+mp135.evb:uart_expect sentinel="mdma_xfer" timeout_ms=15000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
+mp135.evb:uart_close
 ```
 
 - Check 1lane single-buffer DDR MDMA @ presc=63 pattern correct
@@ -1767,20 +1767,20 @@ MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=15.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 15\r"
+mp135.evb:uart_write data="p 15\r"
 delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mp135.evb:uart_write data="o 1000000\r"
+mp135.evb:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=12000
+mp135.evb:uart_write data="m 1000000 0 1\r"
+mp135.evb:uart_expect sentinel="mdma_xfer" timeout_ms=12000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
+mp135.evb:uart_close
 ```
 
 - Check 1lane single-buffer DDR MDMA @ presc=15 pattern correct
@@ -1789,20 +1789,20 @@ MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=5.
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 5 1\r"
+mp135.evb:uart_write data="p 5 1\r"
 delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mp135.evb:uart_write data="o 1000000\r"
+mp135.evb:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=6000
+mp135.evb:uart_write data="m 1000000 0 1\r"
+mp135.evb:uart_expect sentinel="mdma_xfer" timeout_ms=6000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=30000
+mp135.evb:uart_close
 ```
 
 - Check 1lane single-buffer DDR MDMA @ presc=5 pattern correct
@@ -1811,20 +1811,20 @@ MDMA regression -- 1-lane single-buffer DDR MDMA read at presc=5 wall-rate floor
 
 ```
 bench_mcu:reset_dut  # blobs: @main.stm32 (referenced from flash.tsv)
-dfu:flash_layout layout=@flash.tsv no_reconnect=true
-mp135:uart_open
-mp135:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
+dfu.evb:flash_layout layout=@flash.tsv no_reconnect=true
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="JEDEC ID:" timeout_ms=10000
 delay ms=300
-mp135:uart_write data="p 5 1\r"
+mp135.evb:uart_write data="p 5 1\r"
 delay ms=100
-mp135:uart_write data="o 1000000\r"
-mp135:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
+mp135.evb:uart_write data="o 1000000\r"
+mp135.evb:uart_expect sentinel="poison 1000000 B" timeout_ms=10000
 mark tag=bench_start
-mp135:uart_write data="m 1000000 0 1\r"
-mp135:uart_expect sentinel="mdma_xfer" timeout_ms=15000
+mp135.evb:uart_write data="m 1000000 0 1\r"
+mp135.evb:uart_expect sentinel="mdma_xfer" timeout_ms=15000
 mark tag=bench_done
-mp135:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
-mp135:uart_close
+mp135.evb:uart_expect sentinel=", firsterr=-1" timeout_ms=15000
+mp135.evb:uart_close
 ```
 
 - Check 1lane single-buffer DDR MDMA @ presc=5 wall rate >= 100 Mbps
