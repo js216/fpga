@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 
-module tb_qspi;
+module tb_jedec;
    localparam CLKS_PER_BIT = 104;
 
    reg clk;
@@ -30,7 +30,7 @@ module tb_qspi;
    // is the DUT's single-lane response line (io[1] read back).
    wire miso = io[1];
 
-   qspi dut (
+   jedec dut (
       .clk (clk),
       .cs_n(cs_n),
       .sclk(sclk),

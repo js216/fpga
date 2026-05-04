@@ -38,7 +38,7 @@ module tb_spi_quad;
          first_sample = io;
          #19;
          if (io !== first_sample) begin
-            $display("FAIL byte %0d high-pause: io changed from %x to %x",
+            $display("FAIL byte %0d upper-pause: io changed from %x to %x",
                      expected, first_sample, io);
             errs = errs + 1;
          end
@@ -54,7 +54,7 @@ module tb_spi_quad;
          second_sample = io;
          #19;
          if (io !== second_sample) begin
-            $display("FAIL byte %0d high-pause 2: io changed from %x to %x",
+            $display("FAIL byte %0d lower-pause: io changed from %x to %x",
                      expected, second_sample, io);
             errs = errs + 1;
          end
@@ -67,24 +67,24 @@ module tb_spi_quad;
          end
       end
    endtask
-   task automatic frame(input integer count);
+   task automatic frame_from(input integer start, input integer count);
       integer k;
       begin
          #20 cs_n = 1'b0;
          #5;
          for (k = 0; k < count; k = k + 1)
-            clock_byte(k);
+            clock_byte(start + k);
          #5 cs_n = 1'b1;
          #20;
       end
    endtask
-   task automatic paused_frame(input integer count);
+   task automatic paused_frame_from(input integer start, input integer count);
       integer k;
       begin
          #20 cs_n = 1'b0;
          #5;
          for (k = 0; k < count; k = k + 1)
-            clock_byte_paused(k);
+            clock_byte_paused(start + k);
          #5 cs_n = 1'b1;
          #20;
       end
@@ -104,11 +104,11 @@ module tb_spi_quad;
       errs = 0;
       cs_high_quiet();
       cs_high_quiet();
-      frame(256);
+      frame_from(0, 256);
       cs_high_quiet();
-      paused_frame(32);
+      paused_frame_from(256, 32);
       cs_high_quiet();
-      frame(4096);
+      frame_from(288, 4096);
       cs_high_quiet();
       cs_high_quiet();
       if (errs == 0)

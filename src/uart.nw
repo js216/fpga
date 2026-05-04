@@ -7,16 +7,22 @@ source:
 
 - `uart_rx.v`: 8N1 receiver, parameterised by clock cycles per bit;
 - `uart_tx.v`: matching transmitter;
-- `uart_hello.v`: a heartbeat byte source emitting "Hello from iCEstick"
+- `uart_hello.v`: a heartbeat byte source emitting `"Hello from iCE40"`
   every `PERIOD_CYCLES` ticks --- not standalone; it feeds a caller-owned
   transmitter through a valid/ready handshake;
-- `uart.v`: the iCEstick demo top --- instantiates one of each and
-  arbitrates the single `uart_tx` between the hello heartbeat and an
-  echo loopback on the receiver.
+- `uart.v`: the demo top --- instantiates one of each and arbitrates
+  the single `uart_tx` between the hello heartbeat and an echo loopback
+  on the receiver. The same top fits both the iCEstick (iCE40-HX1K)
+  and the HX8K-B-EVN breakout (iCE40-HX8K) --- only the pin map and
+  the nextpnr device/package switches differ. Eight on-board LEDs
+  display the most recently received byte on the HX8K-B-EVN; on the
+  iCEstick (only five LEDs) the upper three bits are simply not
+  routed to a pin.
 
 The baud rate is a ratio between the input clock and the `CLKS_PER_BIT`
-parameter. For the iCEstick's 12 MHz oscillator the default of 104 lands
-on 115200 baud with a 0.16% error, well inside UART tolerance.
+parameter. Both supported boards run from a 12 MHz oscillator, so the
+default of 104 lands on 115200 baud with a 0.16% error, well inside
+UART tolerance.
 
 === Receiver
 
@@ -503,7 +509,7 @@ always @(posedge clk) assert(busy == (state != S_IDLE));
 === Heartbeat byte source
 
 `uart_hello` is a byte producer: every `PERIOD_CYCLES` clock ticks it
-walks the 21-byte `"Hello from iCEstick\r\n"` message out through a
+walks the 18-byte `"Hello from iCE40\r\n"` message out through a
 valid/ready handshake. It owns no transmitter --- the parent module
 provides one, so a single `uart_tx` can serve the heartbeat and any
 other byte source (e.g. an echo loopback) through simple arbitration.
@@ -545,11 +551,11 @@ end
 @
 
 The message is a small combinational ROM addressed by `msg_idx`.
-`MSG_LEN` counts both the visible "Hello from iCEstick" bytes and the
+`MSG_LEN` counts both the visible "Hello from iCE40" bytes and the
 trailing CR/LF.
 
 <<Hello: message ROM>>=
-localparam MSG_LEN = 6'd21;
+localparam MSG_LEN = 6'd18;
 
 reg [7:0] msg_byte;
 always @* begin
@@ -568,13 +574,10 @@ always @* begin
       6'd11: msg_byte = "i";
       6'd12: msg_byte = "C";
       6'd13: msg_byte = "E";
-      6'd14: msg_byte = "s";
-      6'd15: msg_byte = "t";
-      6'd16: msg_byte = "i";
-      6'd17: msg_byte = "c";
-      6'd18: msg_byte = "k";
-      6'd19: msg_byte = 8'h0d;
-      6'd20: msg_byte = 8'h0a;
+      6'd14: msg_byte = "4";
+      6'd15: msg_byte = "0";
+      6'd16: msg_byte = 8'h0d;
+      6'd17: msg_byte = 8'h0a;
       default: msg_byte = 8'h00;
    endcase
 end
@@ -622,13 +625,17 @@ end
 
 === Loopback + heartbeat demo top
 
-The iCEstick demo instantiates one `uart_rx`, one `uart_hello`, and one
+The demo top instantiates one `uart_rx`, one `uart_hello`, and one
 `uart_tx`, plus a small arbiter that picks between the hello byte
 stream and the echoed rx byte. Hello wins when both want the
 transmitter in the same cycle --- the echo byte is simply dropped,
 which is acceptable at human typing rates against a 1 Hz heartbeat.
-The low five bits of the last received byte drive the board LEDs so a
-logic-analyzer-free sanity check is possible by watching the board.
+The full byte of the last received character drives an 8-bit LED bus
+so a logic-analyzer-free sanity check is possible by watching the
+board. The HX8K-B-EVN wires all eight bits to its eight LEDs; the
+iCEstick only has five LEDs, so its pcf maps `led[0..4]` and leaves
+the upper three bits unrouted (nextpnr is told not to fault on the
+unconstrained pins).
 
 <<uart.v>>=
 module uart #(
@@ -638,7 +645,7 @@ module uart #(
       input        clk,
       input        rx,
       output       tx,
-      output [4:0] led
+      output [7:0] led
    );
    <<Top: receive path>>
    <<Top: hello instance>>
@@ -728,17 +735,19 @@ uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
 );
 @
 
-A tiny visual-feedback path: the low five bits of each received byte
-are latched into a register that drives the five on-board LEDs. This
-lets us distinguish "bitstream loaded but nothing coming back" from
-"bitstream loaded, receiver working" without a logic analyzer.
+A tiny visual-feedback path: the full received byte is latched into
+an 8-bit register that drives the on-board LED bus. On the
+HX8K-B-EVN all eight bits land on D2..D9, displaying the ASCII code
+of the last character to come down the wire. On the iCEstick only
+the low five (D1..D5) are physically wired; the upper three bits
+fall on the floor inside the chip.
 
 <<Top: LED display>>=
-reg [4:0] led_reg;
+reg [7:0] led_reg;
 initial led_reg = 0;
 always @(posedge clk)
    if (rx_ready)
-      led_reg <= rx_data[4:0];
+      led_reg <= rx_data;
 assign led = led_reg;
 @
 
@@ -748,7 +757,7 @@ The testbench has two phases. First it drives four test characters
 through the echo loop and checks that each comes back verbatim, covering
 upper, lower, digit, and control-code ASCII classes. Second, once the
 echo tests have finished, it captures the next heartbeat and asserts
-that all 21 bytes of `"Hello from iCEstick\r\n"` arrive in order.
+that all 18 bytes of `"Hello from iCE40\r\n"` arrive in order.
 
 `CLKS_PER_BIT` is shrunk to 10 so each UART byte takes 100 cycles.
 `HELLO_PERIOD` is sized so the heartbeat does not fire during the echo
@@ -804,7 +813,7 @@ happens in the same time step a task is entered.
 <<TB DUT instance>>=
 reg  rx;
 wire tx;
-wire [4:0] led;
+wire [7:0] led;
 
 uart #(
    .CLKS_PER_BIT(CLKS_PER_BIT),
@@ -833,7 +842,7 @@ can arrive faster than we pop bytes) without losing data. The head
 and tail are 6-bit registers, so they wrap around naturally --- the
 queue is truly circular rather than a bounded linear buffer. The 64
 slots are far more than any test in this file exercises (the longest
-burst is the 21-byte heartbeat).
+burst is the 18-byte heartbeat).
 
 <<TB: sniffer queue>>=
 reg [7:0] rx_queue [0:63];
@@ -906,8 +915,8 @@ task automatic xfer(input [7:0] sent, output [7:0] got);
 endtask
 @
 
-`expect_heartbeat` captures the next 21 bytes the DUT emits and
-compares each against the known `"Hello from iCEstick\r\n"` string. An
+`expect_heartbeat` captures the next 18 bytes the DUT emits and
+compares each against the known `"Hello from iCE40\r\n"` string. An
 inline `reg` array holds the expected bytes; any mismatch fatals with
 the offending index so the mis-transmitted character is obvious from
 the log. The expected bytes are deliberately duplicated here rather
@@ -919,7 +928,7 @@ verifies.
 task automatic expect_heartbeat();
    integer i;
    reg [7:0] b;
-   reg [7:0] expected [0:20];
+   reg [7:0] expected [0:17];
    begin
       expected[0]  = "H";
       expected[1]  = "e";
@@ -935,14 +944,11 @@ task automatic expect_heartbeat();
       expected[11] = "i";
       expected[12] = "C";
       expected[13] = "E";
-      expected[14] = "s";
-      expected[15] = "t";
-      expected[16] = "i";
-      expected[17] = "c";
-      expected[18] = "k";
-      expected[19] = 8'h0d;
-      expected[20] = 8'h0a;
-      for (i = 0; i < 21; i = i + 1) begin
+      expected[14] = "4";
+      expected[15] = "0";
+      expected[16] = 8'h0d;
+      expected[17] = 8'h0a;
+      for (i = 0; i < 18; i = i + 1) begin
          recv_byte(b);
          if (b !== expected[i])
             $fatal(1, "FAIL heartbeat[%0d]: got 0x%02h want 0x%02h",
@@ -986,17 +992,17 @@ xfer(8'h00, got); // NUL
 if (got !== 8'h00) $fatal(1, "FAIL NUL: got 0x%02h", got);
 @
 
-LED register. After the NUL frame, the low five bits of the last
-received byte (all zeros) must be visible on the LED output.
+LED register. After the NUL frame, all eight bits of the last
+received byte (all zeros) must be visible on the LED output bus.
 
 <<TB: check LED latch>>=
-if (led !== 5'h00)
-   $fatal(1, "FAIL led: got %b, want %b (low 5 of NUL)", led, 5'h00);
+if (led !== 8'h00)
+   $fatal(1, "FAIL led: got %b, want %b (NUL)", led, 8'h00);
 @
 
 Heartbeat phase. After echo tests the receive line is idle; the next
 thing the DUT emits is the heartbeat burst, and `expect_heartbeat()`
-captures and validates all 21 of its bytes.
+captures and validates all 18 of its bytes.
 
 <<TB: check heartbeat message>>=
 expect_heartbeat();
@@ -1042,14 +1048,24 @@ bmc_tx: prep -top uart_tx
 ../../verilog/uart_tx.v
 @
 
-=== iCEstick pin mapping
+=== Pin mappings
 
-Clock on pin 21 (GBIN6, 12 MHz Discera MEMS oscillator), UART RX on pin 9
-(from the FT2232H channel B, the PC's COM port), UART TX on pin 8 (back
-to the same FTDI channel), five LEDs on pins 95..99. No IrDA or Pmod
-pins used.
+Two boards, one demo top, two pcfs. Both run from a 12 MHz oscillator,
+and both route their UART through an FT2232H Channel B exposed by the
+host as a regular COM port. The five LEDs in the top are mapped to
+five of the available board LEDs; on boards with more LEDs, the rest
+sit unassigned.
 
-<<uart.pcf>>=
+==== iCEstick (iCE40-HX1K-TQ144)
+
+Clock on pin 21 (GBIN6, 12 MHz Discera MEMS oscillator), UART RX on
+pin 9, UART TX on pin 8, five LEDs on pins 95..99. No IrDA or Pmod
+pins used. The top declares an 8-bit `led` bus; this board only has
+five LEDs so the upper three bits stay unconstrained --- nextpnr is
+invoked with `--pcf-allow-unconstrained` and silently leaves them
+unrouted.
+
+<<uart_hx1k.pcf>>=
 set_io clk    21
 set_io rx     9
 set_io tx     8
@@ -1060,21 +1076,54 @@ set_io led[3] 96
 set_io led[4] 95
 @
 
+==== iCE40-HX8K-B-EVN breakout (iCE40HX8K-CT256)
+
+Clock on ball J3 (GBIN6/PIO3_26, 12 MHz oscillator U5), UART RX on
+ball B10 (PIO0_14, FT2232H BDBUS0 = `RS232_Rx_TTL` net), UART TX on
+ball B12 (PIO0_13, BDBUS1 = `RS232_Tx_TTL`). All eight on-board LEDs
+(D2..D9) are wired to balls B5/B4/A2/A1/C5/C4/B3/C3, so the full
+ASCII code of the last received byte is visible at a glance.
+
+<<uart_hx8k.pcf>>=
+set_io clk    J3
+set_io rx     B10
+set_io tx     B12
+set_io led[0] B5
+set_io led[1] B4
+set_io led[2] A2
+set_io led[3] A1
+set_io led[4] C5
+set_io led[5] C4
+set_io led[6] B3
+set_io led[7] C3
+@
+
 === Build fragment
 
-Four Verilog modules from one `.nw` is the only per-module customization
-this chapter needs. The top Makefile handles single-output tangles
-generically; modules like `uart` that declare multiple outputs tangle
-their own Makefile fragment into `build/uart.mk`, which the top
-Makefile includes automatically. The fragment is the single source of
-truth for `uart`'s multi-file tangle and for the custom sim/formal/
-synth recipes that reference all four `.v` sources.
+The chapter has four Verilog modules and two pcfs (one per supported
+iCE40 board). The top Makefile handles single-output tangles
+generically; chapters like `uart` with multi-file synthesis or with
+multiple board targets tangle their own Makefile fragment into
+`build/uart/uart.mk`, which the top Makefile includes automatically.
+The fragment is the single source of truth for `uart`'s multi-file
+tangle, the per-board pcf tangles, and the custom sim/formal/synth
+recipes that reference all four `.v` sources.
+
+The actual nextpnr/icepack rules per board live in the top Makefile,
+gated on the `BOARDS_uart := hx1k hx8k` declaration. This fragment
+just needs to feed the synthesis and aggregate sim/formal — the
+bitstream aggregate target is wired up in the top Makefile so adding
+a third board only edits one place.
 
 <<uart.mk>>=
-UART_VS := verilog/uart.v verilog/uart_rx.v verilog/uart_tx.v verilog/uart_hello.v
+UART_VS  := verilog/uart.v verilog/uart_rx.v verilog/uart_tx.v verilog/uart_hello.v
+UART_PCFS := verilog/uart_hx1k.pcf verilog/uart_hx8k.pcf
 
 $(UART_VS) &: src/uart.nw | verilog
 	cd verilog && tangle uart.v uart_rx.v uart_tx.v uart_hello.v < ../$<
+
+verilog/uart_%.pcf: src/uart.nw | verilog
+	cd verilog && tangle uart_$*.pcf < ../$<
 
 build/uart/uart.json: $(UART_VS) | build/uart
 	cd build/uart && yosys -q -p "read_verilog ../../verilog/uart.v ../../verilog/uart_rx.v ../../verilog/uart_tx.v ../../verilog/uart_hello.v; synth_ice40 -top uart -json uart.json"
@@ -1088,7 +1137,6 @@ build/uart/formal: build/uart/uart.sby $(UART_VS)
 	cd build/uart && sby -f uart.sby
 	@touch $@
 
-bitstream: build/uart/uart.bin
 sim: build/uart/sim
 formal: build/uart/formal
 @
@@ -1097,19 +1145,28 @@ formal: build/uart/formal
 
 ===== Hardware Needed
 
-- Lattice iCEstick (iCE40-HX1K, 12 MHz)
-- USB-A extension cable or hub for the iCEstick
+Either of the two supported boards is sufficient on its own; the
+automated test runs the same plan against both when both are present
+on the bench.
+
+- Lattice iCEstick (iCE40-HX1K-TQ144, 12 MHz, FT2232H)
+- iCE40-HX8K-B-EVN breakout (iCE40HX8K-CT256, 12 MHz, FT2232H)
+- A USB cable per board (mini-B for the HX8K-B-EVN, USB-A for the
+  iCEstick)
 
 ===== Test Setup
 
-The on-board FT2232H exposes two interfaces: one for programming
-the FPGA, one for the UART. The UART runs at 115200, 8N1.
+Each board's on-board FT2232H exposes two interfaces: one for
+programming the FPGA, one for the UART. The UART runs at 115200, 8N1.
+The bench `test_serv` registers each board as a separate `fpga`
+instance (`fpga.hx1k` and `fpga.hx8k`); the per-board plan addresses
+its own instance directly.
 
 ===== Manual Test
 
 Program the bitstream and open a 115200/8N1 terminal on the FPGA UART.
 Within `PERIOD_CYCLES` (one second at 12 MHz) the heartbeat should emit
-`Hello from iCEstick` followed by `\r\n`, repeating once per second.
+`Hello from iCE40` followed by `\r\n`, repeating once per second.
 Type any character into the terminal: the receiver's echo path loops
 the byte back through the shared transmitter so each keystroke prints
 locally. The heartbeat does not interrupt mid-byte; arbitration in
@@ -1118,12 +1175,15 @@ the `uart_tx` between sources.
 
 ===== Automated Test
 
-The plan resets the FPGA, opens the UART capture, programs the
+Each plan resets its FPGA, opens the UART capture, programs the
 bitstream, lets the heartbeat run for two periods so we see the
-banner cleanly, sends a four-byte echo probe, waits for the echo to
-land, and then closes the capture.
+banner cleanly, sends two single-byte echo probes, and then closes
+the capture. The two plans are byte-for-byte identical apart from
+the `fpga.<id>:` prefix --- by construction, both boards are
+exercised through the same sequence so a regression on either one
+shows up immediately.
 
-<<TEST.md>>=
+<<TEST.hx1k.md>>=
 ```
 fpga.hx1k:uart_close
 fpga.hx1k:program bin=@uart.bin
@@ -1142,6 +1202,25 @@ fpga.hx1k:uart_close
 - Check echo loop returned the probe bytes
 @
 
+<<TEST.hx8k.md>>=
+```
+fpga.hx8k:uart_close
+fpga.hx8k:program bin=@uart.bin
+delay ms=2000
+fpga.hx8k:uart_open
+delay ms=2200
+fpga.hx8k:uart_write data="x"
+delay ms=300
+fpga.hx8k:uart_write data="y"
+delay ms=300
+fpga.hx8k:uart_close
+```
+
+- Check `test_serv` had no errors
+- Check heartbeat banner present
+- Check echo loop returned the probe bytes
+@
+
 The verifier is a thin wrapper: read the captured UART stream, look
 for the heartbeat banner, and confirm the echo probes came back.
 The shared dispatcher in `verify_lib` handles argument parsing,
@@ -1152,14 +1231,16 @@ predicates plus a `DISPATCH` table that maps each bullet from
 The dispatcher lives in `lib/verify_lib.py` next to the literate
 sources. The path-fixup at the top is the only piece of boilerplate;
 without it, Python cannot find the shared module from a generated
-test directory.
+test directory. The captured copy lives at
+`build/uart/<board>/verify.py`, so three `..` segments climb back up
+to the repo root before joining `lib`.
 
 <<verify.py>>=
 import os
 import sys
 
 sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "lib"))
 import verify_lib as v
 
 <<UART verify constants>>
@@ -1181,7 +1262,7 @@ proof that the echo path is alive.
 
 <<UART verify constants>>=
 UART_LOG = "streams/fpga.uart.bin"
-BANNER = "Hello from iCEstick"
+BANNER = "Hello from iCE40"
 ECHO_PROBES = ("x", "y")
 MIN_ECHOES = 1
 @
@@ -1212,8 +1293,8 @@ shows how many heartbeats fit inside the capture window.
 
 The echo check first strips the heartbeat copies and CR/LF noise
 out of the captured stream so probe bytes are not double-counted
-inside the "Hello from iCEstick" body (which contains an `i`, an
-`l`, and so on). Then it tallies probe occurrences across both
+inside the "Hello from iCE40" body (which contains an `l`, an
+`o`, and so on). Then it tallies probe occurrences across both
 probes and accepts any single hit.
 
 <<UART verify checks>>=
@@ -1261,46 +1342,62 @@ DISPATCH = {
 ==== Test runner
 
 `build/uart/Makefile` is the entry point invoked from `cd build/uart
-&& make test`. It re-tangles the plan and the verifier from
-`src/uart.nw` so an edit to this chapter is picked up on the next
-test run. It also rebuilds `uart.bin` through the root Makefile before
-handing off to the shared `run_md.py` driver pointed at by `$TEST_SERV`.
-The tangle recipes mirror the per-chapter rules in the top Makefile but
-are reachable from inside the build directory.
+&& make test`. It fans out across both supported boards: each board
+has a sibling subdirectory `build/uart/<board>/` containing that
+board's tangled `TEST.md`, `verify.py`, and `uart.bin`. `make test`
+runs `run_md.py` in each subdirectory, so a regression on either
+board fails the chapter.
+
+The tangle recipes for `TEST.<board>.md` rename to `TEST.md` after
+extraction so `run_md.py` finds it under the canonical name. The
+verifier source is the same single `<<verify.py>>=` chunk reused
+verbatim per board --- the captured stream filename
+(`streams/fpga.uart.bin`) is the same regardless of which `fpga`
+instance the plan addressed.
 
 <<Makefile>>=
 NW := ../../src/uart.nw
+BOARDS := hx1k hx8k
 
-.PHONY: all test
-all: TEST.md verify.py uart.bin
+.PHONY: all test test-hx1k test-hx8k
 
-test: all
-	python3 $$TEST_SERV/run_md.py
+all: $(foreach b,$(BOARDS),$(b)/TEST.md $(b)/verify.py $(b)/uart.bin)
 
-uart.bin: $(NW)
-	$(MAKE) -C ../.. build/uart/uart.bin
+test: test-hx1k test-hx8k
 
-TEST.md: $(NW)
-	tangle TEST.md < $<
+test-hx1k: hx1k/TEST.md hx1k/verify.py hx1k/uart.bin
+	cd hx1k && python3 $$TEST_SERV/run_md.py
 
-verify.py: $(NW)
-	tangle verify.py < $<
+test-hx8k: hx8k/TEST.md hx8k/verify.py hx8k/uart.bin
+	cd hx8k && python3 $$TEST_SERV/run_md.py
+
+$(BOARDS):
+	mkdir -p $@
+
+%/TEST.md: $(NW) | %
+	cd $* && tangle TEST.$*.md < ../$(NW) && mv TEST.$*.md TEST.md
+
+%/verify.py: $(NW) | %
+	cd $* && tangle verify.py < ../$(NW)
+
+%/uart.bin: $(NW)
+	$(MAKE) -C ../.. build/uart/$*/uart.bin
 @
 
 === Summary
 
 Three primitives and one demo top. `uart_rx` and `uart_tx` are 8N1
 workhorses; `uart_hello` is a periodic byte source that emits
-"Hello from iCEstick" over a valid/ready handshake for any caller to
+"Hello from iCE40" over a valid/ready handshake for any caller to
 drive through a shared transmitter. `uart.v` wires one of each
-together into the iCEstick echo + heartbeat demo.
+together into the echo + heartbeat demo.
 
 Verification is split across three layers. Simulation drives a
-round-trip echo of four characters plus the 21-byte heartbeat
+round-trip echo of four characters plus the 18-byte heartbeat
 burst against the Verilator-elaborated design. Formal BMC pins
 down state, counter, bit-index, ready-strobe, and line-level
 invariants on both `uart_rx` and `uart_tx`. Hardware testing
-loads the bitstream onto a real iCEstick and runs the same
+loads the bitstream onto a real iCE40 board and runs the same
 heartbeat-and-echo conversation through the FT2232H UART, with
 `TEST.md` and `verify.py` tangling out of this chapter so the
 plan and the per-bullet checks stay in sync with everything

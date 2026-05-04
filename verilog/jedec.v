@@ -1,4 +1,4 @@
-module qspi (
+module jedec (
       input        clk,
       input        cs_n,
       input        sclk,

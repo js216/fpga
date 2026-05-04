@@ -8,7 +8,7 @@ module tb_uart;
    always #5 clk <= ~clk;
    reg  rx;
    wire tx;
-   wire [4:0] led;
+   wire [7:0] led;
    
    uart #(
       .CLKS_PER_BIT(CLKS_PER_BIT),
@@ -72,7 +72,7 @@ module tb_uart;
    task automatic expect_heartbeat();
       integer i;
       reg [7:0] b;
-      reg [7:0] expected [0:20];
+      reg [7:0] expected [0:17];
       begin
          expected[0]  = "H";
          expected[1]  = "e";
@@ -88,14 +88,11 @@ module tb_uart;
          expected[11] = "i";
          expected[12] = "C";
          expected[13] = "E";
-         expected[14] = "s";
-         expected[15] = "t";
-         expected[16] = "i";
-         expected[17] = "c";
-         expected[18] = "k";
-         expected[19] = 8'h0d;
-         expected[20] = 8'h0a;
-         for (i = 0; i < 21; i = i + 1) begin
+         expected[14] = "4";
+         expected[15] = "0";
+         expected[16] = 8'h0d;
+         expected[17] = 8'h0a;
+         for (i = 0; i < 18; i = i + 1) begin
             recv_byte(b);
             if (b !== expected[i])
                $fatal(1, "FAIL heartbeat[%0d]: got 0x%02h want 0x%02h",
@@ -118,8 +115,8 @@ module tb_uart;
       
       xfer(8'h00, got); // NUL
       if (got !== 8'h00) $fatal(1, "FAIL NUL: got 0x%02h", got);
-      if (led !== 5'h00)
-         $fatal(1, "FAIL led: got %b, want %b (low 5 of NUL)", led, 5'h00);
+      if (led !== 8'h00)
+         $fatal(1, "FAIL led: got %b, want %b (NUL)", led, 8'h00);
       expect_heartbeat();
    
       $display("PASS: echo and heartbeat paths both correct");

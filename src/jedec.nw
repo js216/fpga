@@ -30,8 +30,8 @@ them Hi-Z otherwise. MOSI (single-lane) is `io[0]` sampled as an
 input; MISO (single-lane) is `io[1]` driven as an output when a
 single-lane opcode is in its response window.
 
-<<qspi.v>>=
-module qspi (
+<<jedec.v>>=
+module jedec (
       input        clk,
       input        cs_n,
       input        sclk,
@@ -1349,7 +1349,7 @@ oscillator is on pin 21; CS / SCLK / MOSI / MISO are on the Pmod
 pins used by the existing MP135 wiring; UART TX is pin 8 back to the
 FT2232H channel B.
 
-<<qspi.pcf>>=
+<<jedec.pcf>>=
 set_io clk     21
 set_io tx       8
 set_io cs_n    56
@@ -1362,34 +1362,34 @@ set_io io[3]   48
 
 === Build fragment
 
-Two Verilog sources tangle into the build: `qspi.v` for the slave
+Two Verilog sources tangle into the build: `jedec.v` for the slave
 itself and `uart_tx.v` reused verbatim from the UART chapter.
 The simulator also needs a local `SB_IO` model for the falling-edge
-fabric launch path and unregistered bidirectional pads used by qspi;
+fabric launch path and unregistered bidirectional pads used by jedec;
 synthesis uses yosys' built-in iCE40 primitive instead.
 
-<<qspi.mk>>=
-QSPI_VS := verilog/qspi.v verilog/uart_tx.v
-QSPI_SIM_LIB := build/qspi/SB_IO.v
+<<jedec.mk>>=
+JEDEC_VS := verilog/jedec.v verilog/uart_tx.v
+JEDEC_SIM_LIB := build/jedec/SB_IO.v
 
-build/qspi/qspi.json: $(QSPI_VS) | build/qspi
-	cd build/qspi && yosys -q -p "read_verilog ../../verilog/qspi.v ../../verilog/uart_tx.v; synth_ice40 -top qspi -json qspi.json"
+build/jedec/jedec.json: $(JEDEC_VS) | build/jedec
+	cd build/jedec && yosys -q -p "read_verilog ../../verilog/jedec.v ../../verilog/uart_tx.v; synth_ice40 -top jedec -json jedec.json"
 
-build/qspi/SB_IO.v: src/qspi.nw | build/qspi
-	cd build/qspi && tangle SB_IO.v < ../../$<
+build/jedec/SB_IO.v: src/jedec.nw | build/jedec
+	cd build/jedec && tangle SB_IO.v < ../../$<
 
-build/qspi/sim: tb/tb_qspi.sv $(QSPI_VS) verilog/uart_rx.v $(QSPI_SIM_LIB) | build/qspi
-	cd build/qspi && verilator --Mdir obj_dir -Wall --binary --top-module tb_qspi ../../tb/tb_qspi.sv ../../verilog/qspi.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v SB_IO.v
-	cd build/qspi && obj_dir/Vtb_qspi
+build/jedec/sim: tb/tb_jedec.sv $(JEDEC_VS) verilog/uart_rx.v $(JEDEC_SIM_LIB) | build/jedec
+	cd build/jedec && verilator --Mdir obj_dir -Wall --binary --top-module tb_jedec ../../tb/tb_jedec.sv ../../verilog/jedec.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v SB_IO.v
+	cd build/jedec && obj_dir/Vtb_jedec
 	@touch $@
 
-bitstream: build/qspi/qspi.bin
-sim: build/qspi/sim
+bitstream: build/jedec/jedec.bin
+sim: build/jedec/sim
 @
 
 === `SB_IO` simulation model
 
-The qspi slave uses unregistered bidirectional pads
+The jedec slave uses unregistered bidirectional pads
 (`PIN_TYPE = 6'b101001`) with the falling-edge launch register in
 fabric. This model is intentionally scoped to that configuration: it
 drives `D_OUT_0` directly when `OUTPUT_ENABLE` is asserted, otherwise
@@ -1407,7 +1407,7 @@ module SB_IO #(
    );
    initial begin
       if (!(PIN_TYPE === 6'b101001 && NEG_TRIGGER === 1'b0)) begin
-         $display("ERROR qspi SB_IO sim model only supports PIN_TYPE=101001 NEG_TRIGGER=0, got %b %b",
+         $display("ERROR jedec SB_IO sim model only supports PIN_TYPE=101001 NEG_TRIGGER=0, got %b %b",
                   PIN_TYPE, NEG_TRIGGER);
          $finish;
       end
@@ -1427,10 +1427,10 @@ sniffer `uart_rx` decodes the DUT's TX line into a small circular
 queue; the stimulus reads back the two log lines and asserts their
 contents match `op=9f bytes=4` and `op=bb bytes=1`.
 
-<<tb_qspi.sv>>=
+<<tb_jedec.sv>>=
 `timescale 1ns/1ps
 
-module tb_qspi;
+module tb_jedec;
    localparam CLKS_PER_BIT = 104;
 
    reg clk;
@@ -1460,7 +1460,7 @@ module tb_qspi;
    // is the DUT's single-lane response line (io[1] read back).
    wire miso = io[1];
 
-   qspi dut (
+   jedec dut (
       .clk (clk),
       .cs_n(cs_n),
       .sclk(sclk),
@@ -2752,7 +2752,7 @@ verify it on real silicon.
 
 <<TEST.md>>=
 ```
-fpga:program bin=@qspi.bin
+fpga:program bin=@jedec.bin
 ```
 
 - Check `test_serv` had no errors
@@ -2783,16 +2783,16 @@ if __name__ == "__main__":
 
 ==== Test runner
 
-`build/qspi/Makefile` is the entry point invoked from `cd build/qspi
+`build/jedec/Makefile` is the entry point invoked from `cd build/jedec
 && make test`. It re-tangles the plan and the verifier from
-`src/qspi.nw` so an edit to this chapter is picked up on the next
+`src/jedec.nw` so an edit to this chapter is picked up on the next
 test run, then hands off to the shared `run_md.py` driver pointed at
 by `$TEST_SERV`. The tangle recipes mirror the per-chapter rules in
 the top Makefile but are reachable from inside the build directory
 without invoking the parent.
 
 <<Makefile>>=
-NW := ../../src/qspi.nw
+NW := ../../src/jedec.nw
 
 .PHONY: all test
 all: TEST.md verify.py
