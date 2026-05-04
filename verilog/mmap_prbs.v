@@ -74,17 +74,11 @@ module mmap_prbs (
                quad_hi_next     <= 1'b0;
             end
          end
-         /* iter18: incrementing-byte pattern. Each rise after quad_active
-          * alternates between low nib of cur_byte and high nib of cur_byte+1. */
+         /* iter19: simplest test - increment quad_next_nibble each cycle.
+          * Master should read bytes 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF.
+          * If we see this pattern, the data path works and cur_byte logic is the bug. */
          if (quad_active && sclk_cnt == 6'd41) begin
-            if (quad_hi_next) begin
-               quad_next_nibble <= cur_byte_inc[7:4];
-               cur_byte         <= cur_byte_inc;
-               quad_hi_next     <= 1'b0;
-            end else begin
-               quad_next_nibble <= cur_byte[3:0];
-               quad_hi_next     <= 1'b1;
-            end
+            quad_next_nibble <= quad_next_nibble + 4'd1;
          end
          if (sclk_cnt < 6'd41) begin
             sclk_cnt <= sclk_cnt + 6'd1;
@@ -92,7 +86,9 @@ module mmap_prbs (
       end
    end
    /* verilator lint_on SYNCASYNCNET */
-   wire [3:0] io_pad_src = quad_next_nibble;
+   /* iter20: drive sclk_cnt[3:0] directly. If sclk_cnt is stuck at 41 (= 9),
+    * we get nibble 9 = byte 0x99. If sclk_cnt advances, we get varying. */
+   wire [3:0] io_pad_src = sclk_cnt[3:0];
    /* verilator lint_off SYNCASYNCNET */
    reg [3:0] io_pad_out;
    initial io_pad_out = 4'b0;
@@ -108,7 +104,7 @@ module mmap_prbs (
    wire io_d_in_2;
    wire io_d_in_3;
    SB_IO #(
-      .PIN_TYPE(6'b011001)
+      .PIN_TYPE(6'b101001)
    ) io0_iob (
       .PACKAGE_PIN(io[0]),
       .OUTPUT_ENABLE(io_oe),
@@ -116,7 +112,7 @@ module mmap_prbs (
       .D_IN_0(io_d_in_0)
    );
    SB_IO #(
-      .PIN_TYPE(6'b011001)
+      .PIN_TYPE(6'b101001)
    ) io1_iob (
       .PACKAGE_PIN(io[1]),
       .OUTPUT_ENABLE(io_oe),
@@ -124,7 +120,7 @@ module mmap_prbs (
       .D_IN_0(io_d_in_1)
    );
    SB_IO #(
-      .PIN_TYPE(6'b011001)
+      .PIN_TYPE(6'b101001)
    ) io2_iob (
       .PACKAGE_PIN(io[2]),
       .OUTPUT_ENABLE(io_oe),
@@ -132,7 +128,7 @@ module mmap_prbs (
       .D_IN_0(io_d_in_2)
    );
    SB_IO #(
-      .PIN_TYPE(6'b011001)
+      .PIN_TYPE(6'b101001)
    ) io3_iob (
       .PACKAGE_PIN(io[3]),
       .OUTPUT_ENABLE(io_oe),
