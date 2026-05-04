@@ -8,6 +8,7 @@ module mmap_prbs (
    reg [31:0] cmd_sr;
    reg [7:0]  opcode_q;
    reg [23:0] addr_q;
+   reg [7:0]  cur_byte;
    reg [3:0]  quad_next_nibble;
    reg        quad_hi_next;
    reg        quad_active;
@@ -17,10 +18,13 @@ module mmap_prbs (
       cmd_sr           = 32'd0;
       opcode_q         = 8'd0;
       addr_q           = 24'd0;
+      cur_byte         = 8'd0;
       quad_next_nibble = 4'd0;
       quad_hi_next     = 1'b0;
       quad_active      = 1'b0;
    end
+   
+   wire [7:0] cur_byte_inc = cur_byte + 8'd1;
    /* verilator lint_off SYNCASYNCNET */
    reg [1:0] cs_sync;
    initial cs_sync = 2'b11;
@@ -46,6 +50,7 @@ module mmap_prbs (
          cmd_sr           <= 32'd0;
          opcode_q         <= 8'd0;
          addr_q           <= 24'd0;
+         cur_byte         <= 8'd0;
          quad_next_nibble <= 4'd0;
          quad_hi_next     <= 1'b0;
          quad_active      <= 1'b0;
@@ -53,21 +58,35 @@ module mmap_prbs (
          if (sclk_cnt < 6'd32) begin
             cmd_sr <= {cmd_sr[30:0], io_d_in_0};
          end
-         /* iter16: assert OE early (after opcode+addr captured at sclk_cnt==32)
-          * so io_pad_out has setup time before master's data sample on cycle 50. */
-         if (sclk_cnt == 6'd32) begin
+         /* iter18: address-derived incrementing-byte pattern for c-command CRC
+          * test (no alt-byte, 9 dummy = 41 cycles before data, master samples
+          * at rise 42). Boundary at sclk_cnt==40 fires at rise 41 - quad_active
+          * one cycle ahead of master's first data sample. cur_byte loaded with
+          * addr_q[7:0] so byte 0 = addr LSB, matching c command's expected
+          * `i & 0xFF` ramp when chunk_size is a multiple of 256 with addr 0. */
+         if (sclk_cnt == 6'd40) begin
             opcode_q <= cmd_sr[31:24];
             addr_q   <= cmd_sr[23:0];
             if (cmd_sr[31:24] == 8'h6B) begin
                quad_active      <= 1'b1;
-               quad_next_nibble <= 4'hA;       /* constant 0xA */
+               cur_byte         <= cmd_sr[7:0];
+               quad_next_nibble <= cmd_sr[7:4];
+               quad_hi_next     <= 1'b0;
+            end
+         end
+         /* iter18: incrementing-byte pattern. Each rise after quad_active
+          * alternates between low nib of cur_byte and high nib of cur_byte+1. */
+         if (quad_active && sclk_cnt == 6'd41) begin
+            if (quad_hi_next) begin
+               quad_next_nibble <= cur_byte_inc[7:4];
+               cur_byte         <= cur_byte_inc;
+               quad_hi_next     <= 1'b0;
+            end else begin
+               quad_next_nibble <= cur_byte[3:0];
                quad_hi_next     <= 1'b1;
             end
          end
-         if (quad_active && sclk_cnt == 6'd33) begin
-            quad_next_nibble <= 4'hA;
-         end
-         if (sclk_cnt < 6'd33) begin
+         if (sclk_cnt < 6'd41) begin
             sclk_cnt <= sclk_cnt + 6'd1;
          end
       end
@@ -89,7 +108,7 @@ module mmap_prbs (
    wire io_d_in_2;
    wire io_d_in_3;
    SB_IO #(
-      .PIN_TYPE(6'b101001)
+      .PIN_TYPE(6'b011001)
    ) io0_iob (
       .PACKAGE_PIN(io[0]),
       .OUTPUT_ENABLE(io_oe),
@@ -97,7 +116,7 @@ module mmap_prbs (
       .D_IN_0(io_d_in_0)
    );
    SB_IO #(
-      .PIN_TYPE(6'b101001)
+      .PIN_TYPE(6'b011001)
    ) io1_iob (
       .PACKAGE_PIN(io[1]),
       .OUTPUT_ENABLE(io_oe),
@@ -105,7 +124,7 @@ module mmap_prbs (
       .D_IN_0(io_d_in_1)
    );
    SB_IO #(
-      .PIN_TYPE(6'b101001)
+      .PIN_TYPE(6'b011001)
    ) io2_iob (
       .PACKAGE_PIN(io[2]),
       .OUTPUT_ENABLE(io_oe),
@@ -113,7 +132,7 @@ module mmap_prbs (
       .D_IN_0(io_d_in_2)
    );
    SB_IO #(
-      .PIN_TYPE(6'b101001)
+      .PIN_TYPE(6'b011001)
    ) io3_iob (
       .PACKAGE_PIN(io[3]),
       .OUTPUT_ENABLE(io_oe),
