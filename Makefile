@@ -82,14 +82,6 @@ doc: doc/$(1).pdf
 ifeq ($$(BOARDS_$(1)),)
 # ---- single-target chapter: legacy DEVICE/PACKAGE flow ----
 
-build/$(1)/TEST.md: $$(call chapter_src,$(1)) | build/$(1)
-	@cd build/$(1) && tangle TEST.md < ../../$$< 2>/dev/null
-	@touch $$@
-
-build/$(1)/verify.py: $$(call chapter_src,$(1)) | build/$(1)
-	@cd build/$(1) && tangle verify.py < ../../$$< 2>/dev/null
-	@touch $$@
-
 build/$(1)/$(1).asc: build/$(1)/$(1).json verilog/$(1).pcf
 	cd build/$(1) && nextpnr-ice40 --$$(DEVICE) --package $$(PACKAGE) \
 		--json $(1).json --pcf ../../verilog/$(1).pcf \
@@ -110,15 +102,6 @@ define CHAP_BOARD_RULES
 
 build/$(1)/$(2):
 	mkdir -p $$@
-
-build/$(1)/$(2)/TEST.md: $$(call chapter_src,$(1)) | build/$(1)/$(2)
-	@cd build/$(1)/$(2) && tangle TEST.$(2).md < ../../../$$< 2>/dev/null && \
-		mv TEST.$(2).md TEST.md
-	@touch $$@
-
-build/$(1)/$(2)/verify.py: $$(call chapter_src,$(1)) | build/$(1)/$(2)
-	@cd build/$(1)/$(2) && tangle verify.py < ../../../$$< 2>/dev/null
-	@touch $$@
 
 build/$(1)/$(2)/$(1).asc: build/$(1)/$(1).json verilog/$(1)_$(2).pcf | build/$(1)/$(2)
 	cd build/$(1)/$(2) && nextpnr-ice40 --$(2) --package $$(nextpnr_pkg_$(2)) \
