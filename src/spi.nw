@@ -138,9 +138,14 @@ For 4-lane the presenter preloads the lower nibble after the
 `phase == 0` sample, and the next byte's upper nibble after the
 `phase == 1` sample, matching
 the STM32MP1 QUADSPI indirect-read assembly of
-`{first_sample, second_sample}`. The byte counter is initialized by FPGA
-configuration rather than by each CS-high interval; this lets a single
-STM32 transfer continue through the peripheral's 4-byte microframes.
+`{first_sample, second_sample}`. Raising `cs_n` returns `data_byte`
+and `phase` to zero so each transaction begins from a deterministic
+seed; this is what lets two back-to-back indirect reads of the same
+length produce bit-identical streams (the `T` twin-MDMA bench), and
+matches the 1-lane variant's behaviour. Continuation across the
+QSPI controller's microframes is not relied on by the master --- the
+bench drives one MDMA-managed read per CS-low interval and resets the
+expected pattern at each `qspi_mdma_read` call.
 
 <<SPI streaming: quad lane>>=
 reg phase;
@@ -150,7 +155,16 @@ initial phase = 1'b0;
 initial dout_quad = 4'd0;
 always @(posedge cs_n or posedge sclk) begin
    if (cs_n) begin
-      phase <= 1'b0;
+      /* Reset to a known seed on every CS rising edge.  Without this
+       * the slave's `data_byte` carries whatever value the previous
+       * transaction (or even the QSPI controller's boot-time JEDEC
+       * polling) left behind, plus any extra SCK pulses generated
+       * during the master's ABORT/teardown sequence.  Two consecutive
+       * 16 MiB indirect reads then start at different bytes and the
+       * `T`-command twin compare flags spurious mismatches. */
+      data_byte <= 8'd0;
+      dout_quad <= 4'd0;
+      phase     <= 1'b0;
    end else if (start_ready) begin
       dout_quad <= phase ? next_byte_upper : data_byte[3:0];
       phase <= ~phase;
@@ -955,7 +969,10 @@ The 4-lane TB mirrors the 1-lane shape, expected byte stream,
 pull-up modelling, and `errs` accumulator, but the sampler reads all
 four `io` lines on each rise and reassembles the byte as
 `{first_sample, second_sample}`. It also adds a short paused frame to
-hold SCLK between sample edges.
+hold SCLK between sample edges. Each CS-low interval is checked
+against the same byte-incrementing seed starting at zero because the
+4-lane DUT now resets `data_byte` on CS rising (matching the 1-lane
+variant); this is the property the `T` twin-MDMA bench relies on.
 
 <<tb_spi_quad.sv>>=
 `timescale 1ns/1ps
@@ -1083,9 +1100,12 @@ initial begin
    cs_high_quiet();
    frame_from(0, 256);
    cs_high_quiet();
-   paused_frame_from(256, 32);
+   /* Each CS-low interval restarts the slave's byte counter at zero,
+    * so the paused and long frames also expect bytes 0,1,2,...  This
+    * matches the deterministic-seed behaviour of spi.v's quad block. */
+   paused_frame_from(0, 32);
    cs_high_quiet();
-   frame_from(288, 4096);
+   frame_from(0, 4096);
    cs_high_quiet();
    cs_high_quiet();
    if (errs == 0)

@@ -28,7 +28,16 @@ module spi #(
       initial dout_quad = 4'd0;
       always @(posedge cs_n or posedge sclk) begin
          if (cs_n) begin
-            phase <= 1'b0;
+            /* Reset to a known seed on every CS rising edge.  Without this
+             * the slave's `data_byte` carries whatever value the previous
+             * transaction (or even the QSPI controller's boot-time JEDEC
+             * polling) left behind, plus any extra SCK pulses generated
+             * during the master's ABORT/teardown sequence.  Two consecutive
+             * 16 MiB indirect reads then start at different bytes and the
+             * `T`-command twin compare flags spurious mismatches. */
+            data_byte <= 8'd0;
+            dout_quad <= 4'd0;
+            phase     <= 1'b0;
          end else if (start_ready) begin
             dout_quad <= phase ? next_byte_upper : data_byte[3:0];
             phase <= ~phase;

@@ -106,9 +106,12 @@ module tb_spi_quad;
       cs_high_quiet();
       frame_from(0, 256);
       cs_high_quiet();
-      paused_frame_from(256, 32);
+      /* Each CS-low interval restarts the slave's byte counter at zero,
+       * so the paused and long frames also expect bytes 0,1,2,...  This
+       * matches the deterministic-seed behaviour of spi.v's quad block. */
+      paused_frame_from(0, 32);
       cs_high_quiet();
-      frame_from(288, 4096);
+      frame_from(0, 4096);
       cs_high_quiet();
       cs_high_quiet();
       if (errs == 0)
