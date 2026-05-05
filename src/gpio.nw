@@ -23,7 +23,7 @@ bus.
 
 === Command protocol
 
-Two commands, each exactly five ASCII characters, no terminator
+Two drive commands, each exactly five ASCII characters, no terminator
 required. `Wxxxx` loads `gpio_out` with a 16-bit drive word; `Exxxx`
 loads `gpio_oe` with a 16-bit output-enable mask (`1` means drive,
 `0` means high-impedance).  Both values are four hex digits,
@@ -35,6 +35,10 @@ valid hex digit, so the parser does not treat a mid-command `E` as
 a restart sentinel --- do not type a new command into one that is
 still in flight.  Stray bytes between commands (whitespace,
 newlines, typos) are silently dropped.
+
+A single `?` byte is a read-only liveness query. It does not change
+any GPIO drive register and returns `OK\r\n` on the same UART once the
+current transmit line, if any, has finished.
 
 There is no echo and no acknowledgement; the next heartbeat line is
 the feedback channel. After issuing a command, watch the line for
@@ -98,6 +102,8 @@ reg [$clog2(TICK_CYCLES)-1:0] timer;
 reg [15:0] snapshot;
 reg [2:0]  char_idx;
 reg        active;
+reg        line_is_query;
+reg        query_pending;
 reg        tx_start;
 reg  [7:0] tx_data;
 wire       tx_busy;
@@ -132,6 +138,8 @@ initial begin
    snapshot      = 0;
    char_idx      = 0;
    active        = 0;
+   line_is_query = 0;
+   query_pending = 0;
    tx_start      = 0;
    tx_data       = 0;
    gpio_out      = 0;
@@ -170,10 +178,10 @@ line terminator that every serial terminal handles.
 reg [7:0] cur_char;
 always @* begin
    case (char_idx)
-      3'd0: cur_char = hex_digit(snapshot[15:12]);
-      3'd1: cur_char = hex_digit(snapshot[11:8]);
-      3'd2: cur_char = hex_digit(snapshot[7:4]);
-      3'd3: cur_char = hex_digit(snapshot[3:0]);
+      3'd0: cur_char = line_is_query ? "O" : hex_digit(snapshot[15:12]);
+      3'd1: cur_char = line_is_query ? "K" : hex_digit(snapshot[11:8]);
+      3'd2: cur_char = line_is_query ? 8'h0d : hex_digit(snapshot[7:4]);
+      3'd3: cur_char = line_is_query ? 8'h0a : hex_digit(snapshot[3:0]);
       3'd4: cur_char = 8'h0d;
       3'd5: cur_char = 8'h0a;
       default: cur_char = 8'h00;
@@ -185,7 +193,8 @@ end
 
 One synchronous process drives everything: a default deassert of
 `tx_start` so it is always a one-cycle pulse, the period timer with
-its snapshot latch, and the byte-feed handshake against `uart_tx`.
+its snapshot latch, the pending query response, and the byte-feed
+handshake against `uart_tx`.
 Each concern is its own chunk so that reading top to bottom tracks
 the order in which the three effects compose on the clock edge.
 
@@ -193,6 +202,8 @@ the order in which the three effects compose on the clock edge.
 always @(posedge clk) begin
    <<GPIO: tx_start default>>
    <<GPIO: period timer and snapshot>>
+   <<GPIO: query response start>>
+   <<GPIO: query request latch>>
    <<GPIO: byte feed>>
 end
 @
@@ -216,14 +227,37 @@ its ROM walk.
 <<GPIO: period timer and snapshot>>=
 if (timer == TICK_CYCLES - 1) begin
    timer <= 0;
-   if (!active) begin
+   if (!active && !query_pending) begin
       snapshot <= pins;
       char_idx <= 0;
       active   <= 1'b1;
+      line_is_query <= 1'b0;
    end
 end else begin
    timer <= timer + 1;
 end
+@
+
+Query responses share the transmitter with heartbeat lines. A pending
+query starts as soon as the current line drains; heartbeat ticks wait
+behind it so a liveness check is not hidden behind a full heartbeat
+period.
+
+<<GPIO: query response start>>=
+if (!active && query_pending) begin
+   char_idx      <= 0;
+   active        <= 1'b1;
+   line_is_query <= 1'b1;
+   query_pending <= 1'b0;
+end
+@
+
+The parser owns drive-command state, but the transmit-side process owns
+the query-response latch so `query_pending` has a single flop driver.
+
+<<GPIO: query request latch>>=
+if (rx_ready && rx_state == RX_IDLE && rx_data == "?")
+   query_pending <= 1'b1;
 @
 
 Byte feed handshake against `uart_tx`. When `active` is high and the
@@ -241,9 +275,10 @@ double-advance `char_idx`, and skip a character.
 if (active && !tx_busy && !tx_start) begin
    tx_start <= 1'b1;
    tx_data  <= cur_char;
-   if (char_idx == LAST_IDX) begin
-      active   <= 1'b0;
-      char_idx <= 0;
+   if (char_idx == (line_is_query ? 3'd3 : LAST_IDX)) begin
+      active        <= 1'b0;
+      char_idx      <= 0;
+      line_is_query <= 1'b0;
    end else begin
       char_idx <= char_idx + 1;
    end
@@ -328,7 +363,8 @@ always @(posedge clk) begin
 end
 @
 
-Idle: start a new command on `W` or `E`, ignore anything else.
+Idle: start a new drive command on `W` or `E`, queue a read-only
+response on `?`, and ignore anything else.
 
 <<GPIO: parser idle>>=
 RX_IDLE: begin
@@ -415,6 +451,7 @@ Three families of property cover the module:
 <<GPIO: tx_data stable while tx_busy>>
 <<GPIO: rx state monotonic>>
 <<GPIO: drive regs commit only in RX_D3>>
+<<GPIO: query leaves drive regs unchanged>>
 @
 
 Power-on safety: `gpio_oe` must come up zero. This is the single
@@ -552,6 +589,19 @@ always @(posedge clk) begin
                 $past(rx_ready)         &&
                 $past(rx_nib_valid)     &&
                 $past(cmd_is_enable));
+   end
+end
+@
+
+The query command is a pure liveness check. Seeing `?` in idle may set
+`query_pending`, but it must not modify either GPIO drive register.
+
+<<GPIO: query leaves drive regs unchanged>>=
+always @(posedge clk) begin
+   if (f_past_valid && $past(rx_ready) && $past(rx_state) == RX_IDLE &&
+       $past(rx_data) == "?") begin
+      assert(gpio_out == $past(gpio_out));
+      assert(gpio_oe  == $past(gpio_oe));
    end
 end
 @
@@ -739,9 +789,9 @@ function [7:0] oracle_hex;
    end
 endfunction
 
-task automatic expect_line(input [15:0] expected);
-   reg [7:0] b;
-   reg [7:0] want [0:5];
+   task automatic expect_line(input [15:0] expected);
+      reg [7:0] b;
+      reg [7:0] want [0:5];
    integer k;
    begin
       want[0] = oracle_hex(expected[15:12]);
@@ -755,9 +805,26 @@ task automatic expect_line(input [15:0] expected);
          if (b !== want[k])
             $fatal(1, "FAIL line[%0d]: got 0x%02h want 0x%02h",
                    k, b, want[k]);
+         end
       end
-   end
-endtask
+   endtask
+   task automatic expect_ok;
+      reg [7:0] b;
+      reg [7:0] want [0:3];
+      integer k;
+      begin
+         want[0] = "O";
+         want[1] = "K";
+         want[2] = 8'h0d;
+         want[3] = 8'h0a;
+         for (k = 0; k < 4; k = k + 1) begin
+            recv_byte(b);
+            if (b !== want[k])
+               $fatal(1, "FAIL ok[%0d]: got 0x%02h want 0x%02h",
+                      k, b, want[k]);
+         end
+      end
+   endtask
 @
 
 `send_char` hands a byte to the tb-owned `uart_tx` and waits for
@@ -916,12 +983,14 @@ initial begin
    expect_line(16'h7742);
 
    @(posedge dut.active);
-   send_string("W1234");
-   expect_line(16'h7742);
-   expect_line(16'h7734);
-
-   $display("PASS: heartbeat + command-drive paths both correct");
-   $finish;
+      send_string("W1234");
+      expect_line(16'h7742);
+      expect_line(16'h7734);
+      send_char("?");
+      expect_ok();
+      expect_line(16'h7734);
+      $display("PASS: heartbeat + command-drive paths both correct");
+      $finish;
 end
 @
 

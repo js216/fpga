@@ -11,6 +11,8 @@ module gpio #(
    reg [15:0] snapshot;
    reg [2:0]  char_idx;
    reg        active;
+   reg        line_is_query;
+   reg        query_pending;
    reg        tx_start;
    reg  [7:0] tx_data;
    wire       tx_busy;
@@ -36,6 +38,8 @@ module gpio #(
       snapshot      = 0;
       char_idx      = 0;
       active        = 0;
+      line_is_query = 0;
+      query_pending = 0;
       tx_start      = 0;
       tx_data       = 0;
       gpio_out      = 0;
@@ -54,10 +58,10 @@ module gpio #(
    reg [7:0] cur_char;
    always @* begin
       case (char_idx)
-         3'd0: cur_char = hex_digit(snapshot[15:12]);
-         3'd1: cur_char = hex_digit(snapshot[11:8]);
-         3'd2: cur_char = hex_digit(snapshot[7:4]);
-         3'd3: cur_char = hex_digit(snapshot[3:0]);
+         3'd0: cur_char = line_is_query ? "O" : hex_digit(snapshot[15:12]);
+         3'd1: cur_char = line_is_query ? "K" : hex_digit(snapshot[11:8]);
+         3'd2: cur_char = line_is_query ? 8'h0d : hex_digit(snapshot[7:4]);
+         3'd3: cur_char = line_is_query ? 8'h0a : hex_digit(snapshot[3:0]);
          3'd4: cur_char = 8'h0d;
          3'd5: cur_char = 8'h0a;
          default: cur_char = 8'h00;
@@ -67,20 +71,30 @@ module gpio #(
       tx_start <= 1'b0;
       if (timer == TICK_CYCLES - 1) begin
          timer <= 0;
-         if (!active) begin
+         if (!active && !query_pending) begin
             snapshot <= pins;
             char_idx <= 0;
             active   <= 1'b1;
+            line_is_query <= 1'b0;
          end
       end else begin
          timer <= timer + 1;
       end
+      if (!active && query_pending) begin
+         char_idx      <= 0;
+         active        <= 1'b1;
+         line_is_query <= 1'b1;
+         query_pending <= 1'b0;
+      end
+      if (rx_ready && rx_state == RX_IDLE && rx_data == "?")
+         query_pending <= 1'b1;
       if (active && !tx_busy && !tx_start) begin
          tx_start <= 1'b1;
          tx_data  <= cur_char;
-         if (char_idx == LAST_IDX) begin
-            active   <= 1'b0;
-            char_idx <= 0;
+         if (char_idx == (line_is_query ? 3'd3 : LAST_IDX)) begin
+            active        <= 1'b0;
+            char_idx      <= 0;
+            line_is_query <= 1'b0;
          end else begin
             char_idx <= char_idx + 1;
          end
@@ -201,6 +215,13 @@ module gpio #(
                    $past(rx_ready)         &&
                    $past(rx_nib_valid)     &&
                    $past(cmd_is_enable));
+      end
+   end
+   always @(posedge clk) begin
+      if (f_past_valid && $past(rx_ready) && $past(rx_state) == RX_IDLE &&
+          $past(rx_data) == "?") begin
+         assert(gpio_out == $past(gpio_out));
+         assert(gpio_oe  == $past(gpio_oe));
       end
    end
 `endif

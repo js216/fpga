@@ -88,9 +88,9 @@ module tb_gpio;
       end
    endfunction
    
-   task automatic expect_line(input [15:0] expected);
-      reg [7:0] b;
-      reg [7:0] want [0:5];
+      task automatic expect_line(input [15:0] expected);
+         reg [7:0] b;
+         reg [7:0] want [0:5];
       integer k;
       begin
          want[0] = oracle_hex(expected[15:12]);
@@ -104,9 +104,26 @@ module tb_gpio;
             if (b !== want[k])
                $fatal(1, "FAIL line[%0d]: got 0x%02h want 0x%02h",
                       k, b, want[k]);
+            end
          end
-      end
-   endtask
+      endtask
+      task automatic expect_ok;
+         reg [7:0] b;
+         reg [7:0] want [0:3];
+         integer k;
+         begin
+            want[0] = "O";
+            want[1] = "K";
+            want[2] = 8'h0d;
+            want[3] = 8'h0a;
+            for (k = 0; k < 4; k = k + 1) begin
+               recv_byte(b);
+               if (b !== want[k])
+                  $fatal(1, "FAIL ok[%0d]: got 0x%02h want 0x%02h",
+                         k, b, want[k]);
+            end
+         end
+      endtask
    task automatic send_char(input [7:0] c);
       begin
          @(negedge clk);
@@ -174,11 +191,13 @@ module tb_gpio;
       expect_line(16'h7742);
    
       @(posedge dut.active);
-      send_string("W1234");
-      expect_line(16'h7742);
-      expect_line(16'h7734);
-   
-      $display("PASS: heartbeat + command-drive paths both correct");
-      $finish;
+         send_string("W1234");
+         expect_line(16'h7742);
+         expect_line(16'h7734);
+         send_char("?");
+         expect_ok();
+         expect_line(16'h7734);
+         $display("PASS: heartbeat + command-drive paths both correct");
+         $finish;
    end
 endmodule
