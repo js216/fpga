@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// style.typ --- TODO: description
+// Copyright (c) 2026 Jakob Kastelic
 #set page(
   width: 6in,
   height: 9in,

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Makefile --- TODO: description
+# Copyright (c) 2026 Jakob Kastelic
 CHAPTERS := $(notdir $(basename $(wildcard src/*.nw)))
 
 chapter_src = src/$(1).nw
