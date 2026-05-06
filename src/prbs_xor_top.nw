@@ -1,37 +1,48 @@
 == prbs_xor_top wrapper
 
 Tiny UART command wrapper around `prbs_xor`. This iteration handles
-three of the smallest possible commands: a single byte `'r'`
+four of the smallest possible commands: a single byte `'r'`
 (`8'h72`) that pulses `prbs_xor`'s active-low synchronous reset for
 exactly one clock cycle, a single byte `'s'` (`8'h73`) that pulses
 `prbs_xor`'s `clk_en` high for exactly one clock cycle to advance
-the LFSR/checksum by a single step, and a single byte `'b'`
+the LFSR/checksum by a single step, a single byte `'b'`
 (`8'h62`) that holds `clk_en` high for exactly `2**16 = 65536`
-consecutive clock cycles to perform a burst step. The remaining
-command (print checksum) and the `uart_tx` print path land in
-subsequent iterations.
+consecutive clock cycles to perform a burst step, and a single
+byte `'p'` (`8'h70`) that latches `checksum` into a register and
+streams it out as eight ASCII hex digits followed by `8'h0d`
+(`CR`) and `8'h0a` (`LF`) over a new `tx` UART output.
 
 The wrapper instantiates `uart_rx` (default `CLKS_PER_BIT = 104`),
 feeds the decoded byte through one-cycle compares against `8'h72`,
-`8'h73`, and `8'h62`, lowers `rst_n` for one clock when the reset
-compare fires, raises `clk_en_q` for one clock when the single-step
-compare fires, and loads a 17-bit `burst_count` register with
-`17'd65536` when the burst compare fires. Each cycle while
-`burst_count` is non-zero, it decrements by one and contributes to
-`clk_en` via the OR with `clk_en_q`, so the burst asserts `clk_en`
-on exactly 65536 consecutive cycles starting the cycle after the
-`'b'` decode. `clear` is tied low so the LFSR stays idle outside of
-explicit step or burst pulses; `state` and `checksum` are left
-dangling so the synthesizer trims them. The top-level interface
-exposes only `clk` and `rx`, which is enough to satisfy the
-build-only verification step.
+`8'h73`, `8'h62`, and `8'h70`, lowers `rst_n` for one clock when the
+reset compare fires, raises `clk_en_q` for one clock when the
+single-step compare fires, and loads a 17-bit `burst_count`
+register with `17'd65536` when the burst compare fires. Each cycle
+while `burst_count` is non-zero, it decrements by one and
+contributes to `clk_en` via the OR with `clk_en_q`, so the burst
+asserts `clk_en` on exactly 65536 consecutive cycles starting the
+cycle after the `'b'` decode. `clear` is tied low so the LFSR stays
+idle outside of explicit step or burst pulses.
+
+The print path captures `checksum` into `checksum_q` on the `'p'`
+decode and walks a 4-bit index `print_idx` from 0 (most significant
+nibble) through 7 (least significant nibble), then 8 (`CR`), 9
+(`LF`), with 10 meaning idle. Each cycle in which the index is in
+the active range and the `uart_tx` instance is not busy, the
+wrapper presents the next byte on `tx_data`, raises `tx_start` for
+one clock, and increments `print_idx`. The hex codec is the
+standard `(nib < 4'd10) ? (8'h30 + nib) : (8'h61 + nib - 4'd10)`
+function, emitting lowercase `a`-`f`. The single shared `uart_tx`
+instance (default `CLKS_PER_BIT = 104`) drives the new `tx` port.
+The top-level interface now exposes `clk`, `rx`, and `tx`.
 
 <<prbs_xor_top.v>>=
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Jakob Kastelic
 module prbs_xor_top (
-      input clk,
-      input rx
+      input  clk,
+      input  rx,
+      output tx
    );
 
    wire       rx_ready;
@@ -85,6 +96,70 @@ module prbs_xor_top (
       .clk_en(clk_en),
       .state(state),
       .checksum(checksum)
+   );
+
+   // Print FSM: latch checksum on 'p' (8'h70), then stream eight
+   // ASCII hex digits MSB-first, followed by CR (8'h0d) and LF
+   // (8'h0a). print_idx == 4'd10 means idle.
+   reg [31:0] checksum_q;
+   reg  [3:0] print_idx;
+   reg  [7:0] tx_data;
+   reg        tx_start;
+   wire       tx_busy;
+   wire       tx_ready = ~tx_busy;
+
+   initial begin
+      checksum_q = 32'd0;
+      print_idx  = 4'd10;
+      tx_data    = 8'd0;
+      tx_start   = 1'b0;
+   end
+
+   function [7:0] nib_to_ascii;
+      input [3:0] nib;
+      begin
+         nib_to_ascii = (nib < 4'd10) ? (8'h30 + nib)
+                                      : (8'h61 + nib - 4'd10);
+      end
+   endfunction
+
+   reg [3:0] cur_nib;
+   always @(*) begin
+      case (print_idx)
+         4'd0: cur_nib = checksum_q[31:28];
+         4'd1: cur_nib = checksum_q[27:24];
+         4'd2: cur_nib = checksum_q[23:20];
+         4'd3: cur_nib = checksum_q[19:16];
+         4'd4: cur_nib = checksum_q[15:12];
+         4'd5: cur_nib = checksum_q[11: 8];
+         4'd6: cur_nib = checksum_q[ 7: 4];
+         4'd7: cur_nib = checksum_q[ 3: 0];
+         default: cur_nib = 4'd0;
+      endcase
+   end
+
+   always @(posedge clk) begin
+      tx_start <= 1'b0;
+      if (rx_ready && rx_data == 8'h70) begin
+         checksum_q <= checksum;
+         print_idx  <= 4'd0;
+      end else if (print_idx != 4'd10 && tx_ready && !tx_start) begin
+         case (print_idx)
+            4'd8: tx_data <= 8'h0d;
+            4'd9: tx_data <= 8'h0a;
+            default: tx_data <= nib_to_ascii(cur_nib);
+         endcase
+         tx_start  <= 1'b1;
+         print_idx <= print_idx + 4'd1;
+      end
+   end
+
+   uart_tx u_tx (
+      .clk  (clk),
+      .start(tx_start),
+      .data (tx_data),
+      .tx   (tx),
+      .busy (tx_busy)
    );
 
 endmodule
