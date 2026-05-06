@@ -33,6 +33,19 @@ module prbs_xor_top (
          clk_en_q <= 1'b0;
    end
 
+   reg [16:0] burst_count;
+   initial burst_count = 17'd0;
+   always @(posedge clk) begin
+      if (rx_ready && rx_data == 8'h62)
+         burst_count <= 17'd65536;
+      else if (burst_count != 17'd0)
+         burst_count <= burst_count - 17'd1;
+      else
+         burst_count <= 17'd0;
+   end
+
+   wire clk_en = clk_en_q | (burst_count != 17'd0);
+
    wire [31:0] state;
    wire [31:0] checksum;
 
@@ -40,7 +53,7 @@ module prbs_xor_top (
       .clk(clk),
       .rst_n(rst_n),
       .clear(1'b0),
-      .clk_en(clk_en_q),
+      .clk_en(clk_en),
       .state(state),
       .checksum(checksum)
    );
