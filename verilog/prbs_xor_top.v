@@ -24,6 +24,15 @@ module prbs_xor_top (
          rst_n <= 1'b1;
    end
 
+   reg clk_en_q;
+   initial clk_en_q = 1'b0;
+   always @(posedge clk) begin
+      if (rx_ready && rx_data == 8'h73)
+         clk_en_q <= 1'b1;
+      else
+         clk_en_q <= 1'b0;
+   end
+
    wire [31:0] state;
    wire [31:0] checksum;
 
@@ -31,7 +40,7 @@ module prbs_xor_top (
       .clk(clk),
       .rst_n(rst_n),
       .clear(1'b0),
-      .clk_en(1'b0),
+      .clk_en(clk_en_q),
       .state(state),
       .checksum(checksum)
    );
