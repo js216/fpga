@@ -1,8 +1,9 @@
 == prbs_xor PRBS skeleton
 
-This chapter is the first step of a UART/PRBS/checksum stack. It
-contains an LFSR-only PRBS generator with no UART command interface
-and no XOR checksum yet; those are added in subsequent iterations.
+This chapter is the first step of a UART/PRBS/checksum stack. It now
+contains the LFSR-only PRBS generator together with a streaming XOR
+checksum register; the UART command interface and the matching MP135
+baremetal mirror are added in subsequent iterations.
 
 The legacy `to_be_replaced_by_cleaner_code/mmap_prbs.nw` uses a 15-bit
 PRBS (polynomial `x^15 + x^14 + 1`, seed `15'h7E5F`). For the new
@@ -13,12 +14,16 @@ the XOR checksum without any width-conversion glue. The LFSR is
 seeded at reset to `32'h0000_0001`; PRBS LFSRs cannot tolerate the
 all-zero state.
 
-The module has just three ports: a clock `clk`, an active-low
-synchronous reset `rst_n`, and a 32-bit `state` output that exposes
-the live LFSR register. The clocked `always @(posedge clk)` block
-either reloads the seed when `rst_n` is low or advances the LFSR
-one bit per clock using the Galois recurrence (XOR the feedback
-polynomial mask into the shifted state when the LSB is one).
+The module exposes a clock `clk`, an active-low synchronous reset
+`rst_n`, a single-cycle `clear` pulse, a 32-bit `state` output that
+exposes the live LFSR register, and a 32-bit `checksum` output that
+accumulates the streaming XOR of `state` into itself. The clocked
+`always @(posedge clk)` block either reloads the seed when `rst_n`
+is low or advances the LFSR one bit per clock using the Galois
+recurrence (XOR the feedback polynomial mask into the shifted state
+when the LSB is one). The `clear` pulse zeroes the checksum register
+without disturbing the LFSR, so the host can re-arm an XOR window
+mid-stream; `rst_n` going low resets both the LFSR and the checksum.
 
 <<prbs_xor.v>>=
 // SPDX-License-Identifier: MIT
@@ -26,21 +31,31 @@ polynomial mask into the shifted state when the LSB is one).
 module prbs_xor (
       input             clk,
       input             rst_n,
-      output reg [31:0] state
+      input             clear,
+      output reg [31:0] state,
+      output reg [31:0] checksum
    );
 
    localparam [31:0] SEED = 32'h0000_0001;
    localparam [31:0] POLY = 32'h8020_0003;
 
-   initial state = SEED;
+   initial state    = SEED;
+   initial checksum = 32'h0000_0000;
 
    always @(posedge clk) begin
-      if (!rst_n)
-         state <= SEED;
-      else if (state[0])
-         state <= (state >> 1) ^ POLY;
-      else
-         state <= (state >> 1);
+      if (!rst_n) begin
+         state    <= SEED;
+         checksum <= 32'h0000_0000;
+      end else begin
+         if (state[0])
+            state <= (state >> 1) ^ POLY;
+         else
+            state <= (state >> 1);
+         if (clear)
+            checksum <= 32'h0000_0000;
+         else
+            checksum <= checksum ^ state;
+      end
    end
 endmodule
 @
@@ -51,7 +66,7 @@ configurations) so the LFSR cycles through every non-zero 32-bit
 state before repeating, giving a period of `2**32 - 1` clocks.
 
 This skeleton has no test bench, no formal properties, no pcf, and
-no synthesis fragment yet. The next iteration adds an XOR checksum
-register; the iteration after that, a tiny UART command interface
-(reset / single-step / stream `2**16` words / print checksum); and
-the iteration after that, the matching MP135 baremetal mirror.
+no synthesis fragment yet. The next iteration adds a tiny UART
+command interface (reset / single-step / stream `2**16` words /
+print checksum); the iteration after that, the matching MP135
+baremetal mirror.
