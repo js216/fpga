@@ -62,6 +62,9 @@ define CHAP_RULES
 build/$(1):
 	mkdir -p $$@
 
+build/$(1)/$(1).v: verilog/$(1).v | build/$(1)
+	cp $$< $$@
+
 build/$(1)/$(1).sby: $$(call chapter_src,$(1)) | build/$(1)
 	cd build/$(1) && tangle $(1).sby < ../../$$<
 

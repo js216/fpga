@@ -1,0 +1,57 @@
+== prbs_xor PRBS skeleton
+
+This chapter is the first step of a UART/PRBS/checksum stack. It
+contains an LFSR-only PRBS generator with no UART command interface
+and no XOR checksum yet; those are added in subsequent iterations.
+
+The legacy `to_be_replaced_by_cleaner_code/mmap_prbs.nw` uses a 15-bit
+PRBS (polynomial `x^15 + x^14 + 1`, seed `15'h7E5F`). For the new
+pipeline we widen the LFSR to a maximum-length 32-bit Galois
+configuration (`mask = 32'h80200003`, taps at bits 32, 22, 2, 1) so
+the same shifter can later carry a 32-bit data word per cycle into
+the XOR checksum without any width-conversion glue. The LFSR is
+seeded at reset to `32'h0000_0001`; PRBS LFSRs cannot tolerate the
+all-zero state.
+
+The module has just three ports: a clock `clk`, an active-low
+synchronous reset `rst_n`, and a 32-bit `state` output that exposes
+the live LFSR register. The clocked `always @(posedge clk)` block
+either reloads the seed when `rst_n` is low or advances the LFSR
+one bit per clock using the Galois recurrence (XOR the feedback
+polynomial mask into the shifted state when the LSB is one).
+
+<<prbs_xor.v>>=
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Jakob Kastelic
+module prbs_xor (
+      input             clk,
+      input             rst_n,
+      output reg [31:0] state
+   );
+
+   localparam [31:0] SEED = 32'h0000_0001;
+   localparam [31:0] POLY = 32'h8020_0003;
+
+   initial state = SEED;
+
+   always @(posedge clk) begin
+      if (!rst_n)
+         state <= SEED;
+      else if (state[0])
+         state <= (state >> 1) ^ POLY;
+      else
+         state <= (state >> 1);
+   end
+endmodule
+@
+
+The polynomial `0x80200003` realises feedback taps at bit positions
+32, 22, 2 and 1 (one of the standard 32-bit maximum-length Galois
+configurations) so the LFSR cycles through every non-zero 32-bit
+state before repeating, giving a period of `2**32 - 1` clocks.
+
+This skeleton has no test bench, no formal properties, no pcf, and
+no synthesis fragment yet. The next iteration adds an XOR checksum
+register; the iteration after that, a tiny UART command interface
+(reset / single-step / stream `2**16` words / print checksum); and
+the iteration after that, the matching MP135 baremetal mirror.
