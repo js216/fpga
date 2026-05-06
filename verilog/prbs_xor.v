@@ -4,6 +4,7 @@ module prbs_xor (
       input             clk,
       input             rst_n,
       input             clear,
+      input             clk_en,
       output reg [31:0] state,
       output reg [31:0] checksum
    );
@@ -18,7 +19,7 @@ module prbs_xor (
       if (!rst_n) begin
          state    <= SEED;
          checksum <= 32'h0000_0000;
-      end else begin
+      end else if (clk_en) begin
          if (state[0])
             state <= (state >> 1) ^ POLY;
          else

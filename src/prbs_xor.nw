@@ -15,15 +15,20 @@ seeded at reset to `32'h0000_0001`; PRBS LFSRs cannot tolerate the
 all-zero state.
 
 The module exposes a clock `clk`, an active-low synchronous reset
-`rst_n`, a single-cycle `clear` pulse, a 32-bit `state` output that
+`rst_n`, a single-cycle `clear` pulse, a clock-enable `clk_en` that
+gates LFSR and checksum advance, a 32-bit `state` output that
 exposes the live LFSR register, and a 32-bit `checksum` output that
 accumulates the streaming XOR of `state` into itself. The clocked
 `always @(posedge clk)` block either reloads the seed when `rst_n`
-is low or advances the LFSR one bit per clock using the Galois
-recurrence (XOR the feedback polynomial mask into the shifted state
-when the LSB is one). The `clear` pulse zeroes the checksum register
-without disturbing the LFSR, so the host can re-arm an XOR window
-mid-stream; `rst_n` going low resets both the LFSR and the checksum.
+is low or, when `clk_en` is asserted, advances the LFSR one bit per
+clock using the Galois recurrence (XOR the feedback polynomial mask
+into the shifted state when the LSB is one). The `clear` pulse
+zeroes the checksum register without disturbing the LFSR, so the
+host can re-arm an XOR window mid-stream; `rst_n` going low resets
+both the LFSR and the checksum regardless of `clk_en`. The `clk_en`
+gate lets a future UART command interpreter hold the stream idle by
+default, pulse it high for one cycle to single-step, or hold it
+high for `2**16` cycles to run a burst.
 
 <<prbs_xor.v>>=
 // SPDX-License-Identifier: MIT
@@ -32,6 +37,7 @@ module prbs_xor (
       input             clk,
       input             rst_n,
       input             clear,
+      input             clk_en,
       output reg [31:0] state,
       output reg [31:0] checksum
    );
@@ -46,7 +52,7 @@ module prbs_xor (
       if (!rst_n) begin
          state    <= SEED;
          checksum <= 32'h0000_0000;
-      end else begin
+      end else if (clk_en) begin
          if (state[0])
             state <= (state >> 1) ^ POLY;
          else
@@ -66,7 +72,8 @@ configurations) so the LFSR cycles through every non-zero 32-bit
 state before repeating, giving a period of `2**32 - 1` clocks.
 
 This skeleton has no test bench, no formal properties, no pcf, and
-no synthesis fragment yet. The next iteration adds a tiny UART
-command interface (reset / single-step / stream `2**16` words /
-print checksum); the iteration after that, the matching MP135
-baremetal mirror.
+no synthesis fragment yet. The next iteration wraps the module in a
+tiny UART command interpreter that drives `clk_en`, `clear`, and
+`rst_n` from byte commands (reset / single-step / stream `2**16`
+words / print checksum); the iteration after that, the matching
+MP135 baremetal mirror.
