@@ -268,6 +268,13 @@ with a grouped-target rule that runs `tangle` once and emits both
 build subdirectory so prior verify steps that reference
 `fpga/build/prbs_xor_top/prbs_xor_top.v` keep finding it.
 
+The fragment also adds a yosys `synth_ice40` rule for the reusable
+`prbs_xor` core only (no `prbs_xor_top` or UART submodules) that
+emits `build/prbs_xor/prbs_xor.json`. This gate-checks that the
+tangled core synthesises into an iCE40 netlist before any later
+iteration layers on a `prbs_xor_top` synth, simulation harness, or
+bench comparison.
+
 <<prbs_xor.mk>>=
 PRBS_XOR_VS := verilog/prbs_xor.v verilog/prbs_xor_top.v
 
@@ -279,6 +286,9 @@ build/prbs_xor_top:
 
 build/prbs_xor_top/prbs_xor_top.v: verilog/prbs_xor_top.v | build/prbs_xor_top
 	cp $< $@
+
+build/prbs_xor/prbs_xor.json: build/prbs_xor/prbs_xor.v | build/prbs_xor
+	cd build/prbs_xor && yosys -q -p "read_verilog prbs_xor.v; synth_ice40 -top prbs_xor -json prbs_xor.json"
 @
 
 There is no test bench, no formal property file, and no synthesis
