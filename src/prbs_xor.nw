@@ -299,6 +299,13 @@ gate-checks that the four-file tangled design synthesises before any
 later step layers on a board `.pcf`, a `nextpnr` place + route, or a
 bitstream.
 
+A `nextpnr-ice40` place-and-route rule then consumes the synth JSON
+together with the iCEstick `prbs_xor_top.pcf` and emits an `.asc`
+text bitstream against `--hx1k --package tq144 --freq 12` (the
+iCEstick's HX1K die in a TQ144 package clocked from the on-board
+12 MHz oscillator), gate-checking that the synth netlist physically
+fits the iCEstick before any later `icepack`/`iceprog` step.
+
 <<prbs_xor.mk>>=
 PRBS_XOR_VS := verilog/prbs_xor.v verilog/prbs_xor_top.v
 
@@ -319,6 +326,9 @@ build/prbs_xor/prbs_xor.json: build/prbs_xor/prbs_xor.v | build/prbs_xor
 
 build/prbs_xor_top/prbs_xor_top.json: build/prbs_xor_top/prbs_xor_top.v verilog/prbs_xor.v verilog/uart_rx.v verilog/uart_tx.v | build/prbs_xor_top
 	cd build/prbs_xor_top && yosys -q -p "read_verilog prbs_xor_top.v ../../verilog/prbs_xor.v ../../verilog/uart_rx.v ../../verilog/uart_tx.v; synth_ice40 -top prbs_xor_top -json prbs_xor_top.json"
+
+build/prbs_xor_top/prbs_xor_top.asc: build/prbs_xor_top/prbs_xor_top.json verilog/prbs_xor_top.pcf | build/prbs_xor_top
+	cd build/prbs_xor_top && nextpnr-ice40 --hx1k --package tq144 --json prbs_xor_top.json --pcf ../../verilog/prbs_xor_top.pcf --asc prbs_xor_top.asc --freq 12 -q
 @
 
 There is no test bench, no formal property file, and no synthesis
