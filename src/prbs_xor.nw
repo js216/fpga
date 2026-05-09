@@ -275,6 +275,14 @@ tangled core synthesises into an iCE40 netlist before any later
 iteration layers on a `prbs_xor_top` synth, simulation harness, or
 bench comparison.
 
+A second yosys `synth_ice40` rule wraps the full UART command top
+`prbs_xor_top`, reading the cp'd `build/prbs_xor_top/prbs_xor_top.v`
+together with its three submodule sources (`prbs_xor.v`, `uart_rx.v`,
+`uart_tx.v`) and emitting `build/prbs_xor_top/prbs_xor_top.json`. This
+gate-checks that the four-file tangled design synthesises before any
+later step layers on a board `.pcf`, a `nextpnr` place + route, or a
+bitstream.
+
 <<prbs_xor.mk>>=
 PRBS_XOR_VS := verilog/prbs_xor.v verilog/prbs_xor_top.v
 
@@ -289,6 +297,9 @@ build/prbs_xor_top/prbs_xor_top.v: verilog/prbs_xor_top.v | build/prbs_xor_top
 
 build/prbs_xor/prbs_xor.json: build/prbs_xor/prbs_xor.v | build/prbs_xor
 	cd build/prbs_xor && yosys -q -p "read_verilog prbs_xor.v; synth_ice40 -top prbs_xor -json prbs_xor.json"
+
+build/prbs_xor_top/prbs_xor_top.json: build/prbs_xor_top/prbs_xor_top.v verilog/prbs_xor.v verilog/uart_rx.v verilog/uart_tx.v | build/prbs_xor_top
+	cd build/prbs_xor_top && yosys -q -p "read_verilog prbs_xor_top.v ../../verilog/prbs_xor.v ../../verilog/uart_rx.v ../../verilog/uart_tx.v; synth_ice40 -top prbs_xor_top -json prbs_xor_top.json"
 @
 
 There is no test bench, no formal property file, and no synthesis
