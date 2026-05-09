@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jakob Kastelic
+set_io clk    21
+set_io rx     9
+set_io tx     8

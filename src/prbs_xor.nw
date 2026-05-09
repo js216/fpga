@@ -258,6 +258,22 @@ module prbs_xor_top (
 endmodule
 @
 
+=== iCEstick (iCE40-HX1K-EVB) pin map
+
+The iCEstick wraps `prbs_xor_top` onto the same UART headers as the
+prior `uart` chapter: clock on pin 21 (GBIN6, 12 MHz Discera MEMS
+oscillator), UART RX on pin 9, UART TX on pin 8. `prbs_xor_top` has
+no LED port, so no LED `set_io` lines are needed and nextpnr is
+invoked with `--pcf-allow-unconstrained`.
+
+<<prbs_xor_top.pcf>>=
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jakob Kastelic
+set_io clk    21
+set_io rx     9
+set_io tx     8
+@
+
 === Build
 
 This chapter tangles to two Verilog files (`prbs_xor.v`, the reusable
@@ -294,6 +310,9 @@ build/prbs_xor_top:
 
 build/prbs_xor_top/prbs_xor_top.v: verilog/prbs_xor_top.v | build/prbs_xor_top
 	cp $< $@
+
+verilog/prbs_xor_top.pcf: src/prbs_xor.nw | verilog
+	cd verilog && tangle prbs_xor_top.pcf < ../$<
 
 build/prbs_xor/prbs_xor.json: build/prbs_xor/prbs_xor.v | build/prbs_xor
 	cd build/prbs_xor && yosys -q -p "read_verilog prbs_xor.v; synth_ice40 -top prbs_xor -json prbs_xor.json"
