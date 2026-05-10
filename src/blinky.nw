@@ -230,23 +230,37 @@ always @(posedge clk) begin
 end
 @
 
-=== iCEstick pin mapping
+=== Pin mappings
 
 The iCEstick evaluation board houses a Lattice iCE40-HX1K in the TQ144
 package. The 12 MHz Discera MEMS oscillator drives FPGA pin 21, and LED D1
 (red, Bank 1, PIO1\_14) is on pin 99. Those are the only two pins the
 blinky top-level needs.
 
-<<blinky.pcf>>=
+<<blinky_hx1k.pcf>>=
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jakob Kastelic
 set_io clk 21
 set_io led 99
 @
 
+The HX8K-B-EVN houses a Lattice iCE40-HX8K in the CT256 package. Its
+12 MHz oscillator U5 drives ball J3, and the eight on-board LEDs D2..D9
+are wired to balls B5/B4/A2/A1/C5/C4/B3/C3. The single blinky output
+uses D2, matching the low LED bit used by the UART demo.
+
+<<blinky_hx8k.pcf>>=
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Jakob Kastelic
+set_io clk J3
+set_io led B5
+@
+
 === Build fragment
 
-Blinky's generic rules cover everything except declaring itself as a
-bitstream target. The top Makefile's `bitstream` phony collects
-prereqs from each module's `.mk` fragment.
+Blinky's generic rules cover synthesis, simulation, and formal checks.
+The top Makefile's per-board rules collect the bitstream targets for
+both supported boards from the `BOARDS_blinky` declaration.
 
 <<blinky.mk>>=
 BLINKY_VS := verilog/blinky.v
@@ -263,7 +277,6 @@ build/blinky/formal: build/blinky/blinky.sby $(BLINKY_VS)
 	cd build/blinky && sby -f blinky.sby
 	@touch $@
 
-bitstream: build/blinky/blinky.bin
 sim: build/blinky/sim
 formal: build/blinky/formal
 @
@@ -277,5 +290,5 @@ Second, SymbiYosys proves via bounded model checking that for all
 possible input sequences up to 30 cycles: (1) the initial state is
 zero, (2) the counter stays below `PERIOD`, and (3) the counter
 increments by one each cycle or wraps to zero. Hardware bring-up
-on a real iCEstick is driven separately by
+on the real FPGA boards is driven separately by
 `missions/fpga-blink.md`.

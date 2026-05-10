@@ -15,6 +15,7 @@ PACKAGE ?= tq144
 # own pcf (verilog/<chap>_<board>.pcf), its own bitstream, and its own
 # tangled TEST.md / verify.py. Single-target chapters leave BOARDS_<chap>
 # empty and keep the legacy DEVICE/PACKAGE flow.
+BOARDS_blinky := hx1k hx8k
 BOARDS_uart := hx1k hx8k
 
 # Per-board nextpnr arguments. Add a row when you add a board.
