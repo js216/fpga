@@ -306,6 +306,12 @@ iCEstick's HX1K die in a TQ144 package clocked from the on-board
 12 MHz oscillator), gate-checking that the synth netlist physically
 fits the iCEstick before any later `icepack`/`iceprog` step.
 
+An `icepack` rule then packs the place-and-routed `.asc` into a
+`prbs_xor_top.bin` iCEstick bitstream (~32 KB for the HX1K die),
+mirroring the legacy single-target `build/$(1)/$(1).bin` precedent
+in `fpga/Makefile`. This gate-checks bitstream packing in
+isolation, before any later `iceprog` programming or bench step.
+
 <<prbs_xor.mk>>=
 PRBS_XOR_VS := verilog/prbs_xor.v verilog/prbs_xor_top.v
 
@@ -329,6 +335,9 @@ build/prbs_xor_top/prbs_xor_top.json: build/prbs_xor_top/prbs_xor_top.v verilog/
 
 build/prbs_xor_top/prbs_xor_top.asc: build/prbs_xor_top/prbs_xor_top.json verilog/prbs_xor_top.pcf | build/prbs_xor_top
 	cd build/prbs_xor_top && nextpnr-ice40 --hx1k --package tq144 --json prbs_xor_top.json --pcf ../../verilog/prbs_xor_top.pcf --asc prbs_xor_top.asc --freq 12 -q
+
+build/prbs_xor_top/prbs_xor_top.bin: build/prbs_xor_top/prbs_xor_top.asc | build/prbs_xor_top
+	cd build/prbs_xor_top && icepack prbs_xor_top.asc prbs_xor_top.bin
 @
 
 There is no test bench, no formal property file, and no synthesis
