@@ -1,0 +1,53 @@
+set_io clk      J3
+
+set_io tx       B12
+set_io rx       B10
+
+# Bank~1 stripe (right edge of the CT256 die, x=33) committed
+# after the four-bank probe found five jumpers there and the
+# refinement passes filled in five more.  The first ten
+# `pins[i]` slots now match DSP scan-index `i` in lockstep, so
+# Phase~A's "FPGA bit i" and Phase~B's "DSP idx i" both fire
+# on iter `i` for i=0..9 with clean bidirectional agreement.
+#
+# Confirmed (both Phase~A and Phase~B agree, 2026-05-13 sweeps):
+#   DSP idx 0 (P13.02) <-> P16
+#   DSP idx 1 (P13.04) <-> N16
+#   DSP idx 2 (P13.06) <-> M16
+#   DSP idx 3 (P13.08) <-> K14
+#   DSP idx 4 (P13.10) <-> G14
+#   DSP idx 5 (P13.12) <-> K15
+#   DSP idx 6 (P13.14) <-> J15
+#   DSP idx 7 (P13.16) <-> H14
+#   DSP idx 8 (P13.18) <-> G15
+#   DSP idx 9 (P13.20) <-> F15
+#
+# Six DSP indices (10..15: P13.38, P13.40, P14.06, P14.08,
+# P14.10, P14.12) did not produce a flip on ANY of the
+# remaining sampled balls (the rest of Bank~1, plus pickets
+# from Bank~0/2/3 and the SPI-flash adjacencies).  Possible
+# explanations: the bench harness has only ten jumpers (the
+# DAI1 PIN01..PIN10 group on P13.02..P13.20 is contiguous on
+# the EZLITE while P13.38/P13.40 and the P14 pins are
+# physically far away and may not have been wired); or the
+# remaining six lands on balls outside this sample.  For now
+# the upper six `pins[i]` slots are wired to unprobed Bank~3
+# (left-edge) balls so the next bench owner can extend the
+# search rather than have to start from scratch.
+
+set_io pins[0]  P16
+set_io pins[1]  N16
+set_io pins[2]  M16
+set_io pins[3]  K14
+set_io pins[4]  G14
+set_io pins[5]  K15
+set_io pins[6]  J15
+set_io pins[7]  H14
+set_io pins[8]  G15
+set_io pins[9]  F15
+set_io pins[10] H3
+set_io pins[11] H4
+set_io pins[12] H5
+set_io pins[13] K1
+set_io pins[14] L1
+set_io pins[15] M1

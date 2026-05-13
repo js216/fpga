@@ -17,6 +17,7 @@ PACKAGE ?= tq144
 # empty and keep the legacy DEVICE/PACKAGE flow.
 BOARDS_blinky := hx1k hx8k
 BOARDS_uart := hx1k hx8k
+BOARDS_gpio := hx1k hx8k
 
 # Per-board nextpnr arguments. Add a row when you add a board.
 nextpnr_pkg_hx1k := tq144

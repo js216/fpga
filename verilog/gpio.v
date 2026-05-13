@@ -13,21 +13,26 @@ module gpio #(
    reg        active;
    reg        line_is_query;
    reg        query_pending;
+   reg        snap_pending;
    reg        tx_start;
    reg  [7:0] tx_data;
    wire       tx_busy;
-   
+
    reg [15:0] gpio_out;
    reg [15:0] gpio_oe;
-   
+
+   // Bench cursor for the connectivity-test counter commands
+   // (see "Per-pin cursor commands" below).
+   reg [4:0]  cursor;
+
    reg [2:0]  rx_state;
    reg        cmd_is_enable;
    reg [11:0] accum;
    wire       rx_ready;
    wire [7:0] rx_data;
-   
+
    localparam LAST_IDX = 3'd5;
-   
+
    localparam RX_IDLE = 3'd0;
    localparam RX_D0   = 3'd1;
    localparam RX_D1   = 3'd2;
@@ -40,10 +45,12 @@ module gpio #(
       active        = 0;
       line_is_query = 0;
       query_pending = 0;
+      snap_pending  = 0;
       tx_start      = 0;
       tx_data       = 0;
       gpio_out      = 0;
       gpio_oe       = 0;
+      cursor        = 0;
       rx_state      = RX_IDLE;
       cmd_is_enable = 0;
       accum         = 0;
@@ -71,8 +78,8 @@ module gpio #(
       tx_start <= 1'b0;
       if (timer == TICK_CYCLES - 1) begin
          timer <= 0;
-         if (!active && !query_pending) begin
-            snapshot <= pins;
+         if (!active && !query_pending && !snap_pending) begin
+            snapshot <= pins_in;
             char_idx <= 0;
             active   <= 1'b1;
             line_is_query <= 1'b0;
@@ -80,7 +87,14 @@ module gpio #(
       end else begin
          timer <= timer + 1;
       end
-      if (!active && query_pending) begin
+      if (!active && snap_pending) begin
+         snapshot      <= pins_in;
+         char_idx      <= 0;
+         active        <= 1'b1;
+         line_is_query <= 1'b0;
+         snap_pending  <= 1'b0;
+      end
+      if (!active && !snap_pending && query_pending) begin
          char_idx      <= 0;
          active        <= 1'b1;
          line_is_query <= 1'b1;
@@ -88,6 +102,10 @@ module gpio #(
       end
       if (rx_ready && rx_state == RX_IDLE && rx_data == "?")
          query_pending <= 1'b1;
+      if (rx_ready && rx_state == RX_IDLE && rx_data == "S") begin
+         snap_pending <= 1'b1;
+         snapshot     <= pins_in;
+      end
       if (active && !tx_busy && !tx_start) begin
          tx_start <= 1'b1;
          tx_data  <= cur_char;
@@ -130,6 +148,26 @@ module gpio #(
                end else if (rx_data == "E") begin
                   rx_state      <= RX_D0;
                   cmd_is_enable <= 1'b1;
+               end else if (rx_data == "N") begin
+                  if (cursor < 5'd16) begin
+                     gpio_oe  <= gpio_oe  | (16'd1 << cursor[3:0]);
+                     gpio_out <= gpio_out | (16'd1 << cursor[3:0]);
+                  end
+               end else if (rx_data == "n") begin
+                  if (cursor < 5'd16) begin
+                     gpio_oe  <= gpio_oe  | (16'd1 << cursor[3:0]);
+                     gpio_out <= gpio_out & ~(16'd1 << cursor[3:0]);
+                  end
+               end else if (rx_data == "R") begin
+                  if (cursor < 5'd16) begin
+                     gpio_oe  <= gpio_oe  & ~(16'd1 << cursor[3:0]);
+                     gpio_out <= gpio_out & ~(16'd1 << cursor[3:0]);
+                  end
+                  cursor <= cursor + 5'd1;
+               end else if (rx_data == "Z") begin
+                  gpio_oe  <= 16'h0000;
+                  gpio_out <= 16'h0000;
+                  cursor   <= 5'd0;
                end
             end
             RX_D0, RX_D1, RX_D2: begin
@@ -154,9 +192,19 @@ module gpio #(
       end
    end
    genvar g;
+   wire [15:0] pins_in;
    generate
       for (g = 0; g < 16; g = g + 1) begin : gpio_tri
-         assign pins[g] = gpio_oe[g] ? gpio_out[g] : 1'bz;
+         SB_IO #(
+            .PIN_TYPE (6'b101001),
+            .PULLUP   (1'b1)
+         ) io_inst (
+            .PACKAGE_PIN  (pins[g]),
+            .OUTPUT_CLK   (clk),
+            .OUTPUT_ENABLE(gpio_oe[g]),
+            .D_OUT_0      (gpio_out[g]),
+            .D_IN_0       (pins_in[g])
+         );
       end
    endgenerate
 `ifdef FORMAL
@@ -173,7 +221,7 @@ module gpio #(
    reg f_past_valid;
    initial f_past_valid = 0;
    always @(posedge clk) f_past_valid <= 1;
-   
+
    always @(posedge clk) begin
       if (f_past_valid && $past(tx_start))
          assert(!tx_start);
@@ -206,15 +254,29 @@ module gpio #(
    always @(posedge clk) begin
       if (f_past_valid) begin
          if (gpio_out != $past(gpio_out))
-            assert($past(rx_state) == RX_D3 &&
-                   $past(rx_ready)         &&
-                   $past(rx_nib_valid)     &&
-                   !$past(cmd_is_enable));
+            assert(
+               ($past(rx_state) == RX_D3 &&
+                $past(rx_ready)          &&
+                $past(rx_nib_valid)      &&
+                !$past(cmd_is_enable))
+               || ($past(rx_state) == RX_IDLE &&
+                   $past(rx_ready)            &&
+                   ($past(rx_data) == "N" ||
+                    $past(rx_data) == "n" ||
+                    $past(rx_data) == "R" ||
+                    $past(rx_data) == "Z")));
          if (gpio_oe != $past(gpio_oe))
-            assert($past(rx_state) == RX_D3 &&
-                   $past(rx_ready)         &&
-                   $past(rx_nib_valid)     &&
-                   $past(cmd_is_enable));
+            assert(
+               ($past(rx_state) == RX_D3 &&
+                $past(rx_ready)          &&
+                $past(rx_nib_valid)      &&
+                $past(cmd_is_enable))
+               || ($past(rx_state) == RX_IDLE &&
+                   $past(rx_ready)            &&
+                   ($past(rx_data) == "N" ||
+                    $past(rx_data) == "n" ||
+                    $past(rx_data) == "R" ||
+                    $past(rx_data) == "Z")));
       end
    end
    always @(posedge clk) begin

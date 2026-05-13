@@ -40,6 +40,13 @@ A single `?` byte is a read-only liveness query. It does not change
 any GPIO drive register and returns `OK\r\n` on the same UART once the
 current transmit line, if any, has finished.
 
+A single `S` byte forces an immediate heartbeat-format snapshot of
+the `pins` bus on the same UART, jumping the queue ahead of the
+periodic 100 ms tick. This is the on-demand probe used by the
+bench connectivity test, which drives one external pin at a time
+and reads the snapshot back rather than waiting up to a full
+heartbeat period for the next free tick.
+
 There is no echo and no acknowledgement; the next heartbeat line is
 the feedback channel. After issuing a command, watch the line for
 the bits you expect to flip. On power-on `gpio_oe = 0`, so every
@@ -104,12 +111,17 @@ reg [2:0]  char_idx;
 reg        active;
 reg        line_is_query;
 reg        query_pending;
+reg        snap_pending;
 reg        tx_start;
 reg  [7:0] tx_data;
 wire       tx_busy;
 
 reg [15:0] gpio_out;
 reg [15:0] gpio_oe;
+
+// Bench cursor for the connectivity-test counter commands
+// (see "Per-pin cursor commands" below).
+reg [4:0]  cursor;
 
 reg [2:0]  rx_state;
 reg        cmd_is_enable;
@@ -140,10 +152,12 @@ initial begin
    active        = 0;
    line_is_query = 0;
    query_pending = 0;
+   snap_pending  = 0;
    tx_start      = 0;
    tx_data       = 0;
    gpio_out      = 0;
    gpio_oe       = 0;
+   cursor        = 0;
    rx_state      = RX_IDLE;
    cmd_is_enable = 0;
    accum         = 0;
@@ -202,8 +216,10 @@ the order in which the three effects compose on the clock edge.
 always @(posedge clk) begin
    <<GPIO: tx_start default>>
    <<GPIO: period timer and snapshot>>
+   <<GPIO: snap response start>>
    <<GPIO: query response start>>
    <<GPIO: query request latch>>
+   <<GPIO: snap request latch>>
    <<GPIO: byte feed>>
 end
 @
@@ -227,8 +243,8 @@ its ROM walk.
 <<GPIO: period timer and snapshot>>=
 if (timer == TICK_CYCLES - 1) begin
    timer <= 0;
-   if (!active && !query_pending) begin
-      snapshot <= pins;
+   if (!active && !query_pending && !snap_pending) begin
+      snapshot <= pins_in;
       char_idx <= 0;
       active   <= 1'b1;
       line_is_query <= 1'b0;
@@ -244,11 +260,28 @@ behind it so a liveness check is not hidden behind a full heartbeat
 period.
 
 <<GPIO: query response start>>=
-if (!active && query_pending) begin
+if (!active && !snap_pending && query_pending) begin
    char_idx      <= 0;
    active        <= 1'b1;
    line_is_query <= 1'b1;
    query_pending <= 1'b0;
+end
+@
+
+A pending snapshot has priority over a pending `?` query: the bench
+connectivity test interleaves drives and snapshots tightly, and the
+`OK` response is a liveness check that can wait. When the current
+transmit drains and `snap_pending` is high, latch `pins` into
+`snapshot` (same path the heartbeat uses) and start a fresh
+heartbeat-format line.
+
+<<GPIO: snap response start>>=
+if (!active && snap_pending) begin
+   snapshot      <= pins_in;
+   char_idx      <= 0;
+   active        <= 1'b1;
+   line_is_query <= 1'b0;
+   snap_pending  <= 1'b0;
 end
 @
 
@@ -258,6 +291,25 @@ the query-response latch so `query_pending` has a single flop driver.
 <<GPIO: query request latch>>=
 if (rx_ready && rx_state == RX_IDLE && rx_data == "?")
    query_pending <= 1'b1;
+@
+
+The snapshot-on-demand latch parallels the query latch: an `S` byte
+sampled in idle raises `snap_pending` AND re-latches `snapshot <=
+pins` in the SAME cycle the `S` byte is decoded. Re-latching right
+here (rather than waiting for the snap-response-start arm to fire)
+guarantees the bench sees the pin state at the instant it asked for
+it, not whatever stale value the last heartbeat or the last
+snap-response-start latch happened to capture. This matters when a
+heartbeat is in flight when `S` arrives: the response-start arm
+will not fire until `active` drops, but by then the external
+stimulus may have changed; with the latch here, the answer is
+locked to the `S`-byte cycle.
+
+<<GPIO: snap request latch>>=
+if (rx_ready && rx_state == RX_IDLE && rx_data == "S") begin
+   snap_pending <= 1'b1;
+   snapshot     <= pins_in;
+end
 @
 
 Byte feed handshake against `uart_tx`. When `active` is high and the
@@ -364,7 +416,11 @@ end
 @
 
 Idle: start a new drive command on `W` or `E`, queue a read-only
-response on `?`, and ignore anything else.
+response on `?` (and on `S`, handled by separate latches outside the
+parser), service the cursor commands `N`/`n`/`R`/`Z`, and ignore
+anything else. The cursor commands write `gpio_out`/`gpio_oe`
+directly from idle; the formal block below relaxes the commit
+property to admit those writes.
 
 <<GPIO: parser idle>>=
 RX_IDLE: begin
@@ -374,6 +430,26 @@ RX_IDLE: begin
    end else if (rx_data == "E") begin
       rx_state      <= RX_D0;
       cmd_is_enable <= 1'b1;
+   end else if (rx_data == "N") begin
+      if (cursor < 5'd16) begin
+         gpio_oe  <= gpio_oe  | (16'd1 << cursor[3:0]);
+         gpio_out <= gpio_out | (16'd1 << cursor[3:0]);
+      end
+   end else if (rx_data == "n") begin
+      if (cursor < 5'd16) begin
+         gpio_oe  <= gpio_oe  | (16'd1 << cursor[3:0]);
+         gpio_out <= gpio_out & ~(16'd1 << cursor[3:0]);
+      end
+   end else if (rx_data == "R") begin
+      if (cursor < 5'd16) begin
+         gpio_oe  <= gpio_oe  & ~(16'd1 << cursor[3:0]);
+         gpio_out <= gpio_out & ~(16'd1 << cursor[3:0]);
+      end
+      cursor <= cursor + 5'd1;
+   end else if (rx_data == "Z") begin
+      gpio_oe  <= 16'h0000;
+      gpio_out <= 16'h0000;
+      cursor   <= 5'd0;
    end
 end
 @
@@ -411,18 +487,57 @@ end
 
 === Tri-state drivers
 
-Per-bit conditional drive of the `inout` bus.  `synth_ice40` maps
-each bit to an `SB_IO` cell with `PIN_OUTPUT_TRISTATE` enable, so
-the external pin is truly high-impedance when `gpio_oe[i] == 0` and
-an external signal can drive it freely.  A `generate` loop keeps
-the sixteen lines compact; expanding to a per-bit list would add
-nothing but transcription risk.
+Per-bit conditional drive of the `inout` bus.  Earlier revisions
+relied on `synth_ice40` to infer an `SB_IO` cell from the bare
+`assign pins[g] = gpio_oe[g] ? gpio_out[g] : 1'bz;` pattern.  In
+practice the inferred PIN_TYPE was correct (`6'b101001`, output
+tristate + simple input), so the input buffer was enabled --- but
+with no internal pull-up the bench observed that every pin
+floated at whatever level the surrounding board put on it,
+yielding a heartbeat snapshot that looked nailed to a few bits
+even with the DSP probe disconnected from those balls.  The
+discovery verifier could therefore never distinguish "harness
+connected, line really sitting at 0" from "harness connected,
+DSP idle pull-up isn't strong enough to overcome the FPGA's
+high-impedance input plus board parasitics".
+
+Switching to an explicit `SB_IO` instantiation lets us pin both
+sides of the cell: tristate output driven by `gpio_oe`/`gpio_out`
+exactly as before, AND `PULLUP(1'b1)` so an unwired or weakly
+driven ball reads `1` by default.  A pin truly hard-shorted to
+ground still reads `0`, an externally driven `1` still reads `1`,
+and a floating ball reads `1` instead of an indeterminate value
+(in iCE40 silicon a pull-up is a ~100k resistor, easily
+overpowered by any active driver on either end).  The captured
+input arrives on `pins_in[g]` via `D_IN_0`; all snapshot latches
+read from `pins_in` rather than the `pins` net, which keeps the
+read path explicit and matches the cell topology the iCE40 fabric
+actually instantiates.
+
+The same Verilog elaborates in simulation because `verilog/SB_IO.v`
+already ships a behavioural model that supports `PIN_TYPE=101001`
+(see the `spi` chapter, which has used it for some time).  The
+Verilator sim binary just needs `SB_IO.v` on its compile line;
+the testbench's external `ext_en`/`ext_drv` driver on
+`gpio_line` then races the pull-up exactly the way an external
+driver races the iCE40 pull-up on hardware --- whoever drives
+wins, and when both let go the pull-up takes over.
 
 <<GPIO: tri-state drivers>>=
 genvar g;
+wire [15:0] pins_in;
 generate
    for (g = 0; g < 16; g = g + 1) begin : gpio_tri
-      assign pins[g] = gpio_oe[g] ? gpio_out[g] : 1'bz;
+      SB_IO #(
+         .PIN_TYPE (6'b101001),
+         .PULLUP   (1'b1)
+      ) io_inst (
+         .PACKAGE_PIN  (pins[g]),
+         .OUTPUT_CLK   (clk),
+         .OUTPUT_ENABLE(gpio_oe[g]),
+         .D_OUT_0      (gpio_out[g]),
+         .D_IN_0       (pins_in[g])
+      );
    end
 endgenerate
 @
@@ -580,15 +695,29 @@ something other than the parser.
 always @(posedge clk) begin
    if (f_past_valid) begin
       if (gpio_out != $past(gpio_out))
-         assert($past(rx_state) == RX_D3 &&
-                $past(rx_ready)         &&
-                $past(rx_nib_valid)     &&
-                !$past(cmd_is_enable));
+         assert(
+            ($past(rx_state) == RX_D3 &&
+             $past(rx_ready)          &&
+             $past(rx_nib_valid)      &&
+             !$past(cmd_is_enable))
+            || ($past(rx_state) == RX_IDLE &&
+                $past(rx_ready)            &&
+                ($past(rx_data) == "N" ||
+                 $past(rx_data) == "n" ||
+                 $past(rx_data) == "R" ||
+                 $past(rx_data) == "Z")));
       if (gpio_oe != $past(gpio_oe))
-         assert($past(rx_state) == RX_D3 &&
-                $past(rx_ready)         &&
-                $past(rx_nib_valid)     &&
-                $past(cmd_is_enable));
+         assert(
+            ($past(rx_state) == RX_D3 &&
+             $past(rx_ready)          &&
+             $past(rx_nib_valid)      &&
+             $past(cmd_is_enable))
+            || ($past(rx_state) == RX_IDLE &&
+                $past(rx_ready)            &&
+                ($past(rx_data) == "N" ||
+                 $past(rx_data) == "n" ||
+                 $past(rx_data) == "R" ||
+                 $past(rx_data) == "Z")));
    end
 end
 @
@@ -1028,7 +1157,7 @@ timeout 600
 smtbmc z3
 
 [script]
-read -formal gpio.v uart_tx.v uart_rx.v
+read -formal gpio.v uart_tx.v uart_rx.v SB_IO.v
 chparam -set CLKS_PER_BIT 10 -set TICK_CYCLES 20 gpio
 prep -top gpio
 
@@ -1036,22 +1165,33 @@ prep -top gpio
 ../../verilog/gpio.v
 ../../verilog/uart_tx.v
 ../../verilog/uart_rx.v
+../../verilog/SB_IO.v
 @
 
-=== iCEstick pin mapping
+=== Pin mappings
+
+Two boards, one demo top, two pcfs. Both run from a 12 MHz oscillator
+and route their UART through an FT2232H Channel B exposed by the host
+as a regular COM port. The sixteen GPIO bidirectional pins land on
+each board's expansion headers in connector-position order; the
+bench connectivity test (`logs/fpga-dsp-gpio.md`) only exercises the
+HX8K-B-EVN side, but the iCEstick map is preserved so existing
+fixtures keep building.
+
+==== iCEstick (iCE40-HX1K-TQ144)
 
 Clock on pin 21 (12 MHz Discera MEMS oscillator), UART TX on pin 8
-and RX on pin 9 (FT2232H channel B, the PC's COM port). The sixteen
-GPIO bidirectional pins map to the expansion headers `J1` (Bank 0)
-and `J3` (Bank 2) in connector-position order: `pins[0]` at `J1.3`
-up through `pins[15]` at `J3.10`. FPGA pin numbers on `J1` happen
-to run ascending (`112..119`) with connector position, while on
-`J3` they run descending (`62, 61, 60, 56, 48, 47, 45, 44`) ---
-the ordering is by connector pin, not by FPGA pin number, so a
-scope probe stepped from `J3.3` to `J3.10` reads bits `pins[8]`
-through `pins[15]` in order.
+and RX on pin 9 (FT2232H channel B). The sixteen GPIO pins map to
+expansion headers `J1` (Bank 0) and `J3` (Bank 2) in
+connector-position order: `pins[0]` at `J1.3` up through `pins[15]`
+at `J3.10`. FPGA pin numbers on `J1` happen to run ascending
+(`112..119`) with connector position, while on `J3` they run
+descending (`62, 61, 60, 56, 48, 47, 45, 44`) --- the ordering is
+by connector pin, not by FPGA pin number, so a scope probe stepped
+from `J3.3` to `J3.10` reads bits `pins[8]` through `pins[15]` in
+order.
 
-<<gpio.pcf>>=
+<<gpio_hx1k.pcf>>=
 set_io clk      21
 
 set_io tx       8
@@ -1076,31 +1216,248 @@ set_io pins[14] 45
 set_io pins[15] 44
 @
 
+==== iCE40-HX8K-B-EVN breakout (iCE40HX8K-CT256)
+
+Clock on ball J3 (12 MHz oscillator U5), UART TX on B12 and RX on
+B10 (FT2232H BDBUS0/1, same wiring as the `uart` chapter).  An
+earlier revision wired the sixteen GPIO bits onto the
+right-edge `T`/`R` rows of the CT256 package (T8..T16 and
+R6..R16), reasoning by elimination from "not LED, not SPI flash,
+not clock, not UART".  The bench connectivity sweep then proved
+that hypothesis wrong: with the FPGA inputs configured as
+proper `SB_IO` cells with the internal weak pull-up enabled,
+the heartbeat read `ffff` regardless of what the DSP did on
+P13/P14, and the DSP `Q` snapshot returned a constant value
+regardless of which `pins[g]` the FPGA drove.  Both ends are
+demonstrably driving their pads (FPGA self-readback via `D_IN_0`
+follows the drive register, and the DSP echoes `N<i>=1` /
+`n<i>=0` from its own bank read), but the two sets of pads are
+not on the same wires --- the harness lands on a different
+group of CT256 balls than the `T`/`R` rows.
+
+The next-most-likely candidate is the left-edge group exposed
+on the HX8K-B-EVN's J1 header (Lattice UG121, p.~31): a
+32-pin dual-row connector at the top-left of the board which
+brings out Bank~3 PIO across the `D`/`E`/`F`/`G`/`H`/`J`/`K`
+rows at low CT256 X-coordinate (those rows live on the left
+edge of the die, x=0 in the icebox database).  We pick sixteen
+of them in a stripe down the connector, again skipping J3
+(oscillator), and rely on the discovery verifier to tell us
+whether THIS set is the wired one.  If the answer is still
+"no flip on any bit", the next move is to walk the J2/J4
+groups; we keep the iCEstick map unchanged so the HX1K fixture
+keeps building either way.
+
+<<gpio_hx8k.pcf>>=
+set_io clk      J3
+
+set_io tx       B12
+set_io rx       B10
+
+# Bank~1 stripe (right edge of the CT256 die, x=33) committed
+# after the four-bank probe found five jumpers there and the
+# refinement passes filled in five more.  The first ten
+# `pins[i]` slots now match DSP scan-index `i` in lockstep, so
+# Phase~A's "FPGA bit i" and Phase~B's "DSP idx i" both fire
+# on iter `i` for i=0..9 with clean bidirectional agreement.
+#
+# Confirmed (both Phase~A and Phase~B agree, 2026-05-13 sweeps):
+#   DSP idx 0 (P13.02) <-> P16
+#   DSP idx 1 (P13.04) <-> N16
+#   DSP idx 2 (P13.06) <-> M16
+#   DSP idx 3 (P13.08) <-> K14
+#   DSP idx 4 (P13.10) <-> G14
+#   DSP idx 5 (P13.12) <-> K15
+#   DSP idx 6 (P13.14) <-> J15
+#   DSP idx 7 (P13.16) <-> H14
+#   DSP idx 8 (P13.18) <-> G15
+#   DSP idx 9 (P13.20) <-> F15
+#
+# Six DSP indices (10..15: P13.38, P13.40, P14.06, P14.08,
+# P14.10, P14.12) did not produce a flip on ANY of the
+# remaining sampled balls (the rest of Bank~1, plus pickets
+# from Bank~0/2/3 and the SPI-flash adjacencies).  Possible
+# explanations: the bench harness has only ten jumpers (the
+# DAI1 PIN01..PIN10 group on P13.02..P13.20 is contiguous on
+# the EZLITE while P13.38/P13.40 and the P14 pins are
+# physically far away and may not have been wired); or the
+# remaining six lands on balls outside this sample.  For now
+# the upper six `pins[i]` slots are wired to unprobed Bank~3
+# (left-edge) balls so the next bench owner can extend the
+# search rather than have to start from scratch.
+
+set_io pins[0]  P16
+set_io pins[1]  N16
+set_io pins[2]  M16
+set_io pins[3]  K14
+set_io pins[4]  G14
+set_io pins[5]  K15
+set_io pins[6]  J15
+set_io pins[7]  H14
+set_io pins[8]  G15
+set_io pins[9]  F15
+set_io pins[10] H3
+set_io pins[11] H4
+set_io pins[12] H5
+set_io pins[13] K1
+set_io pins[14] L1
+set_io pins[15] M1
+@
+
+=== Behavioural `SB_IO` sim model
+
+Yosys/`synth_ice40` recognises `SB_IO` as a built-in iCE40
+primitive and infers it during synthesis, so the bitstream flow
+does not need a Verilog definition of the cell. The Verilator
+sim binary and the SymbiYosys formal flow, however, both
+elaborate the gpio top end-to-end and need a behavioural model
+on their compile lines. The chapter owns that stub here so the
+sim/formal path is self-contained: no dependency on a frozen
+legacy chapter, and the model captures exactly the two things
+the gpio top exercises --- a `PIN_TYPE = 6'b101001` tristate
+output with simple input, and a `PULLUP = 1'b1` weak pull-up
+on the captured `D_IN_0` net.
+
+The `PULLUP` modelling is the load-bearing piece. In iCE40
+silicon, an unwired or weakly driven ball reads `1` because the
+IOB's internal ~100k pull-up dominates board parasitics; an
+externally-driven `1` or `0` overpowers the pull-up because any
+active driver is orders of magnitude stronger. The sim mirrors
+that order of operations by attaching a `(weak0, weak1)` pull
+only to a private `d_in_pulled` net which then feeds `D_IN_0`,
+NOT to the `PACKAGE_PIN` itself. That way the testbench's
+external tri-state driver on `gpio_line` continues to race the
+SB_IO output exactly as in silicon: whoever drives takes the
+line, and only when every driver lets go does the weak pull-up
+resolve the read to `1`.
+
+The `initial` guard restricts the model to the two `PIN_TYPE`
+codes the rest of the project uses (`6'b101001` for the gpio
+top's simple bidirectional pad and `6'b100101 NEG_TRIGGER=1`
+for the registered-output pad used by the spi chapter), so a
+typo in a future caller fails loudly rather than silently
+behaving wrong.
+
+<<SB_IO.v>>=
+`ifdef YOSYS
+// Yosys (used by the SymbiYosys formal flow) cannot legalise the
+// `inout PACKAGE_PIN` port across `smt2` export, and does not
+// parse the `assign (weak0, weak1) ...` strength syntax that the
+// Verilator sim path uses to model the iCE40 IOB's weak
+// pull-up.  The formal flow exercises gpio's FSM, handshake and
+// drive-commit properties, none of which depend on the
+// silicon-level race between an external driver and the
+// internal pull-up; a non-bidirectional stub that drives
+// PACKAGE_PIN as an output and feeds D_OUT_0 straight back to
+// D_IN_0 is sufficient to keep the formal flow building while
+// the bench (synthesis) and the testbench (Verilator) get the
+// full behavioural model below.
+module SB_IO #(
+      parameter [5:0] PIN_TYPE    = 6'b000000,
+      parameter [0:0] PULLUP      = 1'b0,
+      parameter [0:0] NEG_TRIGGER = 1'b0
+   ) (
+      output PACKAGE_PIN,
+      input  OUTPUT_CLK,
+      input  OUTPUT_ENABLE,
+      input  D_OUT_0,
+      output D_IN_0
+   );
+   assign PACKAGE_PIN = OUTPUT_ENABLE ? D_OUT_0 : 1'b0;
+   assign D_IN_0      = OUTPUT_ENABLE ? D_OUT_0 : 1'b1;
+endmodule
+`else
+module SB_IO #(
+      parameter [5:0] PIN_TYPE    = 6'b000000,
+      parameter [0:0] PULLUP      = 1'b0,
+      parameter [0:0] NEG_TRIGGER = 1'b0
+   ) (
+      inout  PACKAGE_PIN,
+      input  OUTPUT_CLK,
+      input  OUTPUT_ENABLE,
+      input  D_OUT_0,
+      output D_IN_0
+   );
+   initial begin
+      if (!((PIN_TYPE === 6'b101001 && NEG_TRIGGER === 1'b0) ||
+            (PIN_TYPE === 6'b100101 && NEG_TRIGGER === 1'b1))) begin
+         $display("ERROR SB_IO sim model only supports PIN_TYPE=101001 or PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
+                  PIN_TYPE, NEG_TRIGGER);
+         $finish;
+      end
+   end
+   reg dout_reg;
+   initial dout_reg = 1'b0;
+   always @(negedge OUTPUT_CLK)
+      dout_reg <= D_OUT_0;
+   wire dout_selected = (PIN_TYPE === 6'b100101) ? dout_reg : D_OUT_0;
+   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_selected : 1'bz;
+   // Behavioural pull-up: when the package pin is left high-impedance
+   // by every driver on the inout net, the iCE40 IOB's weak internal
+   // pull-up wins.  The sim attaches a non-strength pull only on the
+   // captured D_IN_0 side so the testbench's `assign gpio_line[i] =
+   // ext_en[i] ? ext_drv[i] : 1'bz;` continues to race the SB_IO
+   // output exactly as in silicon: whoever drives takes the line,
+   // and when both let go the pull-up resolves the read to 1.
+   wire d_in_pulled;
+   assign (weak0, weak1) d_in_pulled = PULLUP ? 1'b1 : 1'bz;
+   assign d_in_pulled = PACKAGE_PIN;
+   assign D_IN_0 = d_in_pulled;
+endmodule
+`endif
+@
+
 === Build fragment
 
 The gpio top pulls in `uart_tx.v` and `uart_rx.v` as dependencies,
 so the generic single-file rules in the top Makefile do not
 suffice. This fragment overrides the sim, formal, and synth
-targets to include all three sources. The `uart_tx.v` and
-`uart_rx.v` prerequisites resolve through the tangle rules declared
-by the `uart` chapter's own fragment.
+targets to include all three sources, and tangles a per-board pcf
+for each entry in `BOARDS_gpio`. The `uart_tx.v` and `uart_rx.v`
+prerequisites resolve through the tangle rules declared by the
+`uart` chapter's own fragment; the per-board bitstream rules are
+declared by the top Makefile via its `CHAP_BOARD_RULES` template.
 
 <<gpio.mk>>=
 GPIO_VS := verilog/gpio.v verilog/uart_tx.v verilog/uart_rx.v
+GPIO_PCFS := verilog/gpio_hx1k.pcf verilog/gpio_hx8k.pcf
+# Behavioural SB_IO model used by Verilator and the formal flow.
+# Yosys/synth_ice40 substitutes the silicon primitive at synth
+# time so the synthesis path does not need this file on its
+# command line.
+GPIO_SIM_LIB := verilog/SB_IO.v
+
+verilog/gpio_%.pcf: src/gpio.nw | verilog
+	cd verilog && tangle gpio_$*.pcf < ../$<
+
+# The chapter owns the behavioural SB_IO stub used by the
+# Verilator and SymbiYosys flows; tangle it from this chapter
+# rather than depending on the frozen legacy spi chapter for
+# the same file.
+verilog/SB_IO.v: src/gpio.nw | verilog
+	cd verilog && tangle SB_IO.v < ../$<
 
 build/gpio/gpio.json: $(GPIO_VS) | build/gpio
 	cd build/gpio && yosys -q -p "read_verilog ../../verilog/gpio.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v; synth_ice40 -top gpio -json gpio.json"
 
-build/gpio/sim: tb/tb_gpio.sv $(GPIO_VS) | build/gpio
-	cd build/gpio && verilator --Mdir obj_dir -Wall --binary --top-module tb_gpio ../../tb/tb_gpio.sv ../../verilog/gpio.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v
+# Legacy compatibility shim: callers that pre-date the
+# BOARDS_gpio split still invoke `make -C fpga
+# build/gpio/gpio.bin` expecting the iCEstick bitstream
+# (matches the historical single-target default). Forward
+# the request to the hx1k per-board output so those callers
+# (e.g. missions/fpga-spi.md) keep working.
+build/gpio/gpio.bin: build/gpio/hx1k/gpio.bin
+	cp $< $@
+
+build/gpio/sim: tb/tb_gpio.sv $(GPIO_VS) $(GPIO_SIM_LIB) | build/gpio
+	cd build/gpio && verilator --Mdir obj_dir -Wall --binary --top-module tb_gpio ../../tb/tb_gpio.sv ../../verilog/gpio.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v ../../verilog/SB_IO.v
 	cd build/gpio && obj_dir/Vtb_gpio
 	@touch $@
 
-build/gpio/formal: build/gpio/gpio.sby $(GPIO_VS)
+build/gpio/formal: build/gpio/gpio.sby $(GPIO_VS) $(GPIO_SIM_LIB)
 	cd build/gpio && sby -f gpio.sby
 	@touch $@
 
-bitstream: build/gpio/gpio.bin
 sim: build/gpio/sim
 formal: build/gpio/formal
 @
