@@ -3,12 +3,14 @@
 module tb_spi_1lane;
    reg        cs_n = 1'b1;
    reg        sclk = 1'b0;
+   reg        clk = 1'b0;
    wire [3:0] io;
+   always #1 clk <= ~clk;
    pullup pu0 (io[0]);
    pullup pu1 (io[1]);
    pullup pu2 (io[2]);
    pullup pu3 (io[3]);
-   spi #(.LANES(1)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+   spi #(.LANES(1)) dut (.clk(clk), .cs_n(cs_n), .sclk(sclk), .io(io));
    integer   errs;
    reg [7:0] rx_io0;
    reg [7:0] rx_io1;
@@ -38,11 +40,12 @@ module tb_spi_1lane;
          for (k = 0; k < count; k = k + 1)
             clock_byte(k);
          #5 cs_n = 1'b1;
-         #20;
+         #20000;
       end
    endtask
    task automatic cs_high_quiet;
       begin
+         #20000;
          #5 sclk = 1'b1;
          if (io !== 4'b1111) begin
             $display("FAIL cs-high: io=%b expected 1111 (slave should release)",
@@ -62,8 +65,10 @@ module tb_spi_1lane;
       cs_high_quiet();
       if (errs == 0)
          $display("PASS tb_spi_1lane: 4352 bytes plus CS-high checks match");
-      else
+      else begin
          $display("FAIL tb_spi_1lane: %0d mismatches", errs);
+         $fatal(1);
+      end
       $finish;
    end
 endmodule

@@ -2,18 +2,18 @@
 
 module tb_blinky;
    localparam PERIOD = 10;
-   
+
    reg  clk;
    wire led;
-   
+
    blinky #(.PERIOD(PERIOD)) dut (
       .clk(clk), .led(led)
    );
-   
+
    // clock: 10ns period
    initial clk = 0;
    always #5 clk <= ~clk;
-   
+
    integer toggle_count;
    integer cycle_count;
    reg prev_led;
@@ -21,7 +21,7 @@ module tb_blinky;
       toggle_count = 0;
       cycle_count = 0;
       prev_led = led;
-   
+
       repeat (5 * PERIOD) begin
          @(negedge clk);
          cycle_count = cycle_count + 1;
@@ -37,7 +37,7 @@ module tb_blinky;
          end
          prev_led = led;
       end
-   
+
       if (toggle_count != 5) begin
          $display("FAIL: exp 5 toggles, got %0d",
                   toggle_count);
