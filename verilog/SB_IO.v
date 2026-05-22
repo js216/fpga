@@ -1,31 +1,3 @@
-`ifdef YOSYS
-// Yosys (used by the SymbiYosys formal flow) cannot legalise the
-// `inout PACKAGE_PIN` port across `smt2` export, and does not
-// parse the `assign (weak0, weak1) ...` strength syntax that the
-// Verilator sim path uses to model the iCE40 IOB's weak
-// pull-up.  The formal flow exercises gpio's FSM, handshake and
-// drive-commit properties, none of which depend on the
-// silicon-level race between an external driver and the
-// internal pull-up; a non-bidirectional stub that drives
-// PACKAGE_PIN as an output and feeds D_OUT_0 straight back to
-// D_IN_0 is sufficient to keep the formal flow building while
-// the bench (synthesis) and the testbench (Verilator) get the
-// full behavioural model below.
-module SB_IO #(
-      parameter [5:0] PIN_TYPE    = 6'b000000,
-      parameter [0:0] PULLUP      = 1'b0,
-      parameter [0:0] NEG_TRIGGER = 1'b0
-   ) (
-      output PACKAGE_PIN,
-      input  OUTPUT_CLK,
-      input  OUTPUT_ENABLE,
-      input  D_OUT_0,
-      output D_IN_0
-   );
-   assign PACKAGE_PIN = OUTPUT_ENABLE ? D_OUT_0 : 1'b0;
-   assign D_IN_0      = OUTPUT_ENABLE ? D_OUT_0 : 1'b1;
-endmodule
-`else
 module SB_IO #(
       parameter [5:0] PIN_TYPE    = 6'b000000,
       parameter [0:0] PULLUP      = 1'b0,
@@ -35,32 +7,84 @@ module SB_IO #(
       input  OUTPUT_CLK,
       input  OUTPUT_ENABLE,
       input  D_OUT_0,
+      input  D_OUT_1,
       output D_IN_0
    );
    initial begin
       if (!((PIN_TYPE === 6'b101001 && NEG_TRIGGER === 1'b0) ||
-            (PIN_TYPE === 6'b100101 && NEG_TRIGGER === 1'b1))) begin
-         $display("ERROR SB_IO sim model only supports PIN_TYPE=101001 or PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
+            (PIN_TYPE === 6'b100101) ||
+            (PIN_TYPE === 6'b100001) ||
+            (PIN_TYPE === 6'b110101))) begin
+         $display("ERROR SB_IO sim model only supports PIN_TYPE=101001 NEG_TRIGGER=0, 100101, 100001, or 110101, got %b %b",
                   PIN_TYPE, NEG_TRIGGER);
          $finish;
       end
    end
+   /* DDR output flops (PIN_TYPE=100001).  With NEG_TRIGGER=1:
+    *   dout_q_0 captured at negedge OUTPUT_CLK,
+    *   dout_q_1 captured at posedge OUTPUT_CLK.
+    * Pad outputs dout_q_1 while OUTPUT_CLK high, dout_q_0 while low. */
    reg dout_reg;
-   initial dout_reg = 1'b0;
-   always @(negedge OUTPUT_CLK)
-      dout_reg <= D_OUT_0;
-   wire dout_selected = (PIN_TYPE === 6'b100101) ? dout_reg : D_OUT_0;
-   assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_selected : 1'bz;
-   // Behavioural pull-up: when the package pin is left high-impedance
-   // by every driver on the inout net, the iCE40 IOB's weak internal
-   // pull-up wins.  The sim attaches a non-strength pull only on the
-   // captured D_IN_0 side so the testbench's `assign gpio_line[i] =
-   // ext_en[i] ? ext_drv[i] : 1'bz;` continues to race the SB_IO
-   // output exactly as in silicon: whoever drives takes the line,
-   // and when both let go the pull-up resolves the read to 1.
-   wire d_in_pulled;
-   assign (weak0, weak1) d_in_pulled = PULLUP ? 1'b1 : 1'bz;
-   assign d_in_pulled = PACKAGE_PIN;
-   assign D_IN_0 = d_in_pulled;
+   reg dout_q_0_ddr;
+   reg dout_q_1_ddr;
+   reg oe_reg;
+   initial dout_reg     = 1'b0;
+   initial dout_q_0_ddr = 1'b0;
+   initial dout_q_1_ddr = 1'b0;
+   initial oe_reg       = 1'b0;
+   generate if (NEG_TRIGGER) begin : g_neg
+      always @(negedge OUTPUT_CLK) begin
+         dout_reg <= D_OUT_0;
+         dout_q_0_ddr <= D_OUT_0;
+         oe_reg <= OUTPUT_ENABLE;
+      end
+      always @(posedge OUTPUT_CLK)
+         dout_q_1_ddr <= D_OUT_1;
+   end else begin : g_pos
+      always @(posedge OUTPUT_CLK) begin
+         dout_reg <= D_OUT_0;
+         dout_q_0_ddr <= D_OUT_0;
+         oe_reg <= OUTPUT_ENABLE;
+      end
+      always @(negedge OUTPUT_CLK)
+         dout_q_1_ddr <= D_OUT_1;
+   end endgenerate
+   /* DDR dout selection per yosys cells_sim.v:
+    *   dout = (OUTPUT_CLK ^ NEG_TRIGGER) ? dout_q_0 : dout_q_1.
+    * With NEG_TRIGGER=1: clk high → dout_q_1 (latched at posedge),
+    *                     clk low  → dout_q_0 (latched at negedge).
+    * With NEG_TRIGGER=0: clk high → dout_q_0, clk low → dout_q_1. */
+   wire dout_ddr = (OUTPUT_CLK ^ NEG_TRIGGER) ? dout_q_0_ddr
+                                              : dout_q_1_ddr;
+   wire dout_selected = (PIN_TYPE === 6'b100001) ? dout_ddr :
+                        (PIN_TYPE === 6'b100101 ||
+                         PIN_TYPE === 6'b110101) ? dout_reg : D_OUT_0;
+   wire oe_selected = (PIN_TYPE === 6'b110101) ? oe_reg : OUTPUT_ENABLE;
+   assign PACKAGE_PIN = oe_selected ? dout_selected : 1'bz;
+   assign D_IN_0 = (PULLUP && (PACKAGE_PIN === 1'bz)) ? 1'b1 : PACKAGE_PIN;
 endmodule
-`endif
+
+/* verilator lint_off DECLFILENAME */
+module SB_LUT4 #(
+      parameter [15:0] LUT_INIT = 16'h0000
+   ) (
+      output O,
+      input  I0,
+      input  I1,
+      input  I2,
+      input  I3
+   );
+   wire [7:0] s3 = I3 ? LUT_INIT[15:8] : LUT_INIT[7:0];
+   wire [3:0] s2 = I2 ? s3[7:4] : s3[3:0];
+   wire [1:0] s1 = I1 ? s2[3:2] : s2[1:0];
+   assign #1 O = I0 ? s1[1] : s1[0];
+endmodule
+
+/* verilator lint_off DECLFILENAME */
+module SB_GB (
+      input  USER_SIGNAL_TO_GLOBAL_BUFFER,
+      output GLOBAL_BUFFER_OUTPUT
+   );
+   assign #1 GLOBAL_BUFFER_OUTPUT = USER_SIGNAL_TO_GLOBAL_BUFFER;
+endmodule
+/* verilator lint_on DECLFILENAME */

@@ -5,3 +5,4 @@ set_io io[0]   47
 set_io io[1]   44
 set_io io[2]   60
 set_io io[3]   48
+set_io tx      8

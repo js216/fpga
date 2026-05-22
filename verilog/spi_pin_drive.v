@@ -1,8 +1,10 @@
 module spi_pin_hiz (
+      input        clk,
       inout        cs_n,
       inout        sclk,
       inout  [3:0] io
    );
+   wire clk_unused = clk;
    wire [5:0] unused;
    SB_IO #(.PIN_TYPE(6'b000001)) i_sclk (.PACKAGE_PIN(sclk), .D_IN_0(unused[0]));
    SB_IO #(.PIN_TYPE(6'b000001)) i_cs_n (.PACKAGE_PIN(cs_n), .D_IN_0(unused[1]));
@@ -70,10 +72,12 @@ endmodule
 module spi_pin_drive #(
       parameter [5:0] MASK = 6'h00
    ) (
+      input        clk,
       output       cs_n,
       output       sclk,
       output [3:0] io
    );
+   wire clk_unused = clk;
    assign sclk  = MASK[0];
    assign cs_n  = MASK[1];
    assign io[0] = MASK[2];

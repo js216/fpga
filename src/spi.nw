@@ -18,15 +18,13 @@ QUADSPI raw read samples IO0 in 1-line data mode even though
 conventional SPI labels often call IO1/MISO the slave-output lane.
 Mirroring the pattern avoids making the raw-read benchmark depend
 on that naming ambiguity.
-`LANES=4` drives all four lanes through the same registered IOB output
-mode on the falling SCLK edge, fed by the posedge-stable stream state;
-the bench command is `b <len> 1 1`.
-The 4-lane case follows the convention
-the rest of this codebase has settled on: the STM32MP1 QUADSPI
-indirect-read engine assembles each byte as
-`{first_sample, second_sample}`, so the first sample of a byte
-cycle carries the upper nibble and the second sample carries the
-lower nibble.
+`LANES=4` drives all four lanes through transparent `SB_IO`
+outputs fed by the falling-edge fabric presenter. The STM32
+raw-stream path is data-only: CS low immediately enables the pad drivers and
+every SCLK cycle belongs to the payload. The normal quad payload is the
+literal incrementing counter as received by the MP135 raw QUADSPI path:
+high nibble of `data_byte` first, then low nibble, so the bytes placed in the
+MP135 QUADSPI receive FIFO are `00 01 02 ...` with no firmware-side decoding.
 
 === Why explicit `SB_IO` instances
 
@@ -48,30 +46,28 @@ pull-up: an undriven net in the TB resolves to `X`, which the
 existing `!==` check happens to flag in some stimulus shapes
 but not in others.
 
-The fix is to bypass tri-state inference entirely and
-instantiate `SB_IO` cells directly. The 1-lane pads use the unregistered
-iCE40 bidirectional form (`PIN_TYPE = 6'b101001`) and receive a shared
-fabric falling-edge presenter, so IO0 and IO1 observe the same launched
-bit. The 4-lane pads use registered IOB output mode and falling-edge
-capture, so quad data does not update on the same rising edge the master
-samples. `OUTPUT_ENABLE = ~cs_n` in all active pad modes.
+`SB_IO` cells directly. The 1-lane path uses the transparent iCE40
+bidirectional form (`PIN_TYPE = 6'b101001`) fed by a fabric falling-edge
+presenter. The 4-lane path uses the transparent bidirectional form
+(`PIN_TYPE = 6'b101001`) fed by a falling-edge fabric register, matching the
+best p5/sshift0 hardware phase.
 
 === Lane data path
 
-The byte-pattern counter `data_byte` advances after the master has
-sampled the final bit or nibble of each byte. In 1-lane mode that state
-update happens on the falling edge after the sample. In 4-lane mode the
-stream state advances on the sampling `posedge sclk`; a posedge-loaded
-`dout_quad` register presents the nibble intended for the next
-falling-edge pad-flop capture. The quad counter deliberately carries
-across CS-high gaps because the STM32MP135 QUADSPI peripheral can split
-one indirect read into short selected bursts while the FIFO is drained.
-Each observed microframe contains an even number of quad sample edges, so
-the nibble phase naturally returns to the upper half of the next byte at
-the end of each burst. The output starts at the first bit/nibble of byte 0, so the first rising edge in a
-freshly configured bitstream samples valid data. The `phase` counter narrows per variant:
-3 bits for 1-lane (eight rises per byte, MSB-first), 1 bit for 4-lane
-(two rises per byte, upper nibble first then lower).
+The 1-lane and 4-lane variants take different approaches to the wire
+payload, dictated by what the STM32MP1 QUADSPI master can verify
+end-to-end.
+
+In 1-lane mode the slave emits an MSB-first incrementing byte counter
+`data_byte` that advances on the falling edge after the master has
+sampled the final bit of each byte. The host's `crc32_expected(len)`
+matches that exact `0,1,2,...` byte stream.
+
+In 4-lane mode the slave emits the same incrementing byte counter, split
+across two SDR quad cycles in the order the MP135 raw receiver packs:
+`data_byte[7:4]` first, then `data_byte[3:0]`. The host FIFO therefore
+contains the raw byte stream `0x00, 0x01, 0x02, ...`, and the MP135
+stream path validates and CRCs those received bytes directly.
 
 The `dout_lane[3:0]` bus carries the value driven into the pads. For
 4-lane, every lane carries one bit of the selected nibble. For 1-lane,
@@ -86,93 +82,286 @@ explicit pad drivers and no fabric tri-state cells regardless of
 <<spi.v>>=
 module spi #(
       parameter LANES = 1,
-      parameter START_DELAY_CLKS = 0
+      parameter START_DELAY_CLKS = 0,
+      parameter FRAME_MODE = 0,
+      parameter DIAG_MODE = 0
    ) (
+      input        clk,
       input        cs_n,
       input        sclk,
       inout  [3:0] io
    );
+   <<SPI streaming: clocks>>
    <<SPI streaming: state>>
    <<SPI streaming: lane logic>>
    <<SPI streaming: io drivers>>
 endmodule
 @
 
-`data_byte` is shared across both variants; `oe` and `dout_lane`
-are the wires the IOB driver loop reads.
+Both variants keep their stream state in the raw SCLK domain. The 1-lane
+presenter advances on falling SCLK edges and drives transparent pads. The
+quad path advances on falling SCLK edges and drives transparent pads.
 
-<<SPI streaming: state>>=
-reg [7:0] data_byte;
-reg [15:0] start_delay_count;
-initial data_byte = 8'd0;
-initial start_delay_count = 16'd0;
-wire [3:0] dout_lane;
-wire start_ready = (START_DELAY_CLKS == 0) ||
-                   (start_delay_count >= START_DELAY_CLKS);
-wire oe = ~cs_n && start_ready;
-always @(posedge cs_n or posedge sclk) begin
-   if (cs_n)
-      start_delay_count <= 16'd0;
-   else if (!start_ready)
-      start_delay_count <= start_delay_count + 16'd1;
-end
+<<SPI streaming: clocks>>=
+wire sclk_stream = sclk;
+wire iob_output_clk = sclk;
 @
 
-The lane logic chunk holds the per-variant `phase` register,
-the edge counter, and the logic that drives `dout_lane`
-from `data_byte` and `phase`. The stream state advances only after each
-mode-0 rising-edge sample point has observed the current value. In
-4-lane mode the pad flop updates on the following falling edge from a
-posedge-loaded presenter register. Raising `cs_n` asynchronously returns both
-variants to byte zero for the next transaction.
+`data_byte` is shared across both variants; `oe` and `dout_lane`
+are the wires the IOB driver loop reads. CS assertion must arm the slave
+immediately, while CS release should not inject a metastable asynchronous
+reset into the SCLK presenter. The reset flop therefore falls directly on
+`negedge cs_n` and rises only after the 12 MHz synchronizer has seen
+CS high. That makes each selected frame deterministic while avoiding a
+raw asynchronous reset release from the CS rising edge.
+
+<<SPI streaming: state>>=
+/* verilator lint_off UNUSEDSIGNAL */
+reg [7:0] data_byte;
+/* verilator lint_on UNUSEDSIGNAL */
+/* verilator lint_off SYNCASYNCNET */
+reg [1:0] cs_sync;
+reg [11:0] cs_high_count;
+reg cs_s_d;
+/* verilator lint_off UNUSEDSIGNAL */
+reg cs_async_rst;
+/* verilator lint_on UNUSEDSIGNAL */
+/* verilator lint_on SYNCASYNCNET */
+initial data_byte = 8'd0;
+initial cs_sync = 2'b11;
+initial cs_high_count = 12'hfff;
+initial cs_s_d = 1'b1;
+initial cs_async_rst = 1'b1;
+wire [3:0] dout_lane;
+wire lane_ready;
+/* verilator lint_off UNUSEDSIGNAL */
+wire [3:0] io_d_in;
+/* verilator lint_on UNUSEDSIGNAL */
+wire quad_reseed_gap = &cs_high_count;
+wire oe = !cs_n && lane_ready;
+
+/* verilator lint_off SYNCASYNCNET */
+always @(posedge clk) begin
+   cs_sync <= {cs_sync[0], cs_n};
+   cs_s_d <= cs_sync[1];
+   if (cs_sync[1]) begin
+      if (!quad_reseed_gap)
+         cs_high_count <= cs_high_count + 12'd1;
+   end else begin
+      cs_high_count <= 12'd0;
+   end
+end
+
+always @(posedge clk or negedge cs_n) begin
+   if (!cs_n)
+      cs_async_rst <= 1'b0;
+   else
+      cs_async_rst <= cs_s_d;
+end
+
+/* verilator lint_on SYNCASYNCNET */
+@
+
+The lane logic chunk holds the per-variant presenter logic that
+drives `dout_lane`. In 1-lane mode it is a serialiser fed by the
+shared `data_byte` register and an 8-step `phase` counter. In 4-lane
+mode it is an immediate two-nibble presenter for raw indirect reads.
 
 <<SPI streaming: lane logic>>=
 generate if (LANES == 4) begin : g_quad
-   <<SPI streaming: quad lane>>
+   if (FRAME_MODE != 0) begin : g_framed
+      <<SPI streaming: framed quad lane>>
+   end else begin : g_immediate
+      <<SPI streaming: immediate quad lane>>
+   end
 end else begin : g_one
    <<SPI streaming: single lane>>
 end endgenerate
 @
 
-For 4-lane the presenter preloads the lower nibble after the
-`phase == 0` sample, and the next byte's upper nibble after the
-`phase == 1` sample, matching
-the STM32MP1 QUADSPI indirect-read assembly of
-`{first_sample, second_sample}`. Raising `cs_n` returns `data_byte`
-and `phase` to zero so each transaction begins from a deterministic
-seed; this is what lets two back-to-back indirect reads of the same
-length produce bit-identical streams (the `T` twin-MDMA bench), and
-matches the 1-lane variant's behaviour. Continuation across the
-QSPI controller's microframes is not relied on by the master --- the
-bench drives one MDMA-managed read per CS-low interval and resets the
-expected pattern at each `qspi_mdma_read` call.
+The immediate 4-lane presenter is retained for data-only experiments. In
+mission raw mode the STM32 uses a normal `0x6B` Quad Output Read frame,
+then validates only the QUADSPI data phase. The framed presenter captures
+the low address byte and starts the raw counter from `address[7:0]` on the
+first data cycle. A memory-mapped master may split one logical read into
+short CS-low microframes; seeding each frame from its address keeps the
+received bytes equal to the literal raw stream offset, still with no
+firmware-side decode.
 
-<<SPI streaming: quad lane>>=
-reg phase;
-reg [3:0] dout_quad;
-wire [3:0] next_byte_upper = data_byte[7:4] + {3'b000, &data_byte[3:0]};
-initial phase = 1'b0;
-initial dout_quad = 4'd0;
-always @(posedge cs_n or posedge sclk) begin
-   if (cs_n) begin
-      /* Reset to a known seed on every CS rising edge.  Without this
-       * the slave's `data_byte` carries whatever value the previous
-       * transaction (or even the QSPI controller's boot-time JEDEC
-       * polling) left behind, plus any extra SCK pulses generated
-       * during the master's ABORT/teardown sequence.  Two consecutive
-       * 16 MiB indirect reads then start at different bytes and the
-       * `T`-command twin compare flags spurious mismatches. */
+For immediate 4-lane raw reads the master does not send an instruction/address phase
+to the FPGA. The first selected SCLK cycle must therefore return the first
+payload nibble. The presenter advances on falling SCLK edges, the same edge
+that launches the next quad nibble toward the STM32. The STM32 QUADSPI data
+phase is SDR: one quad nibble per SCLK cycle. It is not DDR, so the counter
+advances once per launch cycle rather than once per half-cycle.
+
+<<SPI streaming: immediate quad lane>>=
+/* verilator lint_off UNUSEDSIGNAL */
+reg [3:0] quad_dout;
+/* verilator lint_on UNUSEDSIGNAL */
+reg quad_low_phase;
+initial quad_dout = 4'd0;
+initial quad_low_phase = 1'b1;
+function [3:0] quad_diag_nibble;
+   input [7:0] idx;
+   begin
+      case (DIAG_MODE)
+         1: quad_diag_nibble = idx[3:0];
+         2: begin
+            case (idx[1:0])
+               2'd0: quad_diag_nibble = 4'h1;
+               2'd1: quad_diag_nibble = 4'h2;
+               2'd2: quad_diag_nibble = 4'h4;
+               default: quad_diag_nibble = 4'h8;
+            endcase
+         end
+         3: quad_diag_nibble = idx[0] ? 4'hf : 4'h0;
+         4: quad_diag_nibble = idx[7:4];
+         5: quad_diag_nibble = idx[0] ? 4'h1 : 4'h0;
+         6: quad_diag_nibble = idx[0] ? 4'h2 : 4'h0;
+         7: quad_diag_nibble = idx[0] ? 4'h4 : 4'h0;
+         8: quad_diag_nibble = idx[0] ? 4'h8 : 4'h0;
+         default: quad_diag_nibble = 4'h0;
+      endcase
+   end
+endfunction
+function [3:0] quad_payload_nibble;
+   input [7:0] byte_value;
+   input low_phase;
+   begin
+      if (DIAG_MODE == 0)
+         quad_payload_nibble = low_phase ? byte_value[3:0]
+                                          : byte_value[7:4];
+      else
+         quad_payload_nibble = quad_diag_nibble({byte_value[6:0], low_phase});
+   end
+endfunction
+always @(posedge cs_async_rst or posedge sclk_stream) begin
+   if (cs_async_rst) begin
       data_byte <= 8'd0;
-      dout_quad <= 4'd0;
-      phase     <= 1'b0;
-   end else if (start_ready) begin
-      dout_quad <= phase ? next_byte_upper : data_byte[3:0];
-      phase <= ~phase;
-      if (phase)
+      quad_dout <= quad_payload_nibble(8'd0, 1'b1);
+      quad_low_phase <= 1'b1;
+   end else if (!cs_n) begin
+      if (quad_low_phase) begin
+         quad_dout <= quad_payload_nibble(data_byte, 1'b0);
+         quad_low_phase <= 1'b0;
+      end else begin
          data_byte <= data_byte + 8'd1;
+         quad_dout <= quad_payload_nibble(data_byte + 8'd1, 1'b1);
+         quad_low_phase <= 1'b1;
+      end
    end
 end
-assign dout_lane = dout_quad;
+assign lane_ready = 1'b1;
+assign dout_lane = quad_dout;
+@
+
+The framed raw presenter accepts exactly the wire shape emitted by the MP135
+raw-quad path: 8-bit `0x6B` instruction on IO0, 24 address bits on IO0, then
+eight dummy clocks. It counts the fixed prefix, captures the low address byte,
+and advances the payload on falling SCLK edges. The first QUADSPI data sample
+therefore sees the first raw payload nibble, not any instruction/address/dummy
+material. The STM32 packs the first physical quad nibble into the low half of
+each received byte, so the raw counter launches low nibble first.
+
+<<SPI streaming: framed quad lane>>=
+localparam [5:0] FRAME_PREFIX_CLKS = 6'd40; /* 8 opcode + 24 addr + 8 dummy */
+/* verilator lint_off UNUSEDSIGNAL */
+reg [3:0] quad_dout;
+/* verilator lint_on UNUSEDSIGNAL */
+reg [5:0] frame_edges;
+reg [5:0] frame_fall_edges;
+reg [7:0] frame_addr_lsb;
+reg quad_drive;
+reg quad_low_phase;
+reg payload_active;
+initial quad_dout = 4'd0;
+initial frame_edges = 6'd0;
+initial frame_fall_edges = 6'd0;
+initial frame_addr_lsb = 8'd0;
+initial quad_drive = 1'b0;
+initial quad_low_phase = 1'b1;
+initial payload_active = 1'b0;
+function [3:0] quad_diag_nibble;
+   input [7:0] idx;
+   begin
+      case (DIAG_MODE)
+         1: quad_diag_nibble = idx[3:0];
+         2: begin
+            case (idx[1:0])
+               2'd0: quad_diag_nibble = 4'h1;
+               2'd1: quad_diag_nibble = 4'h2;
+               2'd2: quad_diag_nibble = 4'h4;
+               default: quad_diag_nibble = 4'h8;
+            endcase
+         end
+         3: quad_diag_nibble = idx[0] ? 4'hf : 4'h0;
+         4: quad_diag_nibble = idx[7:4];
+         5: quad_diag_nibble = idx[0] ? 4'h1 : 4'h0;
+         6: quad_diag_nibble = idx[0] ? 4'h2 : 4'h0;
+         7: quad_diag_nibble = idx[0] ? 4'h4 : 4'h0;
+         8: quad_diag_nibble = idx[0] ? 4'h8 : 4'h0;
+         default: quad_diag_nibble = 4'h0;
+      endcase
+   end
+endfunction
+function [3:0] quad_payload_nibble;
+   input [7:0] byte_value;
+   input low_phase;
+   begin
+      if (DIAG_MODE == 0)
+         quad_payload_nibble = low_phase ? byte_value[3:0]
+                                          : byte_value[7:4];
+      else
+         quad_payload_nibble = quad_diag_nibble({byte_value[6:0], low_phase});
+   end
+endfunction
+always @(posedge cs_async_rst or posedge sclk_stream) begin
+   if (cs_async_rst) begin
+      frame_edges <= 6'd0;
+      frame_addr_lsb <= 8'd0;
+      quad_drive <= 1'b0;
+   end else if (!cs_n) begin
+      if (frame_edges < FRAME_PREFIX_CLKS)
+         frame_edges <= frame_edges + 6'd1;
+      if (frame_edges >= 6'd24 && frame_edges < 6'd32)
+         frame_addr_lsb <= {frame_addr_lsb[6:0], io_d_in[0]};
+      if (frame_edges == FRAME_PREFIX_CLKS - 6'd1)
+         quad_drive <= 1'b1;
+   end
+end
+always @(posedge cs_async_rst or negedge sclk_stream) begin
+   if (cs_async_rst) begin
+      data_byte <= 8'd0;
+      quad_dout <= quad_payload_nibble(8'd0, 1'b1);
+      frame_fall_edges <= 6'd0;
+      quad_low_phase <= 1'b1;
+      payload_active <= 1'b0;
+   end else if (!cs_n) begin
+      if (!payload_active) begin
+         if (frame_fall_edges < FRAME_PREFIX_CLKS - 6'd1) begin
+            frame_fall_edges <= frame_fall_edges + 6'd1;
+         end else if (frame_fall_edges == FRAME_PREFIX_CLKS - 6'd1) begin
+            frame_fall_edges <= FRAME_PREFIX_CLKS;
+            payload_active <= 1'b1;
+            data_byte <= frame_addr_lsb;
+            quad_dout <= quad_payload_nibble(frame_addr_lsb, 1'b1);
+            quad_low_phase <= 1'b1;
+         end
+      end else begin
+         if (quad_low_phase) begin
+            quad_dout <= quad_payload_nibble(data_byte, 1'b0);
+            quad_low_phase <= 1'b0;
+         end else begin
+            data_byte <= data_byte + 8'd1;
+            quad_dout <= quad_payload_nibble(data_byte + 8'd1, 1'b1);
+            quad_low_phase <= 1'b1;
+         end
+      end
+   end
+end
+assign lane_ready = quad_drive;
+assign dout_lane = quad_dout;
 @
 
 For 1-lane the fabric falling-edge presenter picks
@@ -186,12 +375,13 @@ reg dout_one;
 wire [7:0] data_byte_next = data_byte + 8'd1;
 initial phase = 3'd0;
 initial dout_one = 1'b0;
-always @(posedge cs_n or negedge sclk) begin
-   if (cs_n) begin
+assign lane_ready = (START_DELAY_CLKS == 0);
+always @(posedge cs_async_rst or negedge sclk_stream) begin
+   if (cs_async_rst) begin
       data_byte <= 8'd0;
       phase     <= 3'd0;
       dout_one  <= 1'b0;
-   end else if (start_ready) begin
+   end else if (lane_ready) begin
       if (phase == 3'd7) begin
          data_byte <= data_byte_next;
          phase     <= 3'd0;
@@ -208,28 +398,23 @@ assign dout_lane[2] = 1'b0;
 assign dout_lane[3] = 1'b0;
 @
 
-The IO driver uses one explicit iCE40 `SB_IO` per pad. In 1-lane mode,
-the fabric `dout_one` register performs the falling-edge launch and feeds
-unregistered output-enable pads. Quad mode uses registered pad output
-mode and falling-edge IOB capture; `D_OUT_0` comes from the
-posedge-loaded `dout_quad` presenter. The quad byte counter and nibble
-phase carry across CS-high gaps so STM32 FIFO-drain microframes continue
-the stream.
+The IO driver uses one explicit iCE40 `SB_IO` per pad. Quad mode feeds
+transparent `SB_IO` outputs from the falling-edge fabric presenter registers.
+The explicit primitive keeps output enable in the pad cell instead of
+inferring fabric tri-states.
 
 <<SPI streaming: io drivers>>=
 genvar g;
-wire [3:0] io_d_in_unused;
 generate if (LANES == 4) begin : g_quad_io
-   for (g = 0; g < 4; g = g + 1) begin : g_io
-      SB_IO #(
-         .PIN_TYPE(6'b100101),
-         .NEG_TRIGGER(1'b1)
-      ) iob (
+	   for (g = 0; g < 4; g = g + 1) begin : g_io
+	      SB_IO #(
+	         .PIN_TYPE(6'b101001)
+	      ) iob (
          .PACKAGE_PIN(io[g]),
-         .OUTPUT_CLK(sclk),
+         .OUTPUT_CLK(iob_output_clk),
          .OUTPUT_ENABLE(oe),
          .D_OUT_0(dout_lane[g]),
-         .D_IN_0(io_d_in_unused[g])
+         .D_IN_0(io_d_in[g])
       );
    end
 end else begin : g_one_io
@@ -237,12 +422,12 @@ end else begin : g_one_io
       SB_IO #(
          .PIN_TYPE(6'b101001)
       ) iob (
-         .PACKAGE_PIN(io[g]),
-         .OUTPUT_CLK(sclk),
-         .OUTPUT_ENABLE(oe),
-         .D_OUT_0(dout_lane[g]),
-         .D_IN_0(io_d_in_unused[g])
-      );
+            .PACKAGE_PIN(io[g]),
+            .OUTPUT_CLK(iob_output_clk),
+            .OUTPUT_ENABLE(oe),
+            .D_OUT_0(dout_lane[g]),
+            .D_IN_0(io_d_in[g])
+         );
    end
 end endgenerate
 @
@@ -253,6 +438,7 @@ iCEstick pin numbers, mirroring the `jedec` chapter so the same
 physical wires reach the MP135 `CN8` connector.
 
 <<spi.pcf>>=
+set_io clk     21
 set_io cs_n    56
 set_io sclk    45
 set_io io[0]   47
@@ -274,10 +460,12 @@ The bit order intentionally matches the MP135 `g`/`G` commands:
 
 <<spi_pin_drive.v>>=
 module spi_pin_hiz (
+      input        clk,
       inout        cs_n,
       inout        sclk,
       inout  [3:0] io
    );
+   wire clk_unused = clk;
    wire [5:0] unused;
    SB_IO #(.PIN_TYPE(6'b000001)) i_sclk (.PACKAGE_PIN(sclk), .D_IN_0(unused[0]));
    SB_IO #(.PIN_TYPE(6'b000001)) i_cs_n (.PACKAGE_PIN(cs_n), .D_IN_0(unused[1]));
@@ -345,10 +533,12 @@ endmodule
 module spi_pin_drive #(
       parameter [5:0] MASK = 6'h00
    ) (
+      input        clk,
       output       cs_n,
       output       sclk,
       output [3:0] io
    );
+   wire clk_unused = clk;
    assign sclk  = MASK[0];
    assign cs_n  = MASK[1];
    assign io[0] = MASK[2];
@@ -402,7 +592,7 @@ module spi_debug #(
       inout  [3:0] io,
       output       tx
    );
-   spi #(.LANES(1)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+   spi #(.LANES(1)) dut (.clk(clk), .cs_n(cs_n), .sclk(sclk), .io(io));
 
    reg        cs_meta, cs_sync;
    reg        selected_prev;
@@ -568,20 +758,18 @@ set_io io[3]   48
 
 === Quad raw observer top
 
-The `spi_quad_debug` top mirrors the current raw 4-lane stream and adds
-one UART report for the transaction just observed. The drive logic keeps
-the same carry-across byte counter used by `spi_quad.bin`; the extra
-logic only watches CS, SCLK, and IO[3:0]. Capture runs in the SCLK/CS
-domain so it can observe `p 11` traffic without relying on the 12 MHz
-UART clock to sample a 54 MHz serial clock.
+The `spi_quad_debug` top mirrors the current falling-launch quad
+presenter and adds one UART report for the transaction just observed.
+Capture runs in the SCLK/CS domain so it can observe traffic without
+relying on the 12 MHz UART clock to sample a fast serial clock.
 
 After CS rises, the 12 MHz side prints:
 
    Q F=xx E=xxxx N=<32 nibbles>
 
 `F` is the low byte of the observed frame count, `E` is the number of
-selected SCLK rising edges in the frame, and `N` is the first 32 quad
-nibbles sampled at those rising edges.
+selected SCLK rising-edge sample points in the frame, and `N` is the
+first 32 quad nibbles sampled at those rising edges.
 
 <<spi_quad_debug.v>>=
 module spi_quad_debug #(
@@ -593,26 +781,50 @@ module spi_quad_debug #(
       inout  [3:0] io,
       output       tx
    );
-   reg [7:0] q_data_byte;
-   reg q_phase;
+   wire sclk_clk;
+   SB_GB sclk_gbuf (
+      .USER_SIGNAL_TO_GLOBAL_BUFFER(sclk),
+      .GLOBAL_BUFFER_OUTPUT(sclk_clk)
+   );
+
+   localparam CS_HIGH_RESET_BITS = 2;
+   reg [CS_HIGH_RESET_BITS-1:0] q_cs_high_count;
+   reg q_cs_debounced_high;
+   reg [8:0] q_sample_idx;
    reg [3:0] q_dout_quad;
-   wire [3:0] q_next_byte_upper = q_data_byte[7:4] + {3'b000, &q_data_byte[3:0]};
-   wire q_oe = ~cs_n;
+   wire [8:0] q_next_sample_idx = q_sample_idx + 9'd1;
+   wire [3:0] q_next_sample_nibble =
+      q_next_sample_idx[0] ? q_next_sample_idx[4:1] :
+                             q_next_sample_idx[8:5];
+   wire [3:0] q_iob_dout = q_cs_debounced_high ? 4'd0 : q_dout_quad;
+   wire q_oe = !q_cs_debounced_high;
 
    initial begin
-      q_data_byte = 8'd0;
-      q_phase = 1'b0;
+      q_cs_high_count = {CS_HIGH_RESET_BITS{1'b0}};
+      q_cs_debounced_high = 1'b1;
+      q_sample_idx = 9'd0;
       q_dout_quad = 4'd0;
    end
 
-   always @(posedge cs_n or posedge sclk) begin
-      if (cs_n) begin
-         q_phase <= 1'b0;
+   always @(negedge cs_n or posedge clk) begin
+      if (!cs_n) begin
+         q_cs_high_count <= {CS_HIGH_RESET_BITS{1'b0}};
+         q_cs_debounced_high <= 1'b0;
+      end else if (!q_cs_debounced_high) begin
+         q_cs_high_count <= q_cs_high_count +
+                            {{(CS_HIGH_RESET_BITS-1){1'b0}}, 1'b1};
+         if (q_cs_high_count[0])
+            q_cs_debounced_high <= 1'b1;
+      end
+   end
+
+   always @(posedge q_cs_debounced_high or posedge sclk_clk) begin
+      if (q_cs_debounced_high) begin
+         q_sample_idx <= 9'd0;
+         q_dout_quad <= 4'd0;
       end else begin
-         q_dout_quad <= q_phase ? q_next_byte_upper : q_data_byte[3:0];
-         q_phase <= ~q_phase;
-         if (q_phase)
-            q_data_byte <= q_data_byte + 8'd1;
+         q_sample_idx <= q_next_sample_idx;
+         q_dout_quad <= q_next_sample_nibble;
       end
    end
 
@@ -624,9 +836,9 @@ module spi_quad_debug #(
          .NEG_TRIGGER(1'b1)
       ) iob (
          .PACKAGE_PIN(io[qg]),
-         .OUTPUT_CLK(sclk),
+         .OUTPUT_CLK(sclk_clk),
          .OUTPUT_ENABLE(q_oe),
-         .D_OUT_0(q_dout_quad[qg]),
+         .D_OUT_0(q_iob_dout[qg]),
          .D_IN_0(q_io_sample[qg])
       );
    end endgenerate
@@ -656,7 +868,7 @@ module spi_quad_debug #(
    always @(negedge cs_n)
       frame_count <= frame_count + 8'd1;
 
-   always @(posedge cs_n or posedge sclk) begin
+   always @(posedge cs_n or posedge sclk_clk) begin
       if (cs_n) begin
          active <= 1'b0;
          edge_count <= 16'd0;
@@ -792,23 +1004,24 @@ endfunction
 yosys recognises `SB_IO` as a built-in iCE40 primitive and
 needs no help from us during synthesis. verilator does not, so
 the testbench is compiled against a stand-alone behavioural
-model that covers exactly the pad configurations our DUT uses:
-unregistered output-enable pads (`PIN_TYPE = 6'b101001`) and
-falling-edge registered output-enable pads (`PIN_TYPE = 6'b100101` with
-`NEG_TRIGGER = 1`). Any other configuration is rejected at
-elaboration so a future change to the DUT does not silently desync
-the sim from the synth path.
+model that covers the pad configurations this chapter uses: transparent
+output-enable pads (`PIN_TYPE = 6'b101001`) and the registered
+bidirectional pads (`PIN_TYPE = 6'b100101`) still used by static pin-drive
+helpers. Any other configuration is rejected at elaboration so a future
+change to the DUT does not silently desync the sim from the synth path.
 
 The model either passes `D_OUT_0` directly for unregistered pads or owns
-one falling-edge output register for registered pads, then gates the
-selected output through `OUTPUT_ENABLE`. When the slave releases the bus
-the inout port is driven to `1'bz`, and `D_IN_0` mirrors the package pin
-for pad readback. The testbench attaches a `pullup` per lane to model the
+one edge-selected output register for registered pads, then gates the
+selected output through `OUTPUT_ENABLE`. `SB_GB` is still modelled for
+debug modules that instantiate it. When the slave releases the bus the inout
+port is driven to `1'bz`, and `D_IN_0` mirrors the package pin for pad
+readback. The testbench attaches a `pullup` per lane to model the
 master-side MISO pull-up.
 
 <<SB_IO.v>>=
 module SB_IO #(
       parameter [5:0] PIN_TYPE    = 6'b000000,
+      parameter [0:0] PULLUP      = 1'b0,
       parameter [0:0] NEG_TRIGGER = 1'b0
    ) (
       inout  PACKAGE_PIN,
@@ -819,20 +1032,52 @@ module SB_IO #(
    );
    initial begin
       if (!((PIN_TYPE === 6'b101001 && NEG_TRIGGER === 1'b0) ||
-            (PIN_TYPE === 6'b100101 && NEG_TRIGGER === 1'b1))) begin
-         $display("ERROR SB_IO sim model only supports PIN_TYPE=101001 or PIN_TYPE=100101 NEG_TRIGGER=1, got %b %b",
+            (PIN_TYPE === 6'b100101))) begin
+         $display("ERROR SB_IO sim model only supports PIN_TYPE=101001 NEG_TRIGGER=0 or PIN_TYPE=100101, got %b %b",
                   PIN_TYPE, NEG_TRIGGER);
          $finish;
       end
    end
    reg dout_reg;
    initial dout_reg = 1'b0;
-   always @(negedge OUTPUT_CLK)
-      dout_reg <= D_OUT_0;
+   generate if (NEG_TRIGGER) begin : g_neg
+      always @(negedge OUTPUT_CLK) begin
+         dout_reg <= D_OUT_0;
+      end
+   end else begin : g_pos
+      always @(posedge OUTPUT_CLK) begin
+         dout_reg <= D_OUT_0;
+      end
+   end endgenerate
    wire dout_selected = (PIN_TYPE === 6'b100101) ? dout_reg : D_OUT_0;
    assign PACKAGE_PIN = OUTPUT_ENABLE ? dout_selected : 1'bz;
-   assign D_IN_0 = PACKAGE_PIN;
+   assign D_IN_0 = (PULLUP && (PACKAGE_PIN === 1'bz)) ? 1'b1 : PACKAGE_PIN;
 endmodule
+
+/* verilator lint_off DECLFILENAME */
+module SB_LUT4 #(
+      parameter [15:0] LUT_INIT = 16'h0000
+   ) (
+      output O,
+      input  I0,
+      input  I1,
+      input  I2,
+      input  I3
+   );
+   wire [7:0] s3 = I3 ? LUT_INIT[15:8] : LUT_INIT[7:0];
+   wire [3:0] s2 = I2 ? s3[7:4] : s3[3:0];
+   wire [1:0] s1 = I1 ? s2[3:2] : s2[1:0];
+   assign #1 O = I0 ? s1[1] : s1[0];
+endmodule
+
+/* verilator lint_off DECLFILENAME */
+module SB_GB (
+      input  USER_SIGNAL_TO_GLOBAL_BUFFER,
+      output GLOBAL_BUFFER_OUTPUT
+   );
+   assign #1 GLOBAL_BUFFER_OUTPUT = USER_SIGNAL_TO_GLOBAL_BUFFER;
+endmodule
+/* verilator lint_on DECLFILENAME */
 @
 
 === Testbench
@@ -855,9 +1100,10 @@ Two testbenches, one per `LANES` variant, share the same shape:
   - **Quad paused frame.** The 4-lane bench also holds SCLK high and
     low inside a short frame, modelling peripheral backpressure without
     adding extra sample edges.
-  - **CS-high quiet checks between frames and at the end.** Re-assert
-    that the slave releases the bus and let registered pads preload
-    byte-zero data before the next selected frame.
+  - **CS-high checks between frames and at the end.** Re-assert that the
+    slave releases the bus after long idle gaps. The quad bench also covers
+    a short CS-high continuation gap with no repeated header, matching the
+    STM32MP1 memory-mapped refill shape.
 
 Each TB is built from named chunks: signals (with master-side
 pull-ups), a per-byte sampler that owns the mode-0 sample
@@ -883,12 +1129,14 @@ the IOB output enable never asserts.
 <<tb_1lane: signals>>=
 reg        cs_n = 1'b1;
 reg        sclk = 1'b0;
+reg        clk = 1'b0;
 wire [3:0] io;
+always #1 clk <= ~clk;
 pullup pu0 (io[0]);
 pullup pu1 (io[1]);
 pullup pu2 (io[2]);
 pullup pu3 (io[3]);
-spi #(.LANES(1)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+spi #(.LANES(1)) dut (.clk(clk), .cs_n(cs_n), .sclk(sclk), .io(io));
 integer   errs;
 reg [7:0] rx_io0;
 reg [7:0] rx_io1;
@@ -932,11 +1180,12 @@ task automatic frame(input integer count);
       for (k = 0; k < count; k = k + 1)
          clock_byte(k);
       #5 cs_n = 1'b1;
-      #20;
+      #20000;
    end
 endtask
 task automatic cs_high_quiet;
    begin
+      #20000;
       #5 sclk = 1'b1;
       if (io !== 4'b1111) begin
          $display("FAIL cs-high: io=%b expected 1111 (slave should release)",
@@ -959,20 +1208,24 @@ initial begin
    cs_high_quiet();
    if (errs == 0)
       $display("PASS tb_spi_1lane: 4352 bytes plus CS-high checks match");
-   else
+   else begin
       $display("FAIL tb_spi_1lane: %0d mismatches", errs);
+      $fatal(1);
+   end
    $finish;
 end
 @
 
-The 4-lane TB mirrors the 1-lane shape, expected byte stream,
-pull-up modelling, and `errs` accumulator, but the sampler reads all
-four `io` lines on each rise and reassembles the byte as
-`{first_sample, second_sample}`. It also adds a short paused frame to
-hold SCLK between sample edges. Each CS-low interval is checked
-against the same byte-incrementing seed starting at zero because the
-4-lane DUT now resets `data_byte` on CS rising (matching the 1-lane
-variant); this is the property the `T` twin-MDMA bench relies on.
+The 4-lane TB mirrors the 1-lane shape, pull-up modelling, and `errs`
+accumulator. The sampler reads all four `io` lines at the late shifted
+sample point in the SCLK high phase. STM32 raw quad is SDR:
+with `CCR.DDRM=0`, `DMODE=3` consumes one quad nibble per full SCLK
+cycle. The high-speed hardware gate uses `SSHIFT=1`, so the value must be
+stable at the late sample point until the next falling-edge presenter update.
+The TB reassembles the host-visible
+byte as `{first_sample, second_sample}` and adds a paused frame to expose
+accidental mid-high changes. It also includes repeated CS-low bursts so
+the raw counter reset is checked across independent selected reads.
 
 <<tb_spi_quad.sv>>=
 `timescale 1ns/1ps
@@ -988,69 +1241,162 @@ endmodule
 <<tb_quad: signals>>=
 reg        cs_n = 1'b1;
 reg        sclk = 1'b0;
+reg        clk = 1'b0;
 wire [3:0] io;
+reg        master_oe = 1'b0;
+reg        master_io0 = 1'b0;
+always #42 clk <= ~clk;
+assign io[0] = master_oe ? master_io0 : 1'bz;
 pullup pu0 (io[0]);
 pullup pu1 (io[1]);
 pullup pu2 (io[2]);
-pullup pu3 (io[3]);
-spi #(.LANES(4)) dut (.cs_n(cs_n), .sclk(sclk), .io(io));
+   pullup pu3 (io[3]);
+   spi #(.LANES(4), .FRAME_MODE(1)) dut (
+      .clk(clk), .cs_n(cs_n), .sclk(sclk), .io(io));
 integer    errs;
+/* verilator lint_off UNUSEDSIGNAL */
+reg [3:0]  first_edge_sample, second_edge_sample;
+/* verilator lint_on UNUSEDSIGNAL */
 reg [3:0]  first_sample, second_sample;
+reg [3:0]  first_late_sample, second_late_sample;
 reg [7:0]  rx;
 @
 
 <<tb_quad: byte sampler>>=
-task automatic clock_byte(input integer expected);
-   begin
-      #5 sclk = 1'b1;
-      #1;
-      first_sample = io;
-      #4 sclk = 1'b0;
-      #5 sclk = 1'b1;
-      #1;
-      second_sample = io;
-      #4 sclk = 1'b0;
-      rx = {first_sample, second_sample};
-      if (rx !== expected[7:0]) begin
+   task automatic clock_cmd_bit(input bitval);
+      begin
+         master_io0 = bitval;
+         #5;
+         sclk = 1'b1;
+         #10;
+         sclk = 1'b0;
+         #5;
+      end
+   endtask
+
+   task automatic clock_dummy_bit;
+      begin
+         #5;
+         sclk = 1'b1;
+         #10;
+         sclk = 1'b0;
+         #5;
+      end
+   endtask
+
+   task automatic send_cmd_byte(input [7:0] value);
+      integer bitidx;
+      begin
+         for (bitidx = 7; bitidx >= 0; bitidx = bitidx - 1)
+            clock_cmd_bit(value[bitidx]);
+      end
+   endtask
+
+   task automatic send_frame_header(input [23:0] start);
+      integer d;
+      begin
+         master_oe = 1'b1;
+         send_cmd_byte(8'h6b);
+         send_cmd_byte(start[23:16]);
+         send_cmd_byte(start[15:8]);
+         send_cmd_byte(start[7:0]);
+         master_oe = 1'b0;
+         for (d = 0; d < 8; d = d + 1)
+            clock_dummy_bit();
+      end
+   endtask
+
+      task automatic clock_byte(input integer expected);
+            reg [7:0] expected_raw;
+            begin
+               expected_raw = expected[7:0];
+            #5;
+            sclk = 1'b1;
+            first_edge_sample = io;
+            #8;
+            first_sample = io;
+                  #1;
+                  first_late_sample = io;
+                  if (first_late_sample !== first_sample) begin
+                     $display("FAIL byte %0d: first nibble changed around late sample point: sample=%x late=%x",
+                              expected, first_sample, first_late_sample);
+                     errs = errs + 1;
+                  end
+            #1;
+            sclk = 1'b0;
+            #5;
+            sclk = 1'b1;
+            second_edge_sample = io;
+            #8;
+            second_sample = io;
+                  #1;
+                  second_late_sample = io;
+                  if (second_late_sample !== second_sample) begin
+                     $display("FAIL byte %0d: second nibble changed around late sample point: sample=%x late=%x",
+                              expected, second_sample, second_late_sample);
+                     errs = errs + 1;
+                  end
+               #1;
+               sclk = 1'b0;
+               rx = {second_sample, first_sample};
+         if (rx !== expected_raw) begin
          $display("FAIL byte %0d: got %02x expected %02x",
-                  expected, rx, expected[7:0]);
+                  expected, rx, expected_raw);
          errs = errs + 1;
       end
    end
 endtask
 
-task automatic clock_byte_paused(input integer expected);
-   begin
-      #5 sclk = 1'b1;
-      #1;
-      first_sample = io;
-      #19;
-      if (io !== first_sample) begin
-         $display("FAIL byte %0d upper-pause: io changed from %x to %x",
-                  expected, first_sample, io);
-         errs = errs + 1;
-      end
-      sclk = 1'b0;
-      #20;
-      if (io !== expected[3:0]) begin
-         $display("FAIL byte %0d low-pause: io=%x expected lower nibble %x",
-                  expected, io, expected[3:0]);
-         errs = errs + 1;
-      end
-      #5 sclk = 1'b1;
-      #1;
-      second_sample = io;
-      #19;
-      if (io !== second_sample) begin
-         $display("FAIL byte %0d lower-pause: io changed from %x to %x",
-                  expected, second_sample, io);
-         errs = errs + 1;
-      end
-      #4 sclk = 1'b0;
-      rx = {first_sample, second_sample};
-      if (rx !== expected[7:0]) begin
+      task automatic clock_byte_paused(input integer expected);
+            reg [3:0] first_end, second_end;
+            reg [7:0] expected_raw;
+            begin
+               expected_raw = expected[7:0];
+            #5;
+            sclk = 1'b1;
+            first_edge_sample = io;
+            #8;
+            first_sample = io;
+                  #1;
+                  first_late_sample = io;
+                  if (first_late_sample !== first_sample) begin
+                     $display("FAIL byte %0d paused: first nibble changed around late sample point: sample=%x late=%x",
+                              expected, first_sample, first_late_sample);
+                     errs = errs + 1;
+                  end
+               #16;
+               first_end = io;
+               if (first_end !== first_sample) begin
+                  $display("FAIL byte %0d paused: first nibble changed while SCLK high: start=%x end=%x",
+                           expected, first_sample, first_end);
+                  errs = errs + 1;
+               end
+         sclk = 1'b0;
+         #20;
+            #5;
+            sclk = 1'b1;
+            second_edge_sample = io;
+            #8;
+            second_sample = io;
+                  #1;
+                  second_late_sample = io;
+                  if (second_late_sample !== second_sample) begin
+                     $display("FAIL byte %0d paused: second nibble changed around late sample point: sample=%x late=%x",
+                              expected, second_sample, second_late_sample);
+                     errs = errs + 1;
+                  end
+               #16;
+               second_end = io;
+               if (second_end !== second_sample) begin
+                  $display("FAIL byte %0d paused: second nibble changed while SCLK high: start=%x end=%x",
+                           expected, second_sample, second_end);
+                  errs = errs + 1;
+               end
+            sclk = 1'b0;
+            rx = {second_sample, first_sample};
+      if (rx !== expected_raw) begin
          $display("FAIL byte %0d paused: got %02x expected %02x",
-                  expected, rx, expected[7:0]);
+                  expected, rx, expected_raw);
          errs = errs + 1;
       end
    end
@@ -1058,32 +1404,55 @@ endtask
 @
 
 <<tb_quad: helpers>>=
-task automatic frame_from(input integer start, input integer count);
-   integer k;
-   begin
-      #20 cs_n = 1'b0;
-      #5;
-      for (k = 0; k < count; k = k + 1)
-         clock_byte(start + k);
-      #5 cs_n = 1'b1;
-      #20;
-   end
-endtask
-task automatic paused_frame_from(input integer start, input integer count);
-   integer k;
-   begin
-      #20 cs_n = 1'b0;
-      #5;
-      for (k = 0; k < count; k = k + 1)
-         clock_byte_paused(start + k);
-      #5 cs_n = 1'b1;
-      #20;
-   end
-endtask
-task automatic cs_high_quiet;
-   begin
-      #5 sclk = 1'b1;
-      if (io !== 4'b1111) begin
+   task automatic frame_expect(input [23:0] start,
+                               input integer expected_start,
+                               input integer count,
+                               input integer high_gap);
+      integer k;
+            begin
+               #20 cs_n = 1'b0;
+               #5;
+               send_frame_header(start);
+               for (k = 0; k < count; k = k + 1)
+                  clock_byte(expected_start + k);
+               #5 cs_n = 1'b1;
+         #(high_gap);
+      end
+   endtask
+   task automatic frame_from(input [23:0] start, input integer count);
+      begin
+         frame_expect(start, {24'd0, start[7:0]}, count, 500000);
+      end
+   endtask
+   task automatic short_gap_burst;
+      begin
+         frame_expect(24'd0, 0, 16, 500);
+         frame_expect(24'd16, 16, 240, 500000);
+      end
+   endtask
+   task automatic visible_gap_burst;
+      begin
+         frame_expect(0, 0, 4, 500000);
+         frame_expect(0, 0, 64, 500000);
+      end
+   endtask
+   task automatic paused_frame_from(input [23:0] start, input integer count);
+      integer k;
+            begin
+               #20 cs_n = 1'b0;
+            #5;
+               send_frame_header(start);
+               for (k = 0; k < count; k = k + 1)
+                  clock_byte_paused({8'd0, start} + k);
+               #5 cs_n = 1'b1;
+         #500000;
+      end
+   endtask
+   task automatic cs_high_quiet;
+      begin
+         #20000;
+         #5 sclk = 1'b1;
+         if (io !== 4'b1111) begin
          $display("FAIL cs-high: io=%b expected 1111 (slave should release)",
                   io);
          errs = errs + 1;
@@ -1094,24 +1463,29 @@ endtask
 @
 
 <<tb_quad: scenarios>>=
-initial begin
+   initial begin
    errs = 0;
    cs_high_quiet();
+      cs_high_quiet();
+      frame_from(0, 256);
+      cs_high_quiet();
+      frame_from(24'h000020, 64);
+      cs_high_quiet();
+      short_gap_burst();
+      cs_high_quiet();
+      visible_gap_burst();
    cs_high_quiet();
-   frame_from(0, 256);
-   cs_high_quiet();
-   /* Each CS-low interval restarts the slave's byte counter at zero,
-    * so the paused and long frames also expect bytes 0,1,2,...  This
-    * matches the deterministic-seed behaviour of spi.v's quad block. */
    paused_frame_from(0, 32);
    cs_high_quiet();
-   frame_from(0, 4096);
-   cs_high_quiet();
-   cs_high_quiet();
-   if (errs == 0)
-      $display("PASS tb_spi_quad: 4384 bytes plus CS-high checks match");
-   else
+   frame_expect(0, 0, 4096, 500000);
+      cs_high_quiet();
+      cs_high_quiet();
+      if (errs == 0)
+         $display("PASS tb_spi_quad: framed bytes plus CS-high checks match");
+   else begin
       $display("FAIL tb_spi_quad: %0d mismatches", errs);
+      $fatal(1);
+   end
    $finish;
 end
 @
@@ -1123,11 +1497,10 @@ the behavioural `SB_IO` model is in the sim path, but they do not
 prove that the synthesized netlist still contains the IOB drivers
 that make that model relevant. The netlist checker closes that gap
 without trying to model board timing: after yosys, each variant must
-have exactly four explicit `SB_IO` pads, each pad must be tied to
-the matching `io[n]` port bit, the 1-lane variant must use
-unregistered output-enable pads, the 4-lane variant must use the
-registered negedge-output configuration, and every output enable must be
-driven by the named `oe = ~cs_n` net. This is the structural condition the
+have exactly four explicit `SB_IO` pads, each pad must be tied to the
+matching `io[n]` port bit, every active pad must use the expected
+output cell mode for that variant, and every output enable must be
+driven by the named `oe` net. This is the structural condition the
 hardware failure violated when the lanes floated to the master pull-ups
 and the MP135 read `0xff`.
 
@@ -1194,19 +1567,17 @@ def check(path, lanes):
             params = cell.get("parameters", {})
             conns = cell.get("connections", {})
             pin_type = params.get("PIN_TYPE")
-            if lanes == 1 and pin_type != "101001":
+            neg_trigger = params.get("NEG_TRIGGER", "0")
+            expected_pin_type = "101001"
+            expected_neg_trigger = "0"
+            if pin_type != expected_pin_type:
                 raise AssertionError(
-                    f"{path}: {name} PIN_TYPE={pin_type}, expected 101001")
-            if pin_type == "100101" and params.get("NEG_TRIGGER") != "1":
+                    f"{path}: {name} PIN_TYPE={pin_type}, expected {expected_pin_type}")
+            if neg_trigger != expected_neg_trigger:
                 raise AssertionError(
-                    f"{path}: {name} NEG_TRIGGER={params.get('NEG_TRIGGER')}, "
-                    f"expected 1")
-            if pin_type == "101001" and params.get("NEG_TRIGGER", "0") != "0":
-                raise AssertionError(
-                    f"{path}: {name} NEG_TRIGGER={params.get('NEG_TRIGGER')}, "
-                    f"expected 0")
-            if pin_type == "100101" and conns.get("OUTPUT_CLK") != [sclk_bit]:
-                raise AssertionError(f"{path}: {name} OUTPUT_CLK is not sclk")
+                    f"{path}: {name} NEG_TRIGGER={neg_trigger}, expected {expected_neg_trigger}")
+            if conns.get("OUTPUT_ENABLE") != [oe_bit]:
+                raise AssertionError(f"{path}: {name} OUTPUT_ENABLE is not the oe net")
             dout = conns.get("D_OUT_0", [])
             if (lanes == 4 or lane in (0, 1)) and (not dout or isinstance(dout[0], str)):
                 raise AssertionError(f"{path}: {name} data input is constant on active lane {lane}")
@@ -1245,11 +1616,11 @@ SPI_PIN_MASKS := 00 01 02 04 08 10 20
 build/spi/spi_1lane.json: $(SPI_VS) | build/spi
 	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 1 spi; synth_ice40 -top spi -json spi_1lane.json"
 
-build/spi/spi_quad.json: $(SPI_VS) | build/spi
-	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 spi; synth_ice40 -top spi -json spi_quad.json"
+build/spi/spi_quad.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 spi; synth_ice40 -top spi -json spi_quad.json"
 
-build/spi/spi_quad_framed.json: $(SPI_VS) | build/spi
-	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set START_DELAY_CLKS 40 spi; synth_ice40 -top spi -json spi_quad_framed.json"
+build/spi/spi_quad_framed.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 spi; synth_ice40 -top spi -json spi_quad_framed.json"
 
 verilog/spi_pin_drive.v: src/spi.nw | verilog
 	cd verilog && tangle spi_pin_drive.v < ../$<
@@ -1330,7 +1701,7 @@ verilog/spi_quad_debug.v: src/spi.nw | verilog
 	cd verilog && tangle spi_quad_debug.v < ../$<
 
 build/spi/spi_quad_debug.json: verilog/spi_quad_debug.v $(SPI_VS) verilog/uart_tx.v | build/spi
-	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v ../../verilog/spi_quad_debug.v ../../verilog/uart_tx.v; hierarchy -top spi_quad_debug; synth_ice40 -top spi_quad_debug -json spi_quad_debug.json"
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v ../../verilog/spi_quad_debug.v ../../verilog/uart_tx.v; hierarchy -top spi_quad_debug; flatten; synth_ice40 -top spi_quad_debug -json spi_quad_debug.json"
 
 build/spi/spi_quad_debug.asc: build/spi/spi_quad_debug.json verilog/spi_debug.pcf
 	cd build/spi && nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json spi_quad_debug.json --pcf ../../verilog/spi_debug.pcf --asc spi_quad_debug.asc --freq 12 -q
@@ -3304,28 +3675,28 @@ MP135_QSPI_SRC := /home/agent2/fast_data/stm32mp135_test_board/baremetal/qspi
 all: TEST.md verify.py flash.tsv main.stm32
 
 Makefile: $(NW)
-	tangle Makefile < $<
+   tangle Makefile < $<
 
 test: all bitstreams
-	python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi --log run_md.log
+   python3 -u $$TEST_SERV/run_md.py --fresh --ledger ledger.txt --module spi --log run_md.log
 
 bitstreams:
-	$(MAKE) -C ../.. build/spi/pin_preflight build/spi/spi_1lane.bin build/spi/spi_quad.bin build/spi/jedec.bin
+   $(MAKE) -C ../.. build/spi/pin_preflight build/spi/spi_1lane.bin build/spi/spi_quad.bin build/spi/jedec.bin
 
 bitstream: bitstreams
 
 sim:
-	$(MAKE) -C ../.. build/spi/sim_1lane build/spi/sim_quad build/spi/netlist_check
+   $(MAKE) -C ../.. build/spi/sim_1lane build/spi/sim_quad build/spi/netlist_check
 
 TEST.md: $(NW)
-	tangle TEST.md < $<
+   tangle TEST.md < $<
 
 verify.py: $(NW)
-	tangle verify.py < $<
+   tangle verify.py < $<
 
 flash.tsv:
-	ln -sf $(MP135_QSPI_SRC)/flash.tsv $@
+   ln -sf $(MP135_QSPI_SRC)/flash.tsv $@
 
 main.stm32:
-	ln -sf $(MP135_QSPI_DIR)/main.stm32 $@
+   ln -sf $(MP135_QSPI_DIR)/main.stm32 $@
 @

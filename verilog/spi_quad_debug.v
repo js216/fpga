@@ -7,26 +7,50 @@ module spi_quad_debug #(
       inout  [3:0] io,
       output       tx
    );
-   reg [7:0] q_data_byte;
-   reg q_phase;
+   wire sclk_clk;
+   SB_GB sclk_gbuf (
+      .USER_SIGNAL_TO_GLOBAL_BUFFER(sclk),
+      .GLOBAL_BUFFER_OUTPUT(sclk_clk)
+   );
+
+   localparam CS_HIGH_RESET_BITS = 2;
+   reg [CS_HIGH_RESET_BITS-1:0] q_cs_high_count;
+   reg q_cs_debounced_high;
+   reg [8:0] q_sample_idx;
    reg [3:0] q_dout_quad;
-   wire [3:0] q_next_byte_upper = q_data_byte[7:4] + {3'b000, &q_data_byte[3:0]};
-   wire q_oe = ~cs_n;
+   wire [8:0] q_next_sample_idx = q_sample_idx + 9'd1;
+   wire [3:0] q_next_sample_nibble =
+      q_next_sample_idx[0] ? q_next_sample_idx[4:1] :
+                             q_next_sample_idx[8:5];
+   wire [3:0] q_iob_dout = q_cs_debounced_high ? 4'd0 : q_dout_quad;
+   wire q_oe = !q_cs_debounced_high;
 
    initial begin
-      q_data_byte = 8'd0;
-      q_phase = 1'b0;
+      q_cs_high_count = {CS_HIGH_RESET_BITS{1'b0}};
+      q_cs_debounced_high = 1'b1;
+      q_sample_idx = 9'd0;
       q_dout_quad = 4'd0;
    end
 
-   always @(posedge cs_n or posedge sclk) begin
-      if (cs_n) begin
-         q_phase <= 1'b0;
+   always @(negedge cs_n or posedge clk) begin
+      if (!cs_n) begin
+         q_cs_high_count <= {CS_HIGH_RESET_BITS{1'b0}};
+         q_cs_debounced_high <= 1'b0;
+      end else if (!q_cs_debounced_high) begin
+         q_cs_high_count <= q_cs_high_count +
+                            {{(CS_HIGH_RESET_BITS-1){1'b0}}, 1'b1};
+         if (q_cs_high_count[0])
+            q_cs_debounced_high <= 1'b1;
+      end
+   end
+
+   always @(posedge q_cs_debounced_high or posedge sclk_clk) begin
+      if (q_cs_debounced_high) begin
+         q_sample_idx <= 9'd0;
+         q_dout_quad <= 4'd0;
       end else begin
-         q_dout_quad <= q_phase ? q_next_byte_upper : q_data_byte[3:0];
-         q_phase <= ~q_phase;
-         if (q_phase)
-            q_data_byte <= q_data_byte + 8'd1;
+         q_sample_idx <= q_next_sample_idx;
+         q_dout_quad <= q_next_sample_nibble;
       end
    end
 
@@ -38,9 +62,9 @@ module spi_quad_debug #(
          .NEG_TRIGGER(1'b1)
       ) iob (
          .PACKAGE_PIN(io[qg]),
-         .OUTPUT_CLK(sclk),
+         .OUTPUT_CLK(sclk_clk),
          .OUTPUT_ENABLE(q_oe),
-         .D_OUT_0(q_dout_quad[qg]),
+         .D_OUT_0(q_iob_dout[qg]),
          .D_IN_0(q_io_sample[qg])
       );
    end endgenerate
@@ -70,7 +94,7 @@ module spi_quad_debug #(
    always @(negedge cs_n)
       frame_count <= frame_count + 8'd1;
 
-   always @(posedge cs_n or posedge sclk) begin
+   always @(posedge cs_n or posedge sclk_clk) begin
       if (cs_n) begin
          active <= 1'b0;
          edge_count <= 16'd0;
@@ -108,7 +132,7 @@ module spi_quad_debug #(
    reg tx_start;
    reg [7:0] tx_data;
    wire tx_busy;
-   
+
    initial begin
       pending = 1'b0;
       frame_toggle_meta = 1'b0;
@@ -117,7 +141,7 @@ module spi_quad_debug #(
       tx_start = 1'b0;
       tx_data = 8'h00;
    end
-   
+
    always @(posedge clk) begin
       tx_start <= 1'b0;
       frame_toggle_meta <= frame_toggle;
@@ -136,7 +160,7 @@ module spi_quad_debug #(
          end
       end
    end
-   
+
    uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
       .clk(clk),
       .start(tx_start),
@@ -144,7 +168,7 @@ module spi_quad_debug #(
       .tx(tx),
       .busy(tx_busy)
    );
-   
+
    function [7:0] quad_hex_digit;
       input [3:0] n;
       begin
@@ -152,14 +176,14 @@ module spi_quad_debug #(
                                       : (8'h57 + {4'd0, n});
       end
    endfunction
-   
+
    function [3:0] quad_sample_nibble;
       input [5:0] idx;
       begin
          quad_sample_nibble = last_nibbles[(31 - idx) * 4 +: 4];
       end
    endfunction
-   
+
    function [7:0] quad_debug_char;
       input [5:0] idx;
       begin
