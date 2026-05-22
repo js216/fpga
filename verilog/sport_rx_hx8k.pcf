@@ -1,0 +1,5 @@
+set_io clk12   J3
+set_io aclk_in N16
+set_io ad0_in  P16
+set_io afs_in  K14
+set_io tx      B12

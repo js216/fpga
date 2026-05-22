@@ -3,3 +3,4 @@
 build
 doc
 __pycache__/
+.tools/

@@ -1,0 +1,4 @@
+set_io clk12    J3
+set_io ad0_out  G14
+set_io aclk_out J15
+set_io afs_out  H14

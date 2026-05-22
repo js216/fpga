@@ -5,6 +5,11 @@ CHAPTERS := $(notdir $(basename $(wildcard src/*.nw)))
 
 chapter_src = src/$(1).nw
 
+LITTST_BINDIR ?= $(CURDIR)/.tools/bin
+ifneq ($(wildcard $(LITTST_BINDIR)/tangle),)
+export PATH := $(LITTST_BINDIR):$(PATH)
+endif
+
 # Single-target default (used by chapters that don't declare BOARDS_<name>).
 # Override on the command line: `make DEVICE=hx8k PACKAGE=ct256 ...`.
 DEVICE  ?= hx1k
@@ -18,10 +23,13 @@ PACKAGE ?= tq144
 BOARDS_blinky := hx1k hx8k
 BOARDS_uart := hx1k hx8k
 BOARDS_gpio := hx1k hx8k
+BOARDS_sport_tx_prbs := hx8k
+BOARDS_sport_rx := hx8k
 
 # Per-board nextpnr arguments. Add a row when you add a board.
 nextpnr_pkg_hx1k := tq144
 nextpnr_pkg_hx8k := ct256
+nextpnr_freq_default := 12
 
 .PHONY: all doc sim formal bitstream clean
 
@@ -71,7 +79,16 @@ build/$(1)/$(1).sby: $$(call chapter_src,$(1)) | build/$(1)
 	cd build/$(1) && tangle $(1).sby < ../../$$<
 
 build/$(1)/$(1).mk: $$(call chapter_src,$(1)) | build/$(1)
-	@cd build/$(1) && tangle $(1).mk < ../../$$< 2>/dev/null
+	@cd build/$(1) && { tangle $(1).mk < ../../$$< 2>$(1).mk.err || { \
+		rc=$$$$?; \
+		if grep -q "Root chunk <<$(1).mk>> not found" $(1).mk.err; then \
+			: > $(1).mk; \
+		else \
+			cat $(1).mk.err >&2; \
+			rm -f $(1).mk.err; \
+			exit $$$$rc; \
+		fi; \
+	}; rm -f $(1).mk.err; }
 	@touch $$@
 
 build/$(1)/Makefile: $$(call chapter_src,$(1)) | build/$(1)
@@ -93,7 +110,8 @@ ifeq ($$(BOARDS_$(1)),)
 build/$(1)/$(1).asc: build/$(1)/$(1).json verilog/$(1).pcf
 	cd build/$(1) && nextpnr-ice40 --$$(DEVICE) --package $$(PACKAGE) \
 		--json $(1).json --pcf ../../verilog/$(1).pcf \
-		--asc $(1).asc --freq 12 -q
+		--asc $(1).asc --freq $$(or $$(nextpnr_freq_$(1)),$$(nextpnr_freq_default)) \
+		$$(if $$(nextpnr_seed_$(1)),--seed $$(nextpnr_seed_$(1))) -q
 
 build/$(1)/$(1).bin: build/$(1)/$(1).asc
 	cd build/$(1) && icepack $(1).asc $(1).bin
@@ -114,7 +132,8 @@ build/$(1)/$(2):
 build/$(1)/$(2)/$(1).asc: build/$(1)/$(1).json verilog/$(1)_$(2).pcf | build/$(1)/$(2)
 	cd build/$(1)/$(2) && nextpnr-ice40 --$(2) --package $$(nextpnr_pkg_$(2)) \
 		--json ../$(1).json --pcf ../../../verilog/$(1)_$(2).pcf \
-		--asc $(1).asc --freq 12 -q --pcf-allow-unconstrained
+		--asc $(1).asc --freq $$(or $$(nextpnr_freq_$(1)),$$(nextpnr_freq_default)) \
+		$$(if $$(nextpnr_seed_$(1)),--seed $$(nextpnr_seed_$(1))) -q --pcf-allow-unconstrained
 
 build/$(1)/$(2)/$(1).bin: build/$(1)/$(2)/$(1).asc
 	cd build/$(1)/$(2) && icepack $(1).asc $(1).bin
