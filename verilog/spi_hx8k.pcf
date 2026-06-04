@@ -1,0 +1,7 @@
+set_io clk   J3
+set_io cs_n  N3
+set_io sclk  L3
+set_io io[0] F1
+set_io io[1] T7
+set_io io[2] B1
+set_io io[3] G1

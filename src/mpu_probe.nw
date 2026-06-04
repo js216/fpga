@@ -1,0 +1,377 @@
+== MPU pin discovery sampler (hx8k)
+
+
+Input-only bring-up fixture for the custom STM32MP135 board. Every bonded
+CT256 user-IO ball (all 203, minus the clock `J3` and the FT2232 UART pins
+`B12`/`B10`) is brought up as a pulled-up `SB_IO` input and sampled into one
+wide heartbeat line of hex nibbles over the UART. A released ball reads `1`
+(internal weak pull-up); an external driver pulling it low reads `0`. The
+bench drives one STM32MP135 SPI/QUADSPI pin low at a time and reads the
+snapshot back: the single bit that goes `0` names the ball that pin is
+wired to. `S` forces an immediate snapshot; `?` replies `OK`.
+
+This chapter reuses `uart_tx`/`uart_rx` verbatim and has no drive path, so
+the discovery direction is strictly MPU -> FPGA.
+
+<<mpu_probe.v>>=
+module mpu_probe #(
+      parameter CLKS_PER_BIT = 104,
+      parameter TICK_CYCLES  = 1_200_000_000,
+      parameter NPINS        = 203
+   )(
+      input               clk,
+      input               rx,
+      inout  [NPINS-1:0]  pins,
+      output              tx
+   );
+   localparam NIBBLES   = (NPINS + 3) / 4;
+   localparam FRAME_LEN = NIBBLES + 2;
+   localparam QUERY_LEN = 4;
+   localparam IDXW      = $clog2(FRAME_LEN + 1);
+
+   wire [NPINS-1:0] pins_in;
+   genvar gi;
+   generate
+      for (gi = 0; gi < NPINS; gi = gi + 1) begin : g_in
+         SB_IO #(
+            .PIN_TYPE(6'b0000_01),
+            .PULLUP(1'b1)
+         ) io_cell (
+            .PACKAGE_PIN(pins[gi]),
+            .D_IN_0(pins_in[gi])
+         );
+      end
+   endgenerate
+
+   reg [$clog2(TICK_CYCLES)-1:0] timer;
+   reg [NPINS-1:0] snapshot;
+   reg [IDXW-1:0]  char_idx;
+   reg             active;
+   reg             is_query;
+   reg             query_pending;
+   reg             snap_pending;
+   reg             tx_start;
+   reg  [7:0]      tx_data;
+   wire            tx_busy;
+   wire            rx_ready;
+   wire [7:0]      rx_data;
+
+   initial begin
+      timer = 0; snapshot = 0; char_idx = 0; active = 0; is_query = 0;
+      query_pending = 0; snap_pending = 0; tx_start = 0; tx_data = 0;
+   end
+
+   function [3:0] nib_at;
+      input [IDXW-1:0] i;
+      integer n;
+      begin
+         n = NIBBLES - 1 - i;
+         nib_at = snapshot[4*n +: 4];
+      end
+   endfunction
+
+   function [7:0] hexchar;
+      input [3:0] v;
+      begin
+         hexchar = (v < 4'd10) ? (8'h30 + v) : (8'h61 + (v - 4'd10));
+      end
+   endfunction
+
+   function [7:0] byte_at;
+      input [IDXW-1:0] i;
+      input            q;
+      begin
+         if (q) begin
+            case (i)
+               0:       byte_at = "O";
+               1:       byte_at = "K";
+               2:       byte_at = 8'h0D;
+               default: byte_at = 8'h0A;
+            endcase
+         end else if (i < NIBBLES[IDXW-1:0])
+            byte_at = hexchar(nib_at(i));
+         else if (i == NIBBLES[IDXW-1:0])
+            byte_at = 8'h0D;
+         else
+            byte_at = 8'h0A;
+      end
+   endfunction
+
+   always @(posedge clk) begin
+      tx_start <= 1'b0;
+
+      if (rx_ready) begin
+         if (rx_data == "S")      snap_pending  <= 1'b1;
+         else if (rx_data == "?") query_pending <= 1'b1;
+      end
+
+      if (!active) begin
+         if (timer == TICK_CYCLES - 1) begin
+            timer    <= 0;
+            snapshot <= pins_in;
+            is_query <= 1'b0;
+            char_idx <= 0;
+            active   <= 1'b1;
+         end else begin
+            timer <= timer + 1'b1;
+            if (snap_pending) begin
+               snap_pending <= 1'b0;
+               snapshot     <= pins_in;
+               is_query     <= 1'b0;
+               char_idx     <= 0;
+               active       <= 1'b1;
+            end else if (query_pending) begin
+               query_pending <= 1'b0;
+               is_query      <= 1'b1;
+               char_idx      <= 0;
+               active        <= 1'b1;
+            end
+         end
+      end else begin
+         if (!tx_busy && !tx_start) begin
+            tx_data  <= byte_at(char_idx, is_query);
+            tx_start <= 1'b1;
+            if (char_idx == (is_query ? QUERY_LEN[IDXW-1:0] - 1'b1
+                                      : FRAME_LEN[IDXW-1:0] - 1'b1))
+               active <= 1'b0;
+            else
+               char_idx <= char_idx + 1'b1;
+         end
+      end
+   end
+
+   uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
+      .clk(clk), .start(tx_start), .data(tx_data), .tx(tx), .busy(tx_busy));
+   uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_rx (
+      .clk(clk), .rx(rx), .ready(rx_ready), .data(rx_data));
+endmodule
+@
+
+
+=== Build fragment
+
+Pulls in `uart_tx.v` and `uart_rx.v`, so it overrides the synth target the
+way the gpio chapter does. hx8k only; the pcf constrains all sampled balls.
+
+<<mpu_probe.mk>>=
+MPU_PROBE_VS := verilog/mpu_probe.v verilog/uart_tx.v verilog/uart_rx.v
+
+verilog/mpu_probe_%.pcf: src/mpu_probe.nw | verilog
+	cd verilog && tangle mpu_probe_$*.pcf < ../$<
+
+build/mpu_probe/mpu_probe.json: $(MPU_PROBE_VS) | build/mpu_probe
+	cd build/mpu_probe && yosys -q -p "read_verilog ../../verilog/mpu_probe.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v; synth_ice40 -top mpu_probe -json mpu_probe.json"
+@
+
+
+=== Pin constraints (hx8k, ct256)
+
+<<mpu_probe_hx8k.pcf>>=
+set_io clk      J3
+set_io tx       B12
+set_io rx       B10
+
+set_io pins[0] A1
+set_io pins[1] A2
+set_io pins[2] A5
+set_io pins[3] A6
+set_io pins[4] A7
+set_io pins[5] A9
+set_io pins[6] A10
+set_io pins[7] A11
+set_io pins[8] A15
+set_io pins[9] A16
+set_io pins[10] B1
+set_io pins[11] B2
+set_io pins[12] B3
+set_io pins[13] B4
+set_io pins[14] B5
+set_io pins[15] B6
+set_io pins[16] B7
+set_io pins[17] B8
+set_io pins[18] B9
+set_io pins[19] B11
+set_io pins[20] B13
+set_io pins[21] B14
+set_io pins[22] B15
+set_io pins[23] B16
+set_io pins[24] C1
+set_io pins[25] C2
+set_io pins[26] C3
+set_io pins[27] C4
+set_io pins[28] C5
+set_io pins[29] C6
+set_io pins[30] C7
+set_io pins[31] C8
+set_io pins[32] C9
+set_io pins[33] C10
+set_io pins[34] C11
+set_io pins[35] C12
+set_io pins[36] C13
+set_io pins[37] C14
+set_io pins[38] C16
+set_io pins[39] D1
+set_io pins[40] D2
+set_io pins[41] D3
+set_io pins[42] D4
+set_io pins[43] D5
+set_io pins[44] D6
+set_io pins[45] D7
+set_io pins[46] D8
+set_io pins[47] D9
+set_io pins[48] D10
+set_io pins[49] D11
+set_io pins[50] D13
+set_io pins[51] D14
+set_io pins[52] D15
+set_io pins[53] D16
+set_io pins[54] E2
+set_io pins[55] E3
+set_io pins[56] E4
+set_io pins[57] E5
+set_io pins[58] E6
+set_io pins[59] E9
+set_io pins[60] E10
+set_io pins[61] E11
+set_io pins[62] E13
+set_io pins[63] E14
+set_io pins[64] E16
+set_io pins[65] F1
+set_io pins[66] F2
+set_io pins[67] F3
+set_io pins[68] F4
+set_io pins[69] F5
+set_io pins[70] F7
+set_io pins[71] F9
+set_io pins[72] F11
+set_io pins[73] F12
+set_io pins[74] F13
+set_io pins[75] F14
+set_io pins[76] F15
+set_io pins[77] F16
+set_io pins[78] G1
+set_io pins[79] G2
+set_io pins[80] G3
+set_io pins[81] G4
+set_io pins[82] G5
+set_io pins[83] G10
+set_io pins[84] G11
+set_io pins[85] G12
+set_io pins[86] G13
+set_io pins[87] G14
+set_io pins[88] G15
+set_io pins[89] G16
+set_io pins[90] H1
+set_io pins[91] H2
+set_io pins[92] H3
+set_io pins[93] H4
+set_io pins[94] H5
+set_io pins[95] H6
+set_io pins[96] H11
+set_io pins[97] H12
+set_io pins[98] H13
+set_io pins[99] H14
+set_io pins[100] H16
+set_io pins[101] J1
+set_io pins[102] J2
+set_io pins[103] J4
+set_io pins[104] J5
+set_io pins[105] J10
+set_io pins[106] J11
+set_io pins[107] J12
+set_io pins[108] J13
+set_io pins[109] J14
+set_io pins[110] J15
+set_io pins[111] J16
+set_io pins[112] K1
+set_io pins[113] K3
+set_io pins[114] K4
+set_io pins[115] K5
+set_io pins[116] K9
+set_io pins[117] K11
+set_io pins[118] K12
+set_io pins[119] K13
+set_io pins[120] K14
+set_io pins[121] K15
+set_io pins[122] K16
+set_io pins[123] L1
+set_io pins[124] L3
+set_io pins[125] L4
+set_io pins[126] L5
+set_io pins[127] L6
+set_io pins[128] L7
+set_io pins[129] L9
+set_io pins[130] L10
+set_io pins[131] L11
+set_io pins[132] L12
+set_io pins[133] L13
+set_io pins[134] L14
+set_io pins[135] L16
+set_io pins[136] M1
+set_io pins[137] M2
+set_io pins[138] M3
+set_io pins[139] M4
+set_io pins[140] M5
+set_io pins[141] M6
+set_io pins[142] M7
+set_io pins[143] M8
+set_io pins[144] M9
+set_io pins[145] M11
+set_io pins[146] M12
+set_io pins[147] M13
+set_io pins[148] M14
+set_io pins[149] M15
+set_io pins[150] M16
+set_io pins[151] N2
+set_io pins[152] N3
+set_io pins[153] N4
+set_io pins[154] N5
+set_io pins[155] N6
+set_io pins[156] N7
+set_io pins[157] N9
+set_io pins[158] N10
+set_io pins[159] N12
+set_io pins[160] N16
+set_io pins[161] P1
+set_io pins[162] P2
+set_io pins[163] P4
+set_io pins[164] P5
+set_io pins[165] P6
+set_io pins[166] P7
+set_io pins[167] P8
+set_io pins[168] P9
+set_io pins[169] P10
+set_io pins[170] P11
+set_io pins[171] P12
+set_io pins[172] P13
+set_io pins[173] P14
+set_io pins[174] P15
+set_io pins[175] P16
+set_io pins[176] R1
+set_io pins[177] R2
+set_io pins[178] R3
+set_io pins[179] R4
+set_io pins[180] R5
+set_io pins[181] R6
+set_io pins[182] R9
+set_io pins[183] R10
+set_io pins[184] R11
+set_io pins[185] R12
+set_io pins[186] R14
+set_io pins[187] R15
+set_io pins[188] R16
+set_io pins[189] T1
+set_io pins[190] T2
+set_io pins[191] T3
+set_io pins[192] T5
+set_io pins[193] T6
+set_io pins[194] T7
+set_io pins[195] T8
+set_io pins[196] T9
+set_io pins[197] T10
+set_io pins[198] T11
+set_io pins[199] T13
+set_io pins[200] T14
+set_io pins[201] T15
+set_io pins[202] T16
+@

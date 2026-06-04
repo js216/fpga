@@ -84,7 +84,14 @@ module spi #(
       parameter LANES = 1,
       parameter START_DELAY_CLKS = 0,
       parameter FRAME_MODE = 0,
-      parameter DIAG_MODE = 0
+      parameter DIAG_MODE = 0,
+      parameter QUAD_LAUNCH_POSEDGE = 0,
+      parameter IOB_OUTPUT_NEGEDGE = 0,
+      parameter QUAD_HIGH_LEAD = 0,
+      parameter QUAD_SEED_BIAS = 0,
+      parameter PRBS_MODE = 0,
+      parameter PRBS32_MODE = 0,
+      parameter QUAD_REG_OUTPUT = 0
    ) (
       input        clk,
       input        cs_n,
@@ -104,7 +111,10 @@ quad path advances on falling SCLK edges and drives transparent pads.
 
 <<SPI streaming: clocks>>=
 wire sclk_stream = sclk;
-wire iob_output_clk = sclk;
+/* IOB output-register launch edge. Default posedge sclk (EVB). The custom
+ * build can launch the pad register on the opposite edge to move the data
+ * eye relative to the master's sample point. */
+wire iob_output_clk = IOB_OUTPUT_NEGEDGE ? ~sclk : sclk;
 @
 
 `data_byte` is shared across both variants; `oe` and `dout_lane`
@@ -275,6 +285,13 @@ reg [7:0] frame_addr_lsb;
 reg quad_drive;
 reg quad_low_phase;
 reg payload_active;
+/* 32-bit byte-PRBS state (PRBS32_MODE). Reseeded to a fixed value at the
+ * start of each CS read (cs_async_rst); a read holds CS low for its whole
+ * length, so the LFSR runs continuously across that read. The emitted
+ * payload byte is lfsr_v[7:0]; lfsr32_step8() advances 8 single Galois
+ * steps per byte. The master mirrors this exact stream (prbs32 in cli.c
+ * and the matrix CRC in the verify). */
+reg [31:0] lfsr_v;
 initial quad_dout = 4'd0;
 initial frame_edges = 6'd0;
 initial frame_fall_edges = 6'd0;
@@ -282,6 +299,7 @@ initial frame_addr_lsb = 8'd0;
 initial quad_drive = 1'b0;
 initial quad_low_phase = 1'b1;
 initial payload_active = 1'b0;
+initial lfsr_v = 32'hFFFFFFFF;
 function [3:0] quad_diag_nibble;
    input [7:0] idx;
    begin
@@ -316,6 +334,44 @@ function [3:0] quad_payload_nibble;
          quad_payload_nibble = quad_diag_nibble({byte_value[6:0], low_phase});
    end
 endfunction
+/* prbs8: eight unrolled 8-bit Galois LFSR steps (poly x^8+x^6+x^5+x^4+1,
+ * Galois mask 0xB8). It diffuses the byte index into a pseudo-random byte
+ * so the streamed payload exercises ~50%-density bit transitions on every
+ * lane instead of the smooth counter. The mapping is a fixed bijection of
+ * the 8-bit index; the master mirrors it byte-for-byte (prbs8() in cli.c),
+ * so the existing 256-periodic CRC/validate path is unchanged. */
+function [7:0] prbs8;
+   input [7:0] x;
+   integer k;
+   reg [7:0] s;
+   begin
+      s = x;
+      for (k = 0; k < 8; k = k + 1)
+         s = (s >> 1) ^ (s[0] ? 8'hB8 : 8'h00);
+      prbs8 = s;
+   end
+endfunction
+/* Payload byte at a given counter index: PRBS when PRBS_MODE, else the
+ * raw incrementing counter. */
+function [7:0] payload_value;
+   input [7:0] idx;
+   begin
+      payload_value = (PRBS_MODE != 0) ? prbs8(idx) : idx;
+   end
+endfunction
+/* 32-bit Galois LFSR, eight single right-shift steps (mask 0xA3000000),
+ * one byte per emitted byte. Period 2^32-1 bytes (~4 GiB). */
+function [31:0] lfsr32_step8;
+   input [31:0] s;
+   integer k;
+   reg [31:0] t;
+   begin
+      t = s;
+      for (k = 0; k < 8; k = k + 1)
+         t = (t >> 1) ^ (t[0] ? 32'hA3000000 : 32'h0);
+      lfsr32_step8 = t;
+   end
+endfunction
 always @(posedge cs_async_rst or posedge sclk_stream) begin
    if (cs_async_rst) begin
       frame_edges <= 6'd0;
@@ -330,10 +386,28 @@ always @(posedge cs_async_rst or posedge sclk_stream) begin
          quad_drive <= 1'b1;
    end
 end
-always @(posedge cs_async_rst or negedge sclk_stream) begin
+/* Launch edge for the payload presenter. Default negedge sclk; the custom
+ * build can launch a half-cycle earlier (posedge) to place settled data
+ * under the master's sample point. */
+wire quad_launch_clk = QUAD_LAUNCH_POSEDGE ? sclk_stream : ~sclk_stream;
+/* Next byte's PRBS32 state (one byte = 8 LFSR steps ahead), used for the
+ * QUAD_HIGH_LEAD high nibble. */
+wire [31:0] lfsr_v_next = lfsr32_step8(lfsr_v);
+/* Payload byte for the current index vs the high-lead (next) index. In
+ * PRBS32_MODE these come from the running LFSR; otherwise the counter /
+ * prbs8 of the index. */
+wire [7:0] pv_seed = (PRBS32_MODE != 0) ? lfsr_v[7:0]
+                     : payload_value(frame_addr_lsb + QUAD_SEED_BIAS[7:0]);
+wire [7:0] pv_high = (PRBS32_MODE != 0) ? lfsr_v_next[7:0]
+                     : payload_value(data_byte + QUAD_HIGH_LEAD[7:0]);
+wire [7:0] pv_low_next = (PRBS32_MODE != 0) ? lfsr_v_next[7:0]
+                     : payload_value(data_byte + 8'd1);
+always @(posedge cs_async_rst or posedge quad_launch_clk) begin
    if (cs_async_rst) begin
       data_byte <= 8'd0;
-      quad_dout <= quad_payload_nibble(8'd0, 1'b1);
+      lfsr_v <= 32'hFFFFFFFF;
+      quad_dout <= quad_payload_nibble(
+                      (PRBS32_MODE != 0) ? 8'hFF : payload_value(8'd0), 1'b1);
       frame_fall_edges <= 6'd0;
       quad_low_phase <= 1'b1;
       payload_active <= 1'b0;
@@ -344,17 +418,28 @@ always @(posedge cs_async_rst or negedge sclk_stream) begin
          end else if (frame_fall_edges == FRAME_PREFIX_CLKS - 6'd1) begin
             frame_fall_edges <= FRAME_PREFIX_CLKS;
             payload_active <= 1'b1;
-            data_byte <= frame_addr_lsb;
-            quad_dout <= quad_payload_nibble(frame_addr_lsb, 1'b1);
+            /* QUAD_SEED_BIAS offsets the counter start so that, after the
+             * QUAD_HIGH_LEAD high/low pairing shift, the master sees the
+             * counter value its address selected (bias = -HIGH_LEAD). */
+            data_byte <= frame_addr_lsb + QUAD_SEED_BIAS[7:0];
+            quad_dout <= quad_payload_nibble(pv_seed, 1'b1);
             quad_low_phase <= 1'b1;
          end
       end else begin
          if (quad_low_phase) begin
-            quad_dout <= quad_payload_nibble(data_byte, 1'b0);
+            /* QUAD_HIGH_LEAD advances the high nibble by QUAD_HIGH_LEAD bytes
+             * so it pairs correctly with its low nibble at the master
+             * (compensates the per-byte high/low sample offset; see the
+             * DIAG_MODE probe in missions/fpga-mpu-spi-custom.md). In
+             * PRBS32_MODE the high nibble is the next LFSR byte. */
+            quad_dout <= quad_payload_nibble(pv_high, 1'b0);
             quad_low_phase <= 1'b0;
          end else begin
             data_byte <= data_byte + 8'd1;
-            quad_dout <= quad_payload_nibble(data_byte + 8'd1, 1'b1);
+            /* Advance the PRBS32 LFSR one byte (8 steps) in lockstep. */
+            if (PRBS32_MODE != 0)
+               lfsr_v <= lfsr_v_next;
+            quad_dout <= quad_payload_nibble(pv_low_next, 1'b1);
             quad_low_phase <= 1'b1;
          end
       end
@@ -405,10 +490,15 @@ inferring fabric tri-states.
 
 <<SPI streaming: io drivers>>=
 genvar g;
+/* QUAD_REG_OUTPUT=1 uses the IOB output flip-flop (PIN_TYPE output field
+ * 6'b1101 = registered output + enable) instead of the transparent driver.
+ * The registered launch has a small, fixed clk-to-out with no fabric routing
+ * in the data path, shrinking the launch delay at the highest prescalers. */
+localparam [5:0] QUAD_PIN_TYPE = QUAD_REG_OUTPUT ? 6'b110101 : 6'b101001;
 generate if (LANES == 4) begin : g_quad_io
 	   for (g = 0; g < 4; g = g + 1) begin : g_io
 	      SB_IO #(
-	         .PIN_TYPE(6'b101001)
+	         .PIN_TYPE(QUAD_PIN_TYPE)
 	      ) iob (
          .PACKAGE_PIN(io[g]),
          .OUTPUT_CLK(iob_output_clk),
@@ -445,6 +535,23 @@ set_io io[0]   47
 set_io io[1]   44
 set_io io[2]   60
 set_io io[3]   48
+@
+
+For the custom STM32MP135 board the QUADSPI bus is wired to the
+iCE40-HX8K-B-EVN. `clk` is the eval board's 12 MHz oscillator (ball
+J3); the remaining signals use the CT256 balls discovered by
+`missions/fpga-mpu-gpio-custom.md` (MP135 QUADSPI net -> ball):
+`QUADSPI_CLK`->L3 (`sclk`), `QUADSPI_CS`->N3 (`cs_n`), `IO0`->F1,
+`IO1`->T7, `IO2`->B1, `IO3`->G1.
+
+<<spi_hx8k.pcf>>=
+set_io clk   J3
+set_io cs_n  N3
+set_io sclk  L3
+set_io io[0] F1
+set_io io[1] T7
+set_io io[2] B1
+set_io io[3] G1
 @
 
 === Static pin-drive preflight top
@@ -1669,6 +1776,169 @@ build/spi/spi_1lane.bin: build/spi/spi_1lane.asc
 
 build/spi/spi_quad.bin: build/spi/spi_quad.asc
 	cd build/spi && icepack spi_quad.asc spi_quad.bin
+
+# Custom-board 4-lane bitstream for the iCE40-HX8K-B-EVN. Reuses the
+# device-independent spi_quad.json; only place-and-route differs (hx8k
+# ct256 + the discovered QUADSPI ball pcf).
+verilog/spi_hx8k.pcf: src/spi.nw | verilog
+	cd verilog && tangle spi_hx8k.pcf < ../$<
+
+build/spi/spi_quad_hx8k.asc: build/spi/spi_quad.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_hx8k.bin: build/spi/spi_quad_hx8k.asc
+	cd build/spi && icepack spi_quad_hx8k.asc spi_quad_hx8k.bin
+
+build/spi/spi_1lane_hx8k.asc: build/spi/spi_1lane.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_1lane.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_1lane_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_1lane_hx8k.bin: build/spi/spi_1lane_hx8k.asc
+	cd build/spi && icepack spi_1lane_hx8k.asc spi_1lane_hx8k.bin
+
+# Custom-board 4-lane variant that launches the quad payload on the opposite
+# SCLK edge (QUAD_LAUNCH_POSEDGE=1) to recenter the data eye at the master.
+build/spi/spi_quad_pe.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set QUAD_LAUNCH_POSEDGE 1 spi; synth_ice40 -top spi -json spi_quad_pe.json"
+
+build/spi/spi_quad_pe_hx8k.asc: build/spi/spi_quad_pe.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_pe.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_pe_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_pe_hx8k.bin: build/spi/spi_quad_pe_hx8k.asc
+	cd build/spi && icepack spi_quad_pe_hx8k.asc spi_quad_pe_hx8k.bin
+
+# Custom-board 4-lane variant launching the IOB output register on the
+# opposite SCLK edge (IOB_OUTPUT_NEGEDGE=1) to recenter the data eye.
+build/spi/spi_quad_io.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set IOB_OUTPUT_NEGEDGE 1 spi; synth_ice40 -top spi -json spi_quad_io.json"
+
+build/spi/spi_quad_io_hx8k.asc: build/spi/spi_quad_io.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_io.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_io_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_io_hx8k.bin: build/spi/spi_quad_io_hx8k.asc
+	cd build/spi && icepack spi_quad_io_hx8k.asc spi_quad_io_hx8k.bin
+
+# Diagnostic variant: every nibble ramps (DIAG_MODE=1) so the raw received
+# bytes reveal exactly how each nibble cycle samples.
+build/spi/spi_quad_d1.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set DIAG_MODE 1 spi; synth_ice40 -top spi -json spi_quad_d1.json"
+
+build/spi/spi_quad_d1_hx8k.asc: build/spi/spi_quad_d1.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_d1.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_d1_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_d1_hx8k.bin: build/spi/spi_quad_d1_hx8k.asc
+	cd build/spi && icepack spi_quad_d1_hx8k.asc spi_quad_d1_hx8k.bin
+
+# Diagnostic with posedge launch (half-SCLK-cycle earlier): exposes the
+# nibble-level alignment at the high prescalers where the integer-byte
+# HIGH_LEAD alone leaves a half-byte (one-nibble) skew.
+build/spi/spi_quad_d1pe.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set DIAG_MODE 1 -set QUAD_LAUNCH_POSEDGE 1 spi; synth_ice40 -top spi -json spi_quad_d1pe.json"
+
+build/spi/spi_quad_d1pe_hx8k.asc: build/spi/spi_quad_d1pe.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_d1pe.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_d1pe_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_d1pe_hx8k.bin: build/spi/spi_quad_d1pe_hx8k.asc
+	cd build/spi && icepack spi_quad_d1pe_hx8k.asc spi_quad_d1pe_hx8k.bin
+
+# Combined HIGH_LEAD + posedge launch: integer-byte advance (HIGH_LEAD=$*)
+# plus a half-SCLK-cycle (one-nibble) launch shift, giving nibble-granular
+# alignment needed at presc<=5 (SCLK > 100 MHz). $* = HIGH_LEAD value.
+build/spi/spi_quad_hlpe%.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set QUAD_HIGH_LEAD $* -set QUAD_LAUNCH_POSEDGE 1 spi; synth_ice40 -top spi -json spi_quad_hlpe$*.json"
+
+build/spi/spi_quad_hlpe%_hx8k.asc: build/spi/spi_quad_hlpe%.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_hlpe$*.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_hlpe$*_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_hlpe%_hx8k.bin: build/spi/spi_quad_hlpe%_hx8k.asc
+	cd build/spi && icepack spi_quad_hlpe$*_hx8k.asc spi_quad_hlpe$*_hx8k.bin
+
+# Bit-perfect high-speed custom 4-lane bitstream: HIGH_LEAD=1 fixes the
+# byte-level high/low pairing, QUAD_LAUNCH_POSEDGE=1 supplies the half-SCLK
+# (one-nibble) shift that centers the eye at presc<=5 (SCLK > 100 MHz), and
+# QUAD_SEED_BIAS=255 (-1) cancels the one-count advance the pairing adds.
+# Headline bitstream for >=400 Mbps bit-perfect streaming.
+build/spi/spi_quad_bppe.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set QUAD_HIGH_LEAD 1 -set QUAD_LAUNCH_POSEDGE 1 -set QUAD_SEED_BIAS 255 spi; synth_ice40 -top spi -json spi_quad_bppe.json"
+
+build/spi/spi_quad_bppe_hx8k.asc: build/spi/spi_quad_bppe.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_bppe.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_bppe_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_bppe_hx8k.bin: build/spi/spi_quad_bppe_hx8k.asc
+	cd build/spi && icepack spi_quad_bppe_hx8k.asc spi_quad_bppe_hx8k.bin
+
+# PRBS payload variant of the bit-perfect bitstream: same alignment
+# (HIGH_LEAD=1 + posedge launch + seed bias) but PRBS_MODE=1 replaces the
+# incrementing counter with prbs8(index), exercising ~50%-density bit
+# transitions on every lane. The master mirrors prbs8 (cli.c, `a .. .. 1`).
+build/spi/spi_quad_prbs.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set QUAD_HIGH_LEAD 1 -set QUAD_LAUNCH_POSEDGE 1 -set QUAD_SEED_BIAS 255 -set PRBS_MODE 1 spi; synth_ice40 -top spi -json spi_quad_prbs.json"
+
+build/spi/spi_quad_prbs_hx8k.asc: build/spi/spi_quad_prbs.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_prbs.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_prbs_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_prbs_hx8k.bin: build/spi/spi_quad_prbs_hx8k.asc
+	cd build/spi && icepack spi_quad_prbs_hx8k.asc spi_quad_prbs_hx8k.bin
+
+# 32-bit-LFSR PRBS payload variant (PRBS32_MODE=1): a free-running 32-bit
+# Galois LFSR (mask 0xA3000000, 8 steps/byte) reseeded to 0xFFFFFFFF at the
+# start of each CS read. With a single CS-low read for the whole transfer
+# the byte stream is continuous, period 2^32-1 bytes (~4 GiB). Same
+# alignment (HIGH_LEAD=1 + posedge + seed bias) as the bit-perfect build.
+build/spi/spi_quad_prbs32.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set QUAD_HIGH_LEAD 1 -set QUAD_LAUNCH_POSEDGE 1 -set QUAD_SEED_BIAS 255 -set PRBS32_MODE 1 spi; synth_ice40 -top spi -json spi_quad_prbs32.json"
+
+build/spi/spi_quad_prbs32_hx8k.asc: build/spi/spi_quad_prbs32.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_prbs32.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_prbs32_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_prbs32_hx8k.bin: build/spi/spi_quad_prbs32_hx8k.asc
+	cd build/spi && icepack spi_quad_prbs32_hx8k.asc spi_quad_prbs32_hx8k.bin
+
+# Custom-board 4-lane bitstream with the high nibble advanced one byte
+# (QUAD_HIGH_LEAD=1) to undo the per-byte high/low sample offset. This is the
+# headline custom 4-lane bitstream.
+build/spi/spi_quad_hl.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set QUAD_HIGH_LEAD 1 spi; synth_ice40 -top spi -json spi_quad_hl.json"
+
+build/spi/spi_quad_hl_hx8k.asc: build/spi/spi_quad_hl.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_hl.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_hl_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_hl_hx8k.bin: build/spi/spi_quad_hl_hx8k.asc
+	cd build/spi && icepack spi_quad_hl_hx8k.asc spi_quad_hl_hx8k.bin
+
+# Bit-perfect custom 4-lane bitstream: QUAD_HIGH_LEAD=1 fixes the high/low
+# nibble pairing, and QUAD_SEED_BIAS=255 (-1) cancels the one-count advance
+# that the pairing shift introduces, so the master sees the exact counter
+# value its read address selected. This is the headline bit-perfect bitstream.
+build/spi/spi_quad_bp.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set QUAD_HIGH_LEAD 1 -set QUAD_SEED_BIAS 255 spi; synth_ice40 -top spi -json spi_quad_bp.json"
+
+build/spi/spi_quad_bp_hx8k.asc: build/spi/spi_quad_bp.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_bp.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_bp_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_bp_hx8k.bin: build/spi/spi_quad_bp_hx8k.asc
+	cd build/spi && icepack spi_quad_bp_hx8k.asc spi_quad_bp_hx8k.bin
+
+# Higher high-nibble-lead variants: the lag grows with SCLK, so faster
+# prescalers need a larger byte advance (offset grows with SCLK frequency).
+build/spi/spi_quad_hl%.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set QUAD_HIGH_LEAD $* spi; synth_ice40 -top spi -json spi_quad_hl$*.json"
+
+build/spi/spi_quad_hl%_hx8k.asc: build/spi/spi_quad_hl%.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_hl$*.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_hl$*_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_hl%_hx8k.bin: build/spi/spi_quad_hl%_hx8k.asc
+	cd build/spi && icepack spi_quad_hl$*_hx8k.asc spi_quad_hl$*_hx8k.bin
+
+# Registered-IOB-output variants (QUAD_REG_OUTPUT=1) with HIGH_LEAD=$* to
+# minimise launch delay at the highest prescalers.
+build/spi/spi_quad_ro%.json: $(SPI_VS) build/spi/spi.mk | build/spi
+	cd build/spi && yosys -q -p "read_verilog ../../verilog/spi.v; chparam -set LANES 4 -set FRAME_MODE 1 -set QUAD_REG_OUTPUT 1 -set QUAD_HIGH_LEAD $* spi; synth_ice40 -top spi -json spi_quad_ro$*.json"
+
+build/spi/spi_quad_ro%_hx8k.asc: build/spi/spi_quad_ro%.json verilog/spi_hx8k.pcf
+	cd build/spi && nextpnr-ice40 --hx8k --package ct256 --json spi_quad_ro$*.json --pcf ../../verilog/spi_hx8k.pcf --asc spi_quad_ro$*_hx8k.asc --freq 100 -q --pcf-allow-unconstrained
+
+build/spi/spi_quad_ro%_hx8k.bin: build/spi/spi_quad_ro%_hx8k.asc
+	cd build/spi && icepack spi_quad_ro$*_hx8k.asc spi_quad_ro$*_hx8k.bin
 
 build/spi/spi_quad_framed.bin: build/spi/spi_quad_framed.asc
 	cd build/spi && icepack spi_quad_framed.asc spi_quad_framed.bin

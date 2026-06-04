@@ -25,6 +25,7 @@ BOARDS_uart := hx1k hx8k
 BOARDS_gpio := hx1k hx8k
 BOARDS_sport_tx_prbs := hx8k
 BOARDS_sport_rx := hx8k
+BOARDS_mpu_probe := hx8k
 
 # Per-board nextpnr arguments. Add a row when you add a board.
 nextpnr_pkg_hx1k := tq144
@@ -152,8 +153,12 @@ $(foreach c,$(CHAPTERS),$(eval $(call CHAP_RULES,$(c))))
 # symlink they can read. Re-run after `make bitstream` if either
 # side's `clean` was invoked.
 
-MP135_QSPI_DIR := /home/claude/stm32mp135_test_board/baremetal/qspi/build
-MP135_QSPI_SRC := /home/claude/stm32mp135_test_board/baremetal/qspi
+# Anchor to this Makefile's own directory so the cross-repo handoff
+# resolves regardless of checkout path or invoking CWD. The qspi tree
+# is a sibling of the fpga/ submodule under the superproject root.
+THIS_DIR := $(dir $(realpath $(lastword $(MAKEFILE_LIST))))
+MP135_QSPI_SRC := $(THIS_DIR)../stm32mp135_test_board/baremetal/qspi
+MP135_QSPI_DIR := $(MP135_QSPI_SRC)/build
 
 stage: bitstream
 	@mkdir -p $(MP135_QSPI_DIR)
