@@ -11,8 +11,8 @@ module sport_tx_prbs (
    SB_PLL40_CORE #(
       .FEEDBACK_PATH("SIMPLE"),
       .DIVR(4'd0),
-      .DIVF(7'd82),
-      .DIVQ(3'd4),
+      .DIVF(7'd57),
+      .DIVQ(3'd3),
       .FILTER_RANGE(3'd1)
    ) pll (
       .REFERENCECLK(clk12),
