@@ -461,7 +461,21 @@ module sport_rx #(
    wire [31:0] fe_exp [0:N-1];
    wire        fe_t [0:N-1];
 
-   wire run_gated = run;
+   // Between FPGA config and DSP firmware start, RUN (R10) floats high
+   // while the DSP's SPI boot clocks MHz-rate noise into the lanes -- a
+   // floating-armed receiver can cross a small MIN_DONE during boot and
+   // fire its one-shot report into the boot bus. Honour RUN only after
+   // it has been GENUINELY seen low (the firmware holds it low 60 ms at
+   // start). Zero-init means "not yet seen low", which iCE40 silicon
+   // honours.
+   reg [2:0] run_sync = 3'b000;
+   reg       run_seen_low = 1'b0;
+   always @(posedge clk12) begin
+      run_sync <= {run_sync[1:0], run};
+      if (run_sync[2:1] == 2'b00)
+         run_seen_low <= 1'b1;
+   end
+   wire run_gated = run & run_seen_low;
    wire print_ok = 1'b1;
 
    // Register ad0/afs in the IO cells, clocked by the lane's own ACLK, so
@@ -623,6 +637,7 @@ module sport_rx #(
 `ifdef DIAG_STATE
    reg [25:0] diag_timer = 26'd0;   // defer prints ~5.6 s past config
    reg        diag_go = 1'b0;
+   wire [31:0] fe_probe = fe_idx[REPORT_IDX];
 `endif
 
    function [7:0] prog_char(input [7:0] idx);
@@ -812,8 +827,10 @@ module sport_rx #(
 `ifdef DIAG_FSPHASE
          pe_latch <= prog_e[REPORT_IDX];
 `else
-         pe_latch <= {8'h6a, 3'd0, run, fe_idx_o[REPORT_IDX][3:0],
-                      8'd0, done[REPORT_IDX], 7'd0};
+         pe_latch <= {8'h6a, 3'd0, run, 2'd0, done[0],
+                      done[N > 1 ? 1 : 0], 6'd0, all_done_w, reported,
+                      sending, pre_wait, prog_pend, fe_pend, collecting,
+                      1'b0};
 `endif
 `else
          pw_latch <= prog_w[REPORT_IDX];
@@ -843,6 +860,7 @@ module sport_rx #(
          pre_cnt <= 15'd0;
          send_idx <= 8'd0;
          msg_kind <= 2'd0;
+         tx_oe <= 1'b1;
          diag_send_word <= 4'd0;
          diag_send_digit <= 4'd0;
          reported <= 1'b1;
@@ -854,6 +872,7 @@ module sport_rx #(
          pre_cnt <= 15'd0;
          send_idx <= 8'd0;
          msg_kind <= 2'd0;
+         tx_oe <= 1'b1;
          diag_send_word <= 4'd0;
          diag_send_digit <= 4'd0;
          reported <= 1'b1;
