@@ -8,11 +8,16 @@ module sport_tx_prbs (
    wire pll_clk;
    wire pll_lock;
 
+   // 12 MHz osc -> 12 * (DIVF+1) / 2^DIVQ = 12 * 83 / 16 = 62.25 MHz,
+   // the closest the iCE40 PLL can get to the 62.5 MHz SPORT external-
+   // receive ceiling (datasheet Table 19, fSPTCLKEXT RX) from a 12 MHz
+   // reference. Matches sport_tx_prbs_multi.v so every FPGA->DSP
+   // section runs at the exact same bit clock.
    SB_PLL40_CORE #(
       .FEEDBACK_PATH("SIMPLE"),
       .DIVR(4'd0),
-      .DIVF(7'd57),
-      .DIVQ(3'd3),
+      .DIVF(7'd82),
+      .DIVQ(3'd4),
       .FILTER_RANGE(3'd1)
    ) pll (
       .REFERENCECLK(clk12),

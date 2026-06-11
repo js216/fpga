@@ -1,0 +1,16 @@
+# 4x parallel FPGA -> DSP SPORT PRBS streamer. DSP drives ACLK/AFS as
+# SPORT master; FPGA consumes those directly and drives only AD0.
+# Lanes: SPORT4B, SPORT0B, SPORT5B, SPORT1B.
+set_io run R10
+set_io ad0_out[0]  N10
+set_io aclk_in[0]  T11
+set_io afs_in[0]   T13
+set_io ad0_out[1]  R5
+set_io aclk_in[1]  T5
+set_io afs_in[1]   R9
+set_io ad0_out[2]  T14
+set_io aclk_in[2]  T15
+set_io afs_in[2]   T16
+set_io ad0_out[3]  P8
+set_io aclk_in[3]  P9
+set_io afs_in[3]   T10

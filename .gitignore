@@ -4,3 +4,4 @@ build
 doc
 __pycache__/
 .tools/
+obj_dir/

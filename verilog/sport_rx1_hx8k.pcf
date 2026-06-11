@@ -1,0 +1,8 @@
+# Single-lane DSP TX -> FPGA RX (lane 0 only, N=1 -> scalar port names).
+#   lane 0 SPORT4A routed to DAI1 PB05/PB07/PB08 -> N10/T11/T13
+set_io clk12   J3
+set_io ad0_in  N10
+set_io aclk_in T11
+set_io afs_in  T13
+set_io run     R10
+set_io tx      B12

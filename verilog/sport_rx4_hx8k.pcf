@@ -1,6 +1,4 @@
-# DSP TX pins on the live wiring (fpga-dsp-gpio scan 2026-06):
-#   lane 0 SPORT4A routed to DAI1 PB05/PB07/PB08 -> N10/T11/T13
-#   lane 1 SPORT0A routed to DAI0 PB05/PB07/PB08 -> R5/T5/R9
+# 4x DSP -> FPGA SPORT receiver.
 set_io clk12      J3
 set_io ad0_in[0]  N10
 set_io aclk_in[0] T11
@@ -8,5 +6,11 @@ set_io afs_in[0]  T13
 set_io ad0_in[1]  R5
 set_io aclk_in[1] T5
 set_io afs_in[1]  R9
+set_io ad0_in[2]  T14
+set_io aclk_in[2] T15
+set_io afs_in[2]  T16
+set_io ad0_in[3]  P8
+set_io aclk_in[3] P9
+set_io afs_in[3]  T10
 set_io run         R10
 set_io tx         B12

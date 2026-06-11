@@ -4,6 +4,7 @@ module SB_IO #(
       parameter [0:0] NEG_TRIGGER = 1'b0
    ) (
       inout  PACKAGE_PIN,
+      input  INPUT_CLK,
       input  OUTPUT_CLK,
       input  OUTPUT_ENABLE,
       input  D_OUT_0,
@@ -14,6 +15,9 @@ module SB_IO #(
       if (!((PIN_TYPE === 6'b101001 && NEG_TRIGGER === 1'b0) ||
             (PIN_TYPE === 6'b100101) ||
             (PIN_TYPE === 6'b100001) ||
+            (PIN_TYPE === 6'b000000) ||
+            (PIN_TYPE === 6'b010100) ||
+            (PIN_TYPE === 6'b010000) ||
             (PIN_TYPE === 6'b110101))) begin
          $display("ERROR SB_IO sim model only supports PIN_TYPE=101001 NEG_TRIGGER=0, 100101, 100001, or 110101, got %b %b",
                   PIN_TYPE, NEG_TRIGGER);
@@ -59,9 +63,22 @@ module SB_IO #(
    wire dout_selected = (PIN_TYPE === 6'b100001) ? dout_ddr :
                         (PIN_TYPE === 6'b100101 ||
                          PIN_TYPE === 6'b110101) ? dout_reg : D_OUT_0;
-   wire oe_selected = (PIN_TYPE === 6'b110101) ? oe_reg : OUTPUT_ENABLE;
+   wire oe_selected = (PIN_TYPE === 6'b110101) ? oe_reg : OUTPUT_ENABLE
+                       | (PIN_TYPE === 6'b010100) | (PIN_TYPE === 6'b010000);
+   generate if (PIN_TYPE !== 6'b000000) begin : g_pad_drive
    assign PACKAGE_PIN = oe_selected ? dout_selected : 1'bz;
-   assign D_IN_0 = (PULLUP && (PACKAGE_PIN === 1'bz)) ? 1'b1 : PACKAGE_PIN;
+   end endgenerate
+   /* Registered input (PIN_TYPE=000000): pin captured by INPUT_CLK,
+    * NEG_TRIGGER selects the capture edge. */
+   reg din_q;
+   initial din_q = 1'b0;
+   generate if (NEG_TRIGGER) begin : g_din_neg
+      always @(negedge INPUT_CLK) din_q <= PACKAGE_PIN;
+   end else begin : g_din_pos
+      always @(posedge INPUT_CLK) din_q <= PACKAGE_PIN;
+   end endgenerate
+   wire din_raw = (PULLUP && (PACKAGE_PIN === 1'bz)) ? 1'b1 : PACKAGE_PIN;
+   assign D_IN_0 = (PIN_TYPE === 6'b000000) ? din_q : din_raw;
 endmodule
 
 /* verilator lint_off DECLFILENAME */

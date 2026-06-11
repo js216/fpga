@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: MIT
-// sport_tx_prbs_multi.v --- N parallel SPORT PRBS31 streamers off one PLL.
-// All lanes share the proven single-channel generator. The shared
-// data/frame source makes every lane word-synchronous; the DSP verifies
-// each received lane against the same PRBS31 word stream.
+// sport_tx_prbs_ser.v --- serial-LFSR PRBS31 streamer (bidir-only).
+// Protocol-identical to prbs_chan in sport_tx_prbs_multi.v but generates the
+// PRBS bit stream with a 1-bit-per-clock LFSR instead of a 32-iteration
+// combinational prbs31_word()/prbs31_advance() pair. The emitted serial
+// stream is the raw continuous LFSR output (nb = s[30]^s[27]); since
+// prbs31_word() sends 32 successive LFSR bits MSB-first and advances 32 steps
+// per word, the concatenation is exactly that sequence, so the DSP verifier
+// sees an identical waveform. Removing the two deep combinational chains
+// frees LUTs/routing so the co-located from_dsp receiver can place cleanly.
 
-module prbs_chan (
+module prbs_chan_ser (
       input  pll_clk,
       input  enable,
       output reg ad0_r,
@@ -24,27 +29,7 @@ module prbs_chan (
    reg [21:0] idle_count  = 22'd0;
    reg [30:0] prbs_state  = PRBS31_SEED;
    reg [31:0] shift_word  = 32'd0;
-
-   function [31:0] prbs31_word;
-      input [30:0] s_in; integer i; reg [30:0] s; reg [31:0] w; reg nb;
-      begin
-         s = s_in; w = 32'd0;
-         for (i = 0; i < 32; i = i + 1) begin
-            nb = s[30] ^ s[27]; s = {s[29:0], nb}; w = {w[30:0], nb};
-         end
-         prbs31_word = w;
-      end
-   endfunction
-   function [30:0] prbs31_advance;
-      input [30:0] s_in; integer i; reg [30:0] s; reg nb;
-      begin
-         s = s_in;
-         for (i = 0; i < 32; i = i + 1) begin nb = s[30] ^ s[27]; s = {s[29:0], nb}; end
-         prbs31_advance = s;
-      end
-   endfunction
-
-   wire [31:0] current_payload = prbs31_word(prbs_state);
+   reg        nb;
 
    always @(negedge pll_clk) begin
       if (!enable) begin
@@ -61,33 +46,34 @@ module prbs_chan (
          if (idle_count == IDLE_CYCLES - 22'd1) begin
             phase <= PH_PATTERN; idle_count <= 22'd0; bitcnt <= 5'd0;
          end else idle_count <= idle_count + 22'd1;
-      end else begin
+      end else if (phase == PH_DUMMY) begin
          afs_r <= (bitcnt == 5'd0);
          if (bitcnt == 5'd0) begin
-            if (phase == PH_DUMMY) begin
-               ad0_r <= DUMMY_WORD[31]; shift_word <= {DUMMY_WORD[30:0], 1'b0};
-            end else begin
-               ad0_r <= current_payload[31]; shift_word <= {current_payload[30:0], 1'b0};
-            end
+            ad0_r <= DUMMY_WORD[31]; shift_word <= {DUMMY_WORD[30:0], 1'b0};
             bitcnt <= 5'd1;
          end else begin
             ad0_r <= shift_word[31]; shift_word <= {shift_word[30:0], 1'b0};
             if (bitcnt == 5'd31) begin
                bitcnt <= 5'd0;
-               if (phase == PH_DUMMY) begin
-                  if (dummy_count == DUMMY_WORDS - 14'd1) begin
-                     phase <= PH_IDLE; dummy_count <= 14'd0;
-                  end else dummy_count <= dummy_count + 14'd1;
-               end else prbs_state <= prbs31_advance(prbs_state);
+               if (dummy_count == DUMMY_WORDS - 14'd1) begin
+                  phase <= PH_IDLE; dummy_count <= 14'd0;
+               end else dummy_count <= dummy_count + 14'd1;
             end else bitcnt <= bitcnt + 5'd1;
          end
+      end else begin   // PH_PATTERN: serial LFSR, one bit per clock
+         afs_r <= (bitcnt == 5'd0);
+         nb = prbs_state[30] ^ prbs_state[27];
+         ad0_r <= nb;
+         prbs_state <= {prbs_state[29:0], nb};
+         bitcnt <= (bitcnt == 5'd31) ? 5'd0 : bitcnt + 5'd1;
       end
    end
 endmodule
 
-module sport_tx_prbs_multi #(
-      parameter N = 2,
-      parameter START_DELAY_CYCLES = 0
+module sport_tx_prbs_ser #(
+      parameter N = 1,
+      parameter START_DELAY_CYCLES = 0,
+      parameter TX_QUIET = 0   // diagnostic: keep PLL+logic placed but hold pins static
    )(
       input              clk12,
       output [N-1:0]     ad0_out,
@@ -126,15 +112,16 @@ module sport_tx_prbs_multi #(
    endgenerate
 
    wire ad0_w, afs_w;
-   prbs_chan g (.pll_clk(pll_clk), .enable(stream_enable), .ad0_r(ad0_w), .afs_r(afs_w));
+   wire chan_en = (TX_QUIET != 0) ? 1'b0 : stream_enable;
+   prbs_chan_ser g (.pll_clk(pll_clk), .enable(chan_en), .ad0_r(ad0_w), .afs_r(afs_w));
 
-   assign ad0_out = {N{ad0_w}};
-   assign afs_out = {N{afs_w}};
+   assign ad0_out = (TX_QUIET != 0) ? {N{1'b0}} : {N{ad0_w}};
+   assign afs_out = (TX_QUIET != 0) ? {N{1'b0}} : {N{afs_w}};
 
    genvar i;
    generate
       for (i = 0; i < N; i = i + 1) begin : ch
-         assign aclk_out[i] = pll_clk;
+         assign aclk_out[i] = (TX_QUIET != 0) ? 1'b0 : pll_clk;
       end
    endgenerate
 endmodule

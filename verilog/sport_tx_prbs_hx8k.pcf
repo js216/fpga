@@ -1,11 +1,10 @@
 # SPORT4 half-B RECEIVE pins on the live wiring (fpga-dsp-gpio scan, 2026-06).
-# The DSP's SPORT4B receives data<-PB05, ACLK<-PB07, AFS<-PB08
-# (sport_install_external_loopback), so the FPGA drives those:
+# The DSP drives ACLK/AFS as SPORT master; the FPGA consumes those directly
+# and drives only AD0.
 #   DAI1_PIN05 (data)  -> ball N10
 #   DAI1_PIN07 (ACLK)  -> ball T11
 #   DAI1_PIN08 (AFS)   -> ball T13
-# clk12 is the board's 12 MHz oscillator (J3), not a DSP jumper.
-set_io clk12    J3
-set_io ad0_out  N10
-set_io aclk_out T11
-set_io afs_out  T13
+set_io run        R10
+set_io ad0_out    N10
+set_io aclk_in    T11
+set_io afs_in     T13

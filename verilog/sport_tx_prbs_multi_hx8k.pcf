@@ -1,9 +1,13 @@
-# 2x parallel SPORT PRBS streamer. Channel 0 -> SPORT4 RX pins, channel 1 -> SPORT0 RX pins.
-# Live wiring (fpga-dsp-gpio scan 2026-06): DAI1 PB05/07/08 -> N10/T11/T13; DAI0 PB05/07/08 -> R5/T5/R9.
-set_io clk12 J3
+# 2x parallel SPORT PRBS streamer. DSP drives ACLK/AFS as SPORT master;
+# FPGA consumes those directly and drives only AD0.
+# Ch0 -> SPORT4A wired pins, ch1 -> SPORT0B pins.
+# Live wiring (fpga-dsp-gpio scan 2026-06):
+#   SPORT4A = DAI1 PB05/07/08 -> N10/T11/T13
+#   SPORT0B = DAI0 PB05/07/08 -> R5/T5/R9
+set_io run R10
 set_io ad0_out[0]  N10
-set_io aclk_out[0] T11
-set_io afs_out[0]  T13
+set_io aclk_in[0]  T11
+set_io afs_in[0]   T13
 set_io ad0_out[1]  R5
-set_io aclk_out[1] T5
-set_io afs_out[1]  R9
+set_io aclk_in[1]  T5
+set_io afs_in[1]   R9
