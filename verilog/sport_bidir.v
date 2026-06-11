@@ -13,7 +13,10 @@ module sport_bidir #(
       parameter NOPLL_DATA_NEG = 1,
       parameter NOPLL_CLK_POS = 1,
       parameter [1:0] SYNC_PH = 2'd1,
-      parameter SHARE_PAIRS = 0   // 4-lane: pairs share one clk/fs pad
+      parameter SHARE_PAIRS = 0,  // 4-lane: pairs share one clk/fs pad
+      parameter FROM_DSP_EN = 1   // 0: D->F lanes are unverified clock
+                                  // scaffolding -- receiver held in reset,
+                                  // prints nothing, claims nothing
    )(
       input clk12,
       input run,
@@ -22,6 +25,7 @@ module sport_bidir #(
       output [TX_TO_DSP_N-1:0] fpga_ad0_out,
       output [(SHARE_PAIRS ? TX_TO_DSP_N/2 : TX_TO_DSP_N)-1:0] fpga_aclk_out,
       output [(SHARE_PAIRS ? TX_TO_DSP_N/2 : TX_TO_DSP_N)-1:0] fpga_afs_out,
+      output led,
       input  [RX_FROM_DSP_N-1:0] dsp_ad0_in,
       input  [RX_FROM_DSP_N-1:0] dsp_aclk_in,
       input  [RX_FROM_DSP_N-1:0] dsp_afs_in,
@@ -53,9 +57,18 @@ module sport_bidir #(
                   // dsp_aclk_in[0]/[1], SRU copies on aclk2 (P10) and
                   // aclk3 (T8), so no lane's phase moves with another's
                   // clock load.
+                  // Rule proven by the 4-lane config: forwarders run on
+                  // the SRU clock copies, never on the primary clocks that
+                  // feed the from_dsp capture registers -- mixing loads
+                  // shifts the capture/launch phases per netlist.
+                  // Empirically pinned per lane count, each to its only
+                  // never-failed clocking: 1x1 forwards the primary;
+                  // 2x2 puts both forwarders on the SRU copies; 4-lane
+                  // pairs share the copies (SHARE_PAIRS).
                   .fwd_aclk(SHARE_PAIRS != 0
                             ? (tx_i < 2 ? dsp_aclk2_in : dsp_aclk3_in)
-                            : (tx_i == 0 ? dsp_aclk_in[0] : dsp_aclk2_in)),
+                            : (TX_TO_DSP_N == 1 ? dsp_aclk_in[0]
+                               : (tx_i == 0 ? dsp_aclk2_in : dsp_aclk3_in))),
                   .run(run),
                   .ad0_out(tx_ad0_w[tx_i]),
                   .aclk_out(tx_aclk_w[tx_i]),
@@ -105,11 +118,12 @@ module sport_bidir #(
    sport_rx #(.N(RX_FROM_DSP_N), .MIN_DONE_WORDS(MIN_DONE_WORDS),
               .REPORT_LANE0(REPORT_LANE0), .REPORT_IDX(REPORT_IDX),
               .RESYNC(1), .RUN_GATE(0)) from_dsp (
+      .led(led),
       .clk12(clk12),
       .aclk_in(dsp_aclk_in),
       .ad0_in(dsp_ad0_in),
       .afs_in(dsp_afs_in),
-      .run(run),
+      .run(FROM_DSP_EN ? run : 1'b0),
       .tx(tx)
    );
 endmodule

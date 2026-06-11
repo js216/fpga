@@ -434,8 +434,14 @@ module sport_rx #(
       input  [N-1:0] ad0_in,
       input  [N-1:0] afs_in,
       input        run,
-      inout        tx
+      inout        tx,
+      // Visual transfer-in-progress indicator: toggles once per
+      // heartbeat line, so it blinks at ~0.5 Hz while data flows
+      // and holds steady when idle.
+      output reg   led
    );
+
+   initial led = 1'b0;
 
    wire [31:0] words [0:N-1];
    wire [31:0] errors [0:N-1];
@@ -842,6 +848,7 @@ module sport_rx #(
          pre_cnt <= 15'd0;
          tx_oe <= 1'b1;
          prog_pend <= 1'b0;
+         led <= ~led;
       end else if (REPORT_LANE0 && print_ok && !reported && all_done_w
                    && !sending && !pre_wait) begin
 `ifdef DIAG_FIRST

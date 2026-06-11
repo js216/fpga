@@ -6,3 +6,4 @@ set_io aclk_in T11
 set_io afs_in  T13
 set_io run     R10
 set_io tx      B12
+set_io led B5
