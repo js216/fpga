@@ -139,20 +139,3 @@ module sport_tx_from_dsp_clk #(
       end
    endgenerate
 endmodule
-
-module sport_tx_from_dsp_clk_1 (
-      (* noglobal *) input run,
-      input aclk_in,
-      input afs_in,
-      output ad0_out
-   );
-   sport_tx_from_dsp_clk_chan #(
-      .DIRECT_OUT(1),
-      .EARLY_BIT(0)
-   ) lane0 (
-      .run(run),
-      .aclk_in(aclk_in),
-      .afs_in(afs_in),
-      .ad0_out(ad0_out)
-   );
-endmodule

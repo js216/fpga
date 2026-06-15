@@ -23,7 +23,6 @@ PACKAGE ?= tq144
 BOARDS_blinky := hx1k hx8k
 BOARDS_uart := hx1k hx8k
 BOARDS_gpio := hx1k hx8k
-BOARDS_sport_tx_prbs := hx8k
 BOARDS_sport_rx := hx8k
 BOARDS_mpu_probe := hx8k
 

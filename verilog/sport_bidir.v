@@ -12,7 +12,6 @@ module sport_bidir #(
       parameter NOPLL = 0,
       parameter NOPLL_DATA_NEG = 1,
       parameter NOPLL_CLK_POS = 1,
-      parameter [1:0] SYNC_PH = 2'd1,
       parameter SHARE_PAIRS = 0,  // 4-lane: pairs share one clk/fs pad
       parameter FROM_DSP_EN = 1   // 0: D->F lanes are unverified clock
                                   // scaffolding -- receiver held in reset,
@@ -45,10 +44,8 @@ module sport_bidir #(
 
    generate
       if (SYNC_TX != 0) begin : sync_tx
-         // Source-synchronous streamer. The NOPLL path instantiates one
-         // top-level IO-backed transmitter per output lane, all clocked by the
-         // DSP-forwarded ACLK. The legacy PLL path is kept behind NOPLL=0.
-         wire s_ad0, s_aclk, s_afs;
+         // Source-synchronous streamer: one top-level IO-backed transmitter
+         // per output lane, all clocked by the DSP-forwarded ACLK (NOPLL=1).
          if (NOPLL != 0) begin : nopll
             genvar tx_i;
             for (tx_i = 0; tx_i < TX_TO_DSP_N; tx_i = tx_i + 1) begin : lanes
@@ -86,16 +83,6 @@ module sport_bidir #(
                   .afs_out(tx_afs_w[tx_i])
                );
             end
-         end else begin : withpll
-            sport_tx_sync #(.PH(SYNC_PH)) to_dsp (
-               .fwd_aclk(dsp_aclk_in[0]),
-               .ad0_out(s_ad0),
-               .aclk_out(s_aclk),
-               .afs_out(s_afs)
-            );
-            assign tx_ad0_w  = {TX_TO_DSP_N{s_ad0}};
-            assign tx_aclk_w = {TX_TO_DSP_N{s_aclk}};
-            assign tx_afs_w  = {TX_TO_DSP_N{s_afs}};
          end
       end else begin : free_tx
          sport_tx_prbs_ser #(
