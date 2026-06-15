@@ -20,14 +20,20 @@ module sport_bidir #(
    )(
       input clk12,
       input run,
-      input dsp_aclk2_in,
-      input dsp_aclk3_in,
       output [TX_TO_DSP_N-1:0] fpga_ad0_out,
       output [(SHARE_PAIRS ? TX_TO_DSP_N/2 : TX_TO_DSP_N)-1:0] fpga_aclk_out,
       output [(SHARE_PAIRS ? TX_TO_DSP_N/2 : TX_TO_DSP_N)-1:0] fpga_afs_out,
       output led,
       input  [RX_FROM_DSP_N-1:0] dsp_ad0_in,
       input  [RX_FROM_DSP_N-1:0] dsp_aclk_in,
+`ifdef SHARE_COPIES
+      // 4-lane only: pair forwarders launch from the SRU clock copies
+      // (P10/T8), the never-failed clocking for SHARE_PAIRS. Primary
+      // forwarding (proven for 1x1/2x2) showed thermal-onset pair0
+      // desync on the 4-lane netlists (FFFF-DDDD 2026-06-12 evening).
+      input  dsp_aclk2_in,
+      input  dsp_aclk3_in,
+`endif
       input  [RX_FROM_DSP_N-1:0] dsp_afs_in,
       inout tx
    );
@@ -61,14 +67,19 @@ module sport_bidir #(
                   // the SRU clock copies, never on the primary clocks that
                   // feed the from_dsp capture registers -- mixing loads
                   // shifts the capture/launch phases per netlist.
-                  // Empirically pinned per lane count, each to its only
-                  // never-failed clocking: 1x1 forwards the primary;
-                  // 2x2 puts both forwarders on the SRU copies; 4-lane
-                  // pairs share the copies (SHARE_PAIRS).
-                  .fwd_aclk(SHARE_PAIRS != 0
-                            ? (tx_i < 2 ? dsp_aclk2_in : dsp_aclk3_in)
-                            : (TX_TO_DSP_N == 1 ? dsp_aclk_in[0]
-                               : (tx_i == 0 ? dsp_aclk2_in : dsp_aclk3_in))),
+                  // Every forwarder launches from the PRIMARY capture
+                  // clock of its lane. The SRU copies (P10/T8) existed to
+                  // offload primaries that EYE_DELAY's fabric spurs were
+                  // loading; with EYE_DELAY gone the primaries are clean
+                  // globals, and copy-clocked 2x2 forwarders showed a
+                  // thermal-onset single-lane desync (FF-DD 512MiB,
+                  // 2026-06-12, onset moves run-to-run = analog).
+                  .fwd_aclk(
+`ifdef SHARE_COPIES
+                            SHARE_PAIRS != 0
+                            ? (tx_i < 2 ? dsp_aclk2_in : dsp_aclk3_in) :
+`endif
+                            dsp_aclk_in[tx_i]),
                   .run(run),
                   .ad0_out(tx_ad0_w[tx_i]),
                   .aclk_out(tx_aclk_w[tx_i]),

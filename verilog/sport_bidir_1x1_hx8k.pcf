@@ -9,6 +9,4 @@ set_io dsp_aclk_in   T11
 set_io dsp_afs_in    T13
 set_io tx            B12
 set_io run     R10
-set_io dsp_aclk2_in P10
-set_io dsp_aclk3_in T8
 set_io led B5

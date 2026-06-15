@@ -122,6 +122,16 @@ module sport_rx_chan #(
 `ifdef DIAG_FSPHASE
    reg [15:0] fs_gap = 16'd0;
 `endif
+`ifdef DIAG_GAPAUDIT
+   // FS-gap auditor: every frame must span exactly gap_nominal aclk
+   // edges (32). Any deviation is an extra/missing clock edge ON THE
+   // WIRE -- recorded as {gap[7:0], wcount[23:0]} per anomaly.
+   reg [15:0] gap_audit = 16'd0;
+   reg [15:0] gap_nominal = 16'd0;
+   reg        gap_lock = 1'b0;
+   reg [4:0]  fsbit_nominal = 5'd0;
+   reg        fsbit_lock = 1'b0;
+`endif
  `ifdef DIAG_WINDOW_START
    localparam [31:0] DIAG_BASE = `DIAG_WINDOW_START;
  `else
@@ -142,6 +152,41 @@ module sport_rx_chan #(
 
    always @(`ACLK_SAMPLE_EDGE aclk_global) begin
       afs_d <= afs_r;
+`ifdef DIAG_GAPAUDIT
+      if (afs_r && !afs_d) begin
+         if (started && !gap_lock) begin
+            gap_nominal <= gap_audit + 16'd1;
+            gap_lock <= 1'b1;
+         end else if (fsbit_lock == 1'b0 && gap_lock) begin
+            fsbit_nominal <= bitpos;
+            fsbit_lock <= 1'b1;
+         end else if (gap_lock && fsbit_lock
+                      && ((gap_audit + 16'd1) != gap_nominal
+                          || bitpos != fsbit_nominal)
+                      && diag_count < 4'd8) begin
+            case (diag_count)
+               4'd0: diag_word0 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd1: diag_word1 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd2: diag_word2 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd3: diag_word3 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd4: diag_word4 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd5: diag_word5 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd6: diag_word6 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd7: diag_word7 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd8: diag_word8 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd9: diag_word9 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               default: begin end
+            endcase
+            diag_count <= diag_count + 4'd1;
+         end
+         gap_audit <= 16'd0;
+      end else begin
+         gap_audit <= gap_audit + 16'd1;
+      end
+      // live counts in the last two diag slots so the dump stands alone
+      diag_word8 <= wcount;
+      diag_word9 <= ecount;
+`endif
 `ifdef DIAG_STATE
       fe_idx_r <= {28'd0, fs_seen, armed, started, pass_ready};
 `endif
@@ -283,6 +328,7 @@ module sport_rx_chan #(
                end
 `ifdef DIAG_WORDS
 `ifndef DIAG_FSPHASE
+`ifndef DIAG_GAPAUDIT
                if (wcount >= DIAG_BASE && diag_count < 4'd10) begin
                   case (diag_count)
                      4'd0: diag_word0 <= next_word;
@@ -299,6 +345,7 @@ module sport_rx_chan #(
                   endcase
                   diag_count <= diag_count + 4'd1;
                end
+`endif
 `endif
 `endif
                end

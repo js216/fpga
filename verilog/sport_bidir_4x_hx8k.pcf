@@ -13,8 +13,6 @@ set_io fpga_ad0_out[3]  R4
 # DSP TX master clocks in (4A on T11, 0A on T5) + SRU copies
 set_io dsp_aclk_in[0]  T11
 set_io dsp_aclk_in[1]  T5
-set_io dsp_aclk2_in P10
-set_io dsp_aclk3_in T8
 # from_dsp data/fs stubs (capture unused in this case but ports exist)
 set_io dsp_ad0_in[0]   N10
 set_io dsp_afs_in[0]   T13
@@ -23,3 +21,5 @@ set_io dsp_afs_in[1]   R9
 set_io tx            B12
 set_io run     R10
 set_io led B5
+set_io dsp_aclk2_in P10
+set_io dsp_aclk3_in T8
