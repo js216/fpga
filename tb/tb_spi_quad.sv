@@ -32,7 +32,7 @@ module tb_spi_quad;
             #5;
          end
       endtask
-
+   
       task automatic clock_dummy_bit;
          begin
             #5;
@@ -42,7 +42,7 @@ module tb_spi_quad;
             #5;
          end
       endtask
-
+   
       task automatic send_cmd_byte(input [7:0] value);
          integer bitidx;
          begin
@@ -50,7 +50,7 @@ module tb_spi_quad;
                clock_cmd_bit(value[bitidx]);
          end
       endtask
-
+   
       task automatic send_frame_header(input [23:0] start);
          integer d;
          begin
@@ -64,7 +64,7 @@ module tb_spi_quad;
                clock_dummy_bit();
          end
       endtask
-
+   
          task automatic clock_byte(input integer expected);
                reg [7:0] expected_raw;
                begin
@@ -105,7 +105,7 @@ module tb_spi_quad;
          end
       end
    endtask
-
+   
          task automatic clock_byte_paused(input integer expected);
                reg [3:0] first_end, second_end;
                reg [7:0] expected_raw;

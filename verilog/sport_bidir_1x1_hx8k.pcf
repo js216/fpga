@@ -1,9 +1,7 @@
 set_io clk12 J3
-# FPGA PRBS out -> DSP SPORT5B RX (DAI1 9/10/11 -> T14/T15/T16)
 set_io fpga_ad0_out  T14
 set_io fpga_aclk_out T15
 set_io fpga_afs_out  T16
-# DSP counter (SPORT4A TX) -> FPGA from_dsp (DAI1 5/7/8 -> N10/T11/T13)
 set_io dsp_ad0_in    N10
 set_io dsp_aclk_in   T11
 set_io dsp_afs_in    T13

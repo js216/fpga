@@ -1,14 +1,5 @@
 // SPDX-License-Identifier: MIT
-// sport_tx_prbs_ser.v --- serial-LFSR PRBS31 streamer (bidir-only).
-// Protocol-identical to prbs_chan in sport_tx_prbs_multi.v but generates the
-// PRBS bit stream with a 1-bit-per-clock LFSR instead of a 32-iteration
-// combinational prbs31_word()/prbs31_advance() pair. The emitted serial
-// stream is the raw continuous LFSR output (nb = s[30]^s[27]); since
-// prbs31_word() sends 32 successive LFSR bits MSB-first and advances 32 steps
-// per word, the concatenation is exactly that sequence, so the DSP verifier
-// sees an identical waveform. Removing the two deep combinational chains
-// frees LUTs/routing so the co-located from_dsp receiver can place cleanly.
-
+// Copyright (c) 2026 Jakob Kastelic
 module prbs_chan_ser (
       input  pll_clk,
       input  enable,
@@ -60,7 +51,7 @@ module prbs_chan_ser (
                end else dummy_count <= dummy_count + 14'd1;
             end else bitcnt <= bitcnt + 5'd1;
          end
-      end else begin   // PH_PATTERN: serial LFSR, one bit per clock
+      end else begin
          afs_r <= (bitcnt == 5'd0);
          nb = prbs_state[30] ^ prbs_state[27];
          ad0_r <= nb;
@@ -69,11 +60,10 @@ module prbs_chan_ser (
       end
    end
 endmodule
-
 module sport_tx_prbs_ser #(
       parameter N = 1,
       parameter START_DELAY_CYCLES = 0,
-      parameter TX_QUIET = 0   // diagnostic: keep PLL+logic placed but hold pins static
+      parameter TX_QUIET = 0
    )(
       input              clk12,
       output [N-1:0]     ad0_out,

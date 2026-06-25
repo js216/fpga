@@ -1450,7 +1450,7 @@ build/gpio/gpio.bin: build/gpio/hx1k/gpio.bin
 	cp $< $@
 
 build/gpio/sim: tb/tb_gpio.sv $(GPIO_VS) $(GPIO_SIM_LIB) | build/gpio
-	cd build/gpio && verilator --Mdir obj_dir -Wall --binary --top-module tb_gpio ../../tb/tb_gpio.sv ../../verilog/gpio.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v ../../verilog/SB_IO.v
+	cd build/gpio && verilator --Mdir obj_dir -Wall -Wno-PINMISSING --binary --top-module tb_gpio ../../tb/tb_gpio.sv ../../verilog/gpio.v ../../verilog/uart_tx.v ../../verilog/uart_rx.v ../../verilog/SB_IO.v
 	cd build/gpio && obj_dir/Vtb_gpio
 	@touch $@
 

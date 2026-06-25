@@ -5,11 +5,6 @@ CHAPTERS := $(notdir $(basename $(wildcard src/*.nw)))
 
 chapter_src = src/$(1).nw
 
-LITTST_BINDIR ?= $(CURDIR)/.tools/bin
-ifneq ($(wildcard $(LITTST_BINDIR)/tangle),)
-export PATH := $(LITTST_BINDIR):$(PATH)
-endif
-
 # Single-target default (used by chapters that don't declare BOARDS_<name>).
 # Override on the command line: `make DEVICE=hx8k PACKAGE=ct256 ...`.
 DEVICE  ?= hx1k

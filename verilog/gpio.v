@@ -17,22 +17,22 @@ module gpio #(
    reg        tx_start;
    reg  [7:0] tx_data;
    wire       tx_busy;
-
+   
    reg [15:0] gpio_out;
    reg [15:0] gpio_oe;
-
+   
    // Bench cursor for the connectivity-test counter commands
    // (see "Per-pin cursor commands" below).
    reg [4:0]  cursor;
-
+   
    reg [2:0]  rx_state;
    reg        cmd_is_enable;
    reg [11:0] accum;
    wire       rx_ready;
    wire [7:0] rx_data;
-
+   
    localparam LAST_IDX = 3'd5;
-
+   
    localparam RX_IDLE = 3'd0;
    localparam RX_D0   = 3'd1;
    localparam RX_D1   = 3'd2;
@@ -221,7 +221,7 @@ module gpio #(
    reg f_past_valid;
    initial f_past_valid = 0;
    always @(posedge clk) f_past_valid <= 1;
-
+   
    always @(posedge clk) begin
       if (f_past_valid && $past(tx_start))
          assert(!tx_start);

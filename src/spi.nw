@@ -1992,12 +1992,12 @@ build/spi/check_spi_netlist.py: src/spi.nw | build/spi
 	cd build/spi && tangle check_spi_netlist.py < ../../$<
 
 build/spi/sim_1lane: tb/tb_spi_1lane.sv $(SPI_VS) $(SPI_SIM_LIB) | build/spi
-	cd build/spi && verilator --Mdir obj_1lane -Wall --binary --top-module tb_spi_1lane ../../tb/tb_spi_1lane.sv ../../verilog/spi.v ../../verilog/SB_IO.v
+	cd build/spi && verilator --Mdir obj_1lane -Wall -Wno-PINMISSING --binary --top-module tb_spi_1lane ../../tb/tb_spi_1lane.sv ../../verilog/spi.v ../../verilog/SB_IO.v
 	cd build/spi && obj_1lane/Vtb_spi_1lane
 	@touch $@
 
 build/spi/sim_quad: tb/tb_spi_quad.sv $(SPI_VS) $(SPI_SIM_LIB) | build/spi
-	cd build/spi && verilator --Mdir obj_quad -Wall --binary --top-module tb_spi_quad ../../tb/tb_spi_quad.sv ../../verilog/spi.v ../../verilog/SB_IO.v
+	cd build/spi && verilator --Mdir obj_quad -Wall -Wno-PINMISSING --binary --top-module tb_spi_quad ../../tb/tb_spi_quad.sv ../../verilog/spi.v ../../verilog/SB_IO.v
 	cd build/spi && obj_quad/Vtb_spi_quad
 	@touch $@
 

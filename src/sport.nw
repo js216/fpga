@@ -1,0 +1,2566 @@
+== SPORT: the DSP--FPGA serial data link
+
+This chapter is the single source for every FPGA bitstream the SPORT
+missions use. The link carries a PRBS-31 stream between the ADSP-21569
+DSP and the iCE40-HX8K FPGA over the DSP's synchronous serial ports
+(SPORTs), and verifies it bit-for-bit at the receiving end. One FPGA
+top module, `sport_bidir`, covers all eight tested directions --- 1-,
+2-, and 4-lane DSP$\rightarrow$FPGA (D2F), the symmetric FPGA$\rightarrow$DSP
+(F2D), and the 1x1 and 2x2 bidirectional cases --- selected entirely by
+parameters. It is the FPGA counterpart of the single DSP application in
+`adsp2156/sport`.
+
+Every lane is a one-bit-per-clock PRBS-31 stream framed into 32-bit
+words. There is no handshake, training sequence, or descrambler: both
+endpoints run the same LFSR from the same seed, stepped by the same
+bit clock, so they stay in lockstep and the receiver simply compares
+the wire against its own locally generated word. The DSP is always the
+bus master and owns the bit clock; the FPGA never generates a clock of
+its own (no PLL in the data path).
+
+`sport_bidir` is built from three pieces, each developed in its own
+section below:
+
+  - `sport_tx_sync_nopll` --- the *no-PLL source-synchronous
+    transmitter* (`to_dsp`). It generates a PRBS-31 lane clocked by the
+    DSP's forwarded clock, so it is in lockstep with the DSP's receiver
+    with no clock of its own. This is what every mission uses for an F2D
+    lane.
+
+  - `sport_tx_prbs_ser` --- a *free-running* transmitter that makes its
+    own bit clock with a PLL. It predates the no-PLL transmitter and the
+    missions no longer select it, but `sport_bidir` keeps it as the
+    alternate clocking strategy, so it is documented here too.
+
+  - `sport_rx` --- the *receiver* (`from_dsp`). It samples a DSP-driven
+    lane on the forwarded clock, reassembles 32-bit words, checks each
+    against its own PRBS-31 LFSR, and reports the running word and error
+    counts over UART. This is what verifies a D2F lane.
+
+=== The PRBS-31 stream
+
+The payload is the maximum-length 31-bit linear-feedback sequence of
+the primitive polynomial $x^{31} + x^{28} + 1$. A 31-bit shift register
+`lfsr` holds the state; the next bit is the XOR of the two tap bits
+`lfsr[30] ^ lfsr[27]`, shifted in at the low end. Seeded to all-ones
+(`31'h7FFFFFFF` --- any non-zero seed works, an LFSR cannot leave the
+zero state) it cycles through all $2^{31}-1$ non-zero states before
+repeating. One state advances per bit, so at the 59.375 Mbps lane rate
+the sequence repeats only every $(2^{31}-1)/59.375\text{e}6 \approx 36$
+seconds --- far longer than any single mission word, so no lane ever
+sees the pattern wrap.
+
+Two conventions are fixed across the whole link and must match on both
+ends:
+
+  - *MSB-first.* Each 32-bit word is the next 32 successive LFSR output
+    bits, sent most-significant first. A transmitter that emits one
+    `lfsr[30]^lfsr[27]` bit per clock and a receiver that shifts each
+    received bit into the bottom of a 32-bit register therefore agree on
+    word boundaries without any alignment search.
+
+  - *Word zero is the first frame.* The transmitter holds its LFSR at
+    the seed until the link goes live, so the very first 32-bit word the
+    receiver sees is the seed word. The frame-sync line `afs` marks bit0
+    of every word for the DSP's late-frame-sync SPORT framing.
+
+Because the transmitter sends 32 successive LFSR bits per word and
+advances the LFSR 32 steps per word, a serial one-bit-per-clock LFSR
+and a 32-bit-at-a-time word generator emit byte-identical waveforms.
+Both styles appear below (the serial form in the no-PLL transmitter,
+the word form historically in `sport_tx_prbs_ser`), and the receiver
+checks either against the same locally stepped LFSR.
+
+=== The no-PLL source-synchronous transmitter
+
+`sport_tx_sync_nopll` drives one F2D lane. The DSP is the clock master:
+it forwards its SPORT bit clock to the FPGA as `fwd_aclk`, and this
+module clocks everything from that --- there is no PLL and no
+free-running clock anywhere in the transmit path. The DSP's receiver
+LFSR and this LFSR both start at the seed and are stepped by the same
+clock edges, so they advance bit-for-bit together with nothing to lose
+lock to.
+
+The module holds `lfsr` at the seed while `run` is inactive. When `run`
+asserts, a six-bit `warm` counter waits 63 stable forwarded-clock ticks
+before releasing the LFSR, so that word zero lands on the first frame
+after the clock is known good rather than on a startup glitch. The
+`run` input, which crosses from the DSP-controlled domain, is taken
+through a two-stage synchronizer `run_s`.
+
+<<sport_tx_sync_nopll.v>>=
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Jakob Kastelic
+module sport_tx_sync_nopll #(
+      parameter DATA_NEG = 1,
+      parameter CLK_POS  = 1
+   )(
+      input  fwd_aclk,
+      input  run,
+      output ad0_out,
+      output aclk_out,
+      output afs_out
+   );
+   reg [1:0] run_s = 2'b00;
+   reg [5:0] warm  = 6'd0;
+   localparam [30:0] PRBS31_SEED = 31'h7FFFFFFF;
+
+   reg [30:0] lfsr   = PRBS31_SEED;
+   reg [4:0]  bitcnt = 5'd0;
+   reg        ad0_p  = 1'b0;
+   reg        afs_p  = 1'b0;
+
+   <<Step the PRBS LFSR one bit per forwarded clock>>
+   <<Launch the lane on source-synchronous output pads>>
+endmodule
+@
+
+While warming or idle the LFSR reloads the seed and the outputs sit
+low. Once warm, one PRBS bit is emitted per forwarded-clock period:
+`ad0_p` takes the next tap XOR, `afs_p` pulses on the bit-0 of each
+word (`bitcnt` wraps 31$\rightarrow$0 on its own), and the LFSR shifts
+in the bit it just sent.
+
+<<Step the PRBS LFSR one bit per forwarded clock>>=
+always @(posedge fwd_aclk) begin
+   run_s <= {run_s[0], run};
+   if (!run_s[1] || warm != 6'd63) begin
+      if (run_s[1])
+         warm <= warm + 6'd1;
+      else
+         warm <= 6'd0;
+      lfsr   <= PRBS31_SEED;
+      bitcnt <= 5'd0;
+      ad0_p  <= 1'b0;
+      afs_p  <= 1'b0;
+   end else begin
+      ad0_p  <= lfsr[30] ^ lfsr[27];
+      afs_p  <= (bitcnt == 5'd0);
+      lfsr   <= {lfsr[29:0], (lfsr[30] ^ lfsr[27])};
+      bitcnt <= bitcnt + 5'd1;
+   end
+end
+@
+
+The three output pads are the only part of the link whose analog
+timing was tuned. Data and frame-sync are launched through matched
+`SB_IO` output flops on the falling edge of `fwd_aclk` (`DATA_NEG`),
+half a bit period away from the DSP receiver's rising-edge sample so
+the sample lands in the centre of the eye and away from the
+simultaneous-switching-output disturbance. The forwarded clock
+`aclk_out` is a DDR output that rises at the posedge (`CLK_POS`), so it
+arrives centred on the data. The two phase knobs `DATA_NEG` and
+`CLK_POS` are the parameters that were swept to find that alignment.
+
+<<Launch the lane on source-synchronous output pads>>=
+SB_IO #(.PIN_TYPE(6'b010100), .NEG_TRIGGER(DATA_NEG ? 1'b1 : 1'b0)) ad0_io (
+   .PACKAGE_PIN(ad0_out), .OUTPUT_CLK(fwd_aclk), .D_OUT_0(ad0_p)
+);
+SB_IO #(.PIN_TYPE(6'b010100), .NEG_TRIGGER(DATA_NEG ? 1'b1 : 1'b0)) afs_io (
+   .PACKAGE_PIN(afs_out), .OUTPUT_CLK(fwd_aclk), .D_OUT_0(afs_p)
+);
+SB_IO #(.PIN_TYPE(6'b010000)) aclk_io (
+   .PACKAGE_PIN(aclk_out), .OUTPUT_CLK(fwd_aclk),
+   .D_OUT_0(CLK_POS ? 1'b1 : 1'b0), .D_OUT_1(CLK_POS ? 1'b0 : 1'b1)
+);
+@
+
+=== The free-running transmitter
+
+`sport_tx_prbs_ser` is the older F2D transmitter and the alternative
+`sport_bidir` instantiates when `SYNC_TX` is zero. Where the no-PLL
+transmitter borrows the DSP's clock, this one makes its own bit clock
+with an `SB_PLL40_CORE` from the 12 MHz reference and free-runs. The
+missions all select the no-PLL transmitter now, so this module is no
+longer on the critical path, but it is kept as the second clocking
+strategy and so is documented here.
+
+The PRBS payload is generated by a one-bit-per-clock serial LFSR ---
+the same recurrence and seed as everywhere else, so the waveform is
+identical to a word-at-a-time generator and the receiver cannot tell
+the two apart. (The serial form replaced an earlier word-at-a-time
+generator with two deep combinational chains; dropping those freed
+enough LUTs and routing for a co-located `from_dsp` receiver to place
+cleanly in the bidirectional builds.)
+
+A single channel, `prbs_chan_ser`, runs a three-phase startup before
+the live stream. It first emits 8192 dummy words of a fixed pattern
+(`0xA5A55A5A`), then holds the line idle for 200000 clocks, then begins
+the PRBS pattern. The dummy/idle preamble gives the DSP-side framing a
+known run-up before word zero. Each phase counts 32-bit words via
+`bitcnt`, and `afs_r` pulses on bit0 of every word exactly as on the
+live stream. The channel launches on the *negedge* of `pll_clk`, half a
+bit period from the DSP receiver's posedge sample --- the same
+mid-bit-eye launch the no-PLL transmitter gets from its `SB_IO` negedge
+flops, but here built into the logic clock edge since this stream rides
+its own PLL clock rather than a forwarded one.
+
+<<Free-running PRBS channel>>=
+module prbs_chan_ser (
+      input  pll_clk,
+      input  enable,
+      output reg ad0_r,
+      output reg afs_r
+   );
+   localparam [30:0] PRBS31_SEED = 31'h7fffffff;
+   localparam [31:0] DUMMY_WORD  = 32'hA5A55A5A;
+   localparam [13:0] DUMMY_WORDS = 14'd8192;
+   localparam [21:0] IDLE_CYCLES = 22'd200000;
+   localparam [1:0]  PH_DUMMY    = 2'd0;
+   localparam [1:0]  PH_IDLE     = 2'd1;
+   localparam [1:0]  PH_PATTERN  = 2'd2;
+
+   reg [4:0]  bitcnt      = 5'd0;
+   reg [1:0]  phase       = PH_DUMMY;
+   reg [13:0] dummy_count = 14'd0;
+   reg [21:0] idle_count  = 22'd0;
+   reg [30:0] prbs_state  = PRBS31_SEED;
+   reg [31:0] shift_word  = 32'd0;
+   reg        nb;
+
+   always @(negedge pll_clk) begin
+      if (!enable) begin
+         ad0_r <= 1'b0;
+         afs_r <= 1'b0;
+         bitcnt <= 5'd0;
+         phase <= PH_DUMMY;
+         dummy_count <= 14'd0;
+         idle_count <= 22'd0;
+         prbs_state <= PRBS31_SEED;
+         shift_word <= 32'd0;
+      end else if (phase == PH_IDLE) begin
+         afs_r <= 1'b0; ad0_r <= 1'b0;
+         if (idle_count == IDLE_CYCLES - 22'd1) begin
+            phase <= PH_PATTERN; idle_count <= 22'd0; bitcnt <= 5'd0;
+         end else idle_count <= idle_count + 22'd1;
+      end else if (phase == PH_DUMMY) begin
+         afs_r <= (bitcnt == 5'd0);
+         if (bitcnt == 5'd0) begin
+            ad0_r <= DUMMY_WORD[31]; shift_word <= {DUMMY_WORD[30:0], 1'b0};
+            bitcnt <= 5'd1;
+         end else begin
+            ad0_r <= shift_word[31]; shift_word <= {shift_word[30:0], 1'b0};
+            if (bitcnt == 5'd31) begin
+               bitcnt <= 5'd0;
+               if (dummy_count == DUMMY_WORDS - 14'd1) begin
+                  phase <= PH_IDLE; dummy_count <= 14'd0;
+               end else dummy_count <= dummy_count + 14'd1;
+            end else bitcnt <= bitcnt + 5'd1;
+         end
+      end else begin
+         afs_r <= (bitcnt == 5'd0);
+         nb = prbs_state[30] ^ prbs_state[27];
+         ad0_r <= nb;
+         prbs_state <= {prbs_state[29:0], nb};
+         bitcnt <= (bitcnt == 5'd31) ? 5'd0 : bitcnt + 5'd1;
+      end
+   end
+endmodule
+@
+
+The top wraps that channel: the PLL multiplies the 12 MHz reference up
+to the bit clock, an optional `START_DELAY_CYCLES` gate holds the
+stream off until the link is up, the channel drives all `N` output
+lanes identically, and `TX_QUIET` is a diagnostic that keeps the PLL
+and logic placed but parks every pin low.
+
+<<Free-running transmitter top>>=
+module sport_tx_prbs_ser #(
+      parameter N = 1,
+      parameter START_DELAY_CYCLES = 0,
+      parameter TX_QUIET = 0
+   )(
+      input              clk12,
+      output [N-1:0]     ad0_out,
+      output [N-1:0]     aclk_out,
+      output [N-1:0]     afs_out
+   );
+   wire pll_clk, pll_lock;
+   SB_PLL40_CORE #(
+      .FEEDBACK_PATH("SIMPLE"),
+      .DIVR(4'd0),
+      .DIVF(7'd82),
+      .DIVQ(3'd4),
+      .FILTER_RANGE(3'd1)
+   ) pll (
+      .REFERENCECLK(clk12), .PLLOUTCORE(pll_clk), .LOCK(pll_lock),
+      .RESETB(1'b1), .BYPASS(1'b0)
+   );
+
+   wire stream_enable;
+   generate
+      if (START_DELAY_CYCLES == 0) begin : no_delay
+         assign stream_enable = 1'b1;
+      end else begin : delayed_start
+         reg [31:0] start_delay = 32'd0;
+         reg stream_enable_r = 1'b0;
+         always @(posedge clk12) begin
+            if (!stream_enable_r) begin
+               if (start_delay == START_DELAY_CYCLES - 1)
+                  stream_enable_r <= 1'b1;
+               else
+                  start_delay <= start_delay + 32'd1;
+            end
+         end
+         assign stream_enable = stream_enable_r;
+      end
+   endgenerate
+
+   wire ad0_w, afs_w;
+   wire chan_en = (TX_QUIET != 0) ? 1'b0 : stream_enable;
+   prbs_chan_ser g (.pll_clk(pll_clk), .enable(chan_en), .ad0_r(ad0_w), .afs_r(afs_w));
+
+   assign ad0_out = (TX_QUIET != 0) ? {N{1'b0}} : {N{ad0_w}};
+   assign afs_out = (TX_QUIET != 0) ? {N{1'b0}} : {N{afs_w}};
+
+   genvar i;
+   generate
+      for (i = 0; i < N; i = i + 1) begin : ch
+         assign aclk_out[i] = (TX_QUIET != 0) ? 1'b0 : pll_clk;
+      end
+   endgenerate
+endmodule
+@
+
+Both modules tangle into one file, the channel first so it is defined
+before its instantiation:
+
+<<sport_tx_prbs_ser.v>>=
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Jakob Kastelic
+<<Free-running PRBS channel>>
+<<Free-running transmitter top>>
+@
+
+=== The receiver: sport_rx
+
+`sport_rx` is the D2F verifier. Each of its `N` lanes carries a DSP-driven
+PRBS-31 stream framed into 32-bit words on a forwarded bit clock; the module
+reassembles those words, checks each against its own locally stepped LFSR,
+and once enough words have been seen prints a single PASS/FAIL line over
+UART. The two test boards wire lane 0 to SPORT4A on DAI1 (PB01/PB02/PB04 ->
+P13/M11/P10) and lane 1 to SPORT0A routed onto DAI0 (PB05/PB07/PB08 ->
+R5/T5/R9). After every forwarded clock has been idle for about 5 ms the
+report goes out as
+
+----
+sport_rx lanes=... per_ch_words_hex=... errors_hex=... PASS
+----
+
+on the UART pad (115200 baud, `tx` = B12).
+
+The file is one per-lane checker `sport_rx_chan` followed by the
+`N`-lane wrapper `sport_rx` that instantiates it, aggregates the lanes,
+and owns the UART. The channel must be defined before the wrapper that
+instantiates it, so it tangles first.
+
+<<sport_rx.v>>=
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Jakob Kastelic
+<<The sample-edge selector>>
+<<sport_rx_chan: the per-lane checker>>
+<<sport_rx: the N-lane wrapper>>
+@
+
+The forwarded clock is the only clock the receive logic runs on, and the
+edge on which the lane is sampled is a build-time choice. By default the
+data and frame-sync are captured on the falling edge of the forwarded
+clock --- half a bit away from the launching edge, in the centre of the
+eye --- but defining `SAMPLE_POS` moves capture to the rising edge.
+
+<<The sample-edge selector>>=
+`ifndef SAMPLE_POS
+ `define ACLK_SAMPLE_EDGE negedge
+`else
+ `define ACLK_SAMPLE_EDGE posedge
+`endif
+@
+
+==== The per-lane checker
+
+`sport_rx_chan` checks one lane. Its ports split into the inputs from
+the lane (`aclk_in`, `ad0_in`, `afs_in`), the `clk12`-domain `run` and
+`done` handshake, and a wide bundle of count/diagnostic outputs. `RESYNC`
+selects the re-acquiring frame state machine used in the bidirectional
+builds; `MIN_DONE_WORDS` is how many good words constitute a completed
+transfer; `MSB_FIRST` matches the link's bit order.
+
+<<sport_rx_chan: the per-lane checker>>=
+module sport_rx_chan #(
+      parameter MIN_DONE_WORDS = 32'h00b00000,
+      parameter MSB_FIRST = 1,
+      parameter RESYNC = 0
+   )(
+      input        clk12,
+      input        run,
+      input        aclk_in,
+      input        ad0_in,
+      input        afs_in,
+      output [31:0] words,
+      output [31:0] errors,
+      output [31:0] first_rx,
+      output [31:0] first_exp,
+      output [31:0] first_idx,
+      output [31:0] diag0,
+      output [31:0] diag1,
+      output [31:0] diag2,
+      output [31:0] diag3,
+      output [31:0] diag4,
+      output [31:0] diag5,
+      output [31:0] diag6,
+      output [31:0] diag7,
+      output [31:0] diag8,
+      output [31:0] diag9,
+      output       done,
+      output [31:0] prog_w,
+      output [31:0] prog_e,
+      output        prog_t,
+      output [31:0] fe_idx_o,
+      output [31:0] fe_got_o,
+      output [31:0] fe_exp_o,
+      output        fe_t
+   );
+
+   <<sport_rx_chan: progress and first-error snapshot registers>>
+   <<sport_rx_chan: sample the lane in the aclk domain>>
+   <<sport_rx_chan: PRBS lockstep state>>
+   <<sport_rx_chan: next-word and next-expected-word combinational logic>>
+   <<sport_rx_chan: the frame state machine and word check>>
+   <<sport_rx_chan: cross to clk12 and detect idle>>
+   <<sport_rx_chan: drive the outputs>>
+endmodule
+@
+
+Two snapshots cross to the `clk12` UART domain. The `prog_*` set is a
+roughly 1 Hz progress heartbeat: every $2^{21}$ words (8 MiB at 60+ Mbps,
+the `PROG_MASK` boundary) the current word and error counts are latched and
+`prog_t` toggled. The `fe_*` set is a one-shot first-error capture ---
+the word index, the received word, and the expected word at the first
+mismatch, with `fe_t` toggled once. Both are level snapshots with a toggle
+handshake so the slow domain can latch them without a true CDC FIFO.
+
+<<sport_rx_chan: progress and first-error snapshot registers>>=
+   localparam [31:0] PROG_MASK = 32'h001fffff;
+
+   reg [31:0] prog_w_r = 32'd0;
+   reg [31:0] prog_e_r = 32'd0;
+   reg        prog_t_r = 1'b0;
+   reg [31:0] fe_idx_r = 32'd0;
+   reg [31:0] fe_got_r = 32'd0;
+   reg [31:0] fe_exp_r = 32'd0;
+   reg        fe_t_r   = 1'b0;
+   reg        fe_seen  = 1'b0;
+   assign prog_w = prog_w_r;
+   assign prog_e = prog_e_r;
+   assign prog_t = prog_t_r;
+   assign fe_idx_o = fe_idx_r;
+   assign fe_got_o = fe_got_r;
+   assign fe_exp_o = fe_exp_r;
+   assign fe_t = fe_t_r;
+@
+
+The lane's data and frame-sync are sampled into `ad0_r`/`afs_r` on the
+selected edge of the forwarded clock. (The wrapper has already registered
+the pins in the IO cells; this is the fabric-side copy the checker works
+from.)
+
+<<sport_rx_chan: sample the lane in the aclk domain>>=
+   wire aclk_global = aclk_in;
+
+   reg ad0_r = 1'b0;
+   reg afs_r = 1'b0;
+   always @(`ACLK_SAMPLE_EDGE aclk_global) begin
+      ad0_r <= ad0_in;
+      afs_r <= afs_in;
+   end
+@
+
+The checker is a pure PRBS-31 lockstep comparator with no sync mechanism.
+The DSP transmits 32-bit PRBS-31 words; `run` holds both endpoint LFSRs at
+the shared seed `31'h7FFFFFFF`. The first observed frame-sync can include
+pad/SRU startup state from before the SPORT stream is fully up, so that one
+fixed startup word is discarded without advancing the LFSR. From the next
+word on, the checker steps exactly once per 32 DSP bit clocks --- there is
+no phase search, training pattern, skipped-word alignment, or data-dependent
+re-sync. `lfsr` is the live expected-bit generator; `lfsr_word` snapshots it
+at each word boundary so a mid-word abort can rewind to a clean boundary.
+`bitpos` counts bits within a word, `started`/`armed`/`arm_wait` run the
+acquire sequence, `pass_ready` marks the startup frame as dropped, and
+`fs_seen` tracks the first (artifact) frame-sync rise.
+
+<<sport_rx_chan: PRBS lockstep state>>=
+   localparam [30:0] PRBS31_SEED = 31'h7FFFFFFF;
+   reg [30:0] lfsr   = PRBS31_SEED;
+   reg        afs_d  = 1'b0;
+   reg [4:0]  bitpos = 5'd0;
+   reg        started = 1'b0;
+   reg        armed = 1'b0;
+   reg [2:0]  arm_wait = 3'd0;
+   reg        pass_ready = 1'b0;
+   reg        fs_seen = 1'b0;
+   reg [30:0] lfsr_word = 31'h7FFFFFFF;
+   reg [31:0] shift_word = 32'd0;
+   reg [31:0] exp_shift_word = 32'd0;
+   reg [31:0] wcount = 32'd0;
+   reg [31:0] ecount = 32'd0;
+   reg        done_aclk = 1'b0;
+   reg        done_toggle = 1'b0;
+   reg [31:0] report_words_aclk = 32'd0;
+   reg [31:0] report_errors_aclk = 32'd0;
+   <<sport_rx_chan: optional diagnostic state>>
+@
+
+Several optional diagnostic taps, all off by default, are compiled in by
+`define`s. `DIAG_FIRST` records the very first received/expected word and
+its index; `DIAG_WORDS` captures the first ten words (or, with
+`DIAG_WINDOW_START`, the first ten past a chosen index) into the ten `diag`
+outputs; `DIAG_FSPHASE` measures the frame-sync gap; and `DIAG_GAPAUDIT`
+verifies every frame spans exactly the nominal number of forwarded-clock
+edges, recording any deviation --- an extra or missing edge on the wire ---
+into the diag slots.
+
+==== Diagnostic build options
+
+These were all bring-up instruments. *None is set in any shipping
+build*, so every block below is `ifdef`-fenced out of the mission
+bitstreams and contributes nothing to the synthesized netlist; they are
+documented here so a future debugger knows what each one captures and
+which ones conflict.
+
+[cols="<,<,<",options="header"]
+|===
+| macro | what it captures | exclusions / notes
+| `DIAG_FIRST`        | first received/expected word + its index | with `DIAG_MISMATCH`, captures only the first *mismatching* word
+| `DIAG_MISMATCH`     | narrows `DIAG_FIRST` to the first error | needs `DIAG_FIRST`
+| `DIAG_INDEX`        | reports the first-word *index* instead of expected word | needs `DIAG_FIRST`
+| `DIAG_WORDS`        | first ten checked words into the ten diag slots | disables the live progress line; mutually exclusive with `DIAG_FSPHASE` and `DIAG_GAPAUDIT` (they own the diag slots)
+| `DIAG_WINDOW_START` | start `DIAG_WORDS` capture past a chosen word index | needs `DIAG_WORDS`
+| `DIAG_FSPHASE`      | frame-sync gap + bit position at each FS rise; arms `done` after ten captures | owns the diag slots; overrides `DIAG_WORDS`
+| `DIAG_GAPAUDIT`     | per-frame edge-count audit (extra/missing wire edges) | owns the diag slots; overrides `DIAG_WORDS`; clobbers `diag_word8/9` with live word/error counts
+| `DIAG_STATE`        | mirrors acquire flags into `fe_idx`; repurposes the progress line as a periodic state dump | suppresses the normal first-error line
+| `DIAG_RAW`          | reports a raw forwarded-clock edge count as the word count | alternate report trigger; takes priority over `DIAG_FORCE_REPORT`
+| `DIAG_FORCE_REPORT` | forces a report after about 10 s instead of on idle | alternate report trigger
+| `DIAG_FORCE_LIVE`   | keeps the report registers live (not zeroed on reset) | for reading counts mid-run
+|===
+
+<<sport_rx_chan: optional diagnostic state>>=
+`ifdef DIAG_FIRST
+   reg [31:0] first_rx_r = 32'd0;
+   reg [31:0] first_exp_r = 32'd0;
+   reg [31:0] first_idx_r = 32'd0;
+   reg        first_seen = 1'b0;
+`endif
+`ifdef DIAG_WORDS
+   reg [31:0] diag_word0 = 32'd0;
+   reg [31:0] diag_word1 = 32'd0;
+   reg [31:0] diag_word2 = 32'd0;
+   reg [31:0] diag_word3 = 32'd0;
+   reg [31:0] diag_word4 = 32'd0;
+   reg [31:0] diag_word5 = 32'd0;
+   reg [31:0] diag_word6 = 32'd0;
+   reg [31:0] diag_word7 = 32'd0;
+   reg [31:0] diag_word8 = 32'd0;
+   reg [31:0] diag_word9 = 32'd0;
+   reg [3:0]  diag_count = 4'd0;
+`ifdef DIAG_FSPHASE
+   reg [15:0] fs_gap = 16'd0;
+`endif
+`ifdef DIAG_GAPAUDIT
+   reg [15:0] gap_audit = 16'd0;
+   reg [15:0] gap_nominal = 16'd0;
+   reg        gap_lock = 1'b0;
+   reg [4:0]  fsbit_nominal = 5'd0;
+   reg        fsbit_lock = 1'b0;
+`endif
+ `ifdef DIAG_WINDOW_START
+   localparam [31:0] DIAG_BASE = `DIAG_WINDOW_START;
+ `else
+   localparam [31:0] DIAG_BASE = 32'd0;
+ `endif
+`endif
+@
+
+The expected word and the received word are both assembled
+combinationally. `next_word` shifts the just-sampled bit into the running
+receive word, MSB-first by default (LSB-first builds set the bit at
+`bitpos`). `exp_bit` is the next PRBS output `lfsr[30]^lfsr[27]`, `lfsr_next`
+the LFSR after one step, and `next_exp_word` the expected word with that bit
+appended. `next_word_bad` is the per-word comparison.
+
+<<sport_rx_chan: next-word and next-expected-word combinational logic>>=
+   wire [31:0] next_msb_word = {shift_word[30:0], ad0_r};
+   wire [31:0] next_lsb_word = shift_word | (32'h1 << bitpos);
+   wire [31:0] next_word = MSB_FIRST ? next_msb_word :
+                            (ad0_r ? next_lsb_word : shift_word);
+
+   wire        exp_bit = lfsr[30] ^ lfsr[27];
+   wire [30:0] lfsr_next = {lfsr[29:0], exp_bit};
+   wire [31:0] next_exp_word = {exp_shift_word[30:0], exp_bit};
+
+   wire        next_word_bad = (next_word != next_exp_word);
+@
+
+The heart of the checker is one `always` block on the sample edge. It
+delays the frame-sync (`afs_d`) for edge detection, runs the optional
+diagnostics, then steps through the acquire/check state machine. The states,
+in priority order, are: idle reset while `run` is low and nothing started;
+hold the finished report while `run` is low after `done`; the `RESYNC`
+dep-FS arm-at-any-rise; the plain arm/`arm_wait`/start sequence; the
+`RESYNC` mid-word abort (frame-sync dipped before bit 31, so rewind to the
+boundary and re-arm); and the running check itself, which shifts in each
+bit, compares whole words at `bitpos == 31`, updates counts, captures the
+first error, fires the progress heartbeat, latches the report at
+`MIN_DONE_WORDS`, and (under `RESYNC`) idles when the frame-sync goes low.
+
+The dep-FS arming is what lets the bidirectional builds re-acquire: any
+frame-sync rise arms the checker, and a false or glitch rise self-corrects
+through the mid-word abort, so no startup-artifact bookkeeping is needed.
+The first complete word seen only sets `pass_ready` (dropping the startup
+frame); checking begins on the word after.
+
+<<sport_rx_chan: the frame state machine and word check>>=
+   always @(`ACLK_SAMPLE_EDGE aclk_global) begin
+      afs_d <= afs_r;
+<<sport_rx_chan: DIAG_GAPAUDIT auditor>>
+<<sport_rx_chan: DIAG_STATE probe>>
+<<sport_rx_chan: DIAG_FSPHASE probe>>
+      if (!run && !done_aclk && !started) begin
+<<sport_rx_chan: state --- idle reset>>
+      end else if (!run && done_aclk) begin
+<<sport_rx_chan: state --- hold the finished report>>
+      end else if (RESYNC && !started && afs_r && !afs_d) begin
+<<sport_rx_chan: state --- RESYNC arm on any frame-sync rise>>
+      end else if (!started && afs_r && !afs_d) begin
+<<sport_rx_chan: state --- plain arm>>
+      end else if (!started && armed && arm_wait < 3'd3) begin
+<<sport_rx_chan: state --- plain arm_wait>>
+      end else if (!started && armed) begin
+<<sport_rx_chan: state --- plain start>>
+      end else if (RESYNC && started && !afs_r && bitpos != 5'd31) begin
+<<sport_rx_chan: state --- RESYNC mid-word abort>>
+      end else if (started) begin
+<<sport_rx_chan: state --- running check>>
+      end
+   end
+@
+
+While `run` is low and the checker has neither started nor finished, the
+state machine sits in idle reset: everything reloads its power-on value
+so the next `run` starts from a clean seed. (`DIAG_FORCE_LIVE` keeps the
+report registers live across this reset for mid-run readout.)
+
+<<sport_rx_chan: state --- idle reset>>=
+            lfsr <= PRBS31_SEED;
+            afs_d <= 1'b0;
+            bitpos <= 5'd0;
+            started <= 1'b0;
+            armed <= 1'b0;
+            arm_wait <= 3'd0;
+            pass_ready <= 1'b0;
+            shift_word <= 32'd0;
+            exp_shift_word <= 32'd0;
+            wcount <= 32'd0;
+            ecount <= 32'd0;
+            done_aclk <= 1'b0;
+            fe_seen <= 1'b0;
+            fs_seen <= 1'b0;
+`ifndef DIAG_FORCE_LIVE
+            report_words_aclk <= 32'd0;
+            report_errors_aclk <= 32'd0;
+`endif
+@
+
+Once `done` is latched and `run` drops, the report is held: only the
+acquire flags are cleared, so the counts and the report registers stay
+put for the slow domain to read.
+
+<<sport_rx_chan: state --- hold the finished report>>=
+            started <= 1'b0;
+            armed <= 1'b0;
+@
+
+The `RESYNC` builds arm on *any* frame-sync rise and start checking
+immediately: this is the re-acquire entry. `pass_ready` is set right
+away (the first word is consumed to seed the engine), the LFSR snapshot
+`lfsr_word` is taken so a later mid-word abort can rewind, and the first
+bit is shifted in.
+
+<<sport_rx_chan: state --- RESYNC arm on any frame-sync rise>>=
+            started <= 1'b1;
+            pass_ready <= 1'b1;
+            lfsr_word <= lfsr;
+            bitpos <= 5'd1;
+            shift_word <= MSB_FIRST ? {31'd0, ad0_r}
+                                    : (ad0_r ? 32'h00000001 : 32'd0);
+            exp_shift_word <= {31'd0, exp_bit};
+            lfsr <= lfsr_next;
+@
+
+In the non-`RESYNC` builds arming is a three-step pipeline. A frame-sync
+rise arms the checker and resets the settle counter:
+
+<<sport_rx_chan: state --- plain arm>>=
+            armed <= 1'b1;
+            arm_wait <= 3'd0;
+@
+
+then `arm_wait` counts three stable edges before starting:
+
+<<sport_rx_chan: state --- plain arm_wait>>=
+            arm_wait <= arm_wait + 3'd1;
+@
+
+and on the fourth it starts, shifting in the first bit. The LFSR only
+advances once `pass_ready` is set (the very first word is dropped as the
+startup frame).
+
+<<sport_rx_chan: state --- plain start>>=
+            armed <= 1'b0;
+            bitpos <= 5'd1;
+            started <= 1'b1;
+            shift_word <= MSB_FIRST ? {31'd0, ad0_r}
+                                    : (ad0_r ? 32'h00000001 : 32'd0);
+            if (pass_ready) begin
+               exp_shift_word <= {31'd0, exp_bit};
+               lfsr <= lfsr_next;
+            end
+@
+
+If the frame-sync dips before bit 31 mid-word, the `RESYNC` builds treat
+it as a lost frame: rewind the LFSR to the snapshot taken at the last
+boundary and drop back to unstarted so the next rise re-arms cleanly.
+
+<<sport_rx_chan: state --- RESYNC mid-word abort>>=
+            started <= 1'b0;
+            bitpos <= 5'd0;
+            shift_word <= 32'd0;
+            exp_shift_word <= 32'd0;
+            lfsr <= lfsr_word;
+@
+
+The running check shifts in each bit, advancing the LFSR in step (once
+`pass_ready`). On the word boundary (`bitpos == 31`) it either drops the
+startup word or runs the per-word check; between boundaries it just
+counts bits up.
+
+<<sport_rx_chan: state --- running check>>=
+            shift_word <= next_word;
+            if (pass_ready) begin
+               exp_shift_word <= next_exp_word;
+               lfsr <= lfsr_next;
+            end
+`ifdef DIAG_FORCE_LIVE
+            report_words_aclk <= wcount;
+            report_errors_aclk <= ecount;
+`endif
+            if (bitpos == 5'd31) begin
+               if (!pass_ready) begin
+                  pass_ready <= 1'b1;
+               end else begin
+<<sport_rx_chan: DIAG_FIRST capture>>
+<<sport_rx_chan: check --- compare and count the word>>
+<<sport_rx_chan: check --- progress heartbeat>>
+<<sport_rx_chan: check --- capture the first error>>
+<<sport_rx_chan: check --- latch the report at MIN_DONE_WORDS>>
+<<sport_rx_chan: DIAG_WORDS capture>>
+               end
+            bitpos <= 5'd0;
+            shift_word <= 32'd0;
+            exp_shift_word <= 32'd0;
+            if (RESYNC && !afs_r)
+               started <= 1'b0;
+            if (RESYNC)
+               lfsr_word <= lfsr_next;
+            end else begin
+               bitpos <= bitpos + 5'd1;
+            end
+@
+
+The word compare bumps the word count and, on a miscompare, the error
+count:
+
+<<sport_rx_chan: check --- compare and count the word>>=
+               wcount <= wcount + 32'd1;
+               if (next_word_bad) begin
+                  ecount <= ecount + 32'd1;
+               end
+@
+
+Every `PROG_MASK`+1 words (the roughly 1 Hz boundary) the current counts
+are snapshotted into the progress fields and `prog_t_r` toggled:
+
+<<sport_rx_chan: check --- progress heartbeat>>=
+               if (((wcount + 32'd1) & PROG_MASK) == 32'd0) begin
+                  prog_w_r <= wcount + 32'd1;
+                  prog_e_r <= ecount + (next_word_bad ? 32'd1 : 32'd0);
+                  prog_t_r <= ~prog_t_r;
+               end
+@
+
+The first miscompare is captured once --- its index, received, and
+expected word --- with `fe_t_r` toggled to hand it to the slow domain:
+
+<<sport_rx_chan: check --- capture the first error>>=
+               if (next_word_bad && !fe_seen) begin
+                  fe_seen  <= 1'b1;
+                  fe_idx_r <= wcount;
+                  fe_got_r <= next_word;
+                  fe_exp_r <= next_exp_word;
+                  fe_t_r   <= ~fe_t_r;
+               end
+@
+
+When the word count reaches `MIN_DONE_WORDS` the transfer is complete:
+`done_aclk` latches, the final counts are frozen into the report
+registers, and `done_toggle` flips to cross the completion to `clk12`.
+
+<<sport_rx_chan: check --- latch the report at MIN_DONE_WORDS>>=
+               if (!done_aclk && (wcount + 32'd1) >= MIN_DONE_WORDS) begin
+                  done_aclk <= 1'b1;
+                  done_toggle <= ~done_toggle;
+                  report_words_aclk <= wcount + 32'd1;
+                  report_errors_aclk <= ecount + (next_word_bad ? 32'd1 : 32'd0);
+               end
+@
+
+The frame-sync gap auditor, under `DIAG_GAPAUDIT`, locks the nominal
+per-frame edge count (32) and the nominal frame-sync bit position on the
+first frames, then records any later frame whose span or bit position
+deviates as `{gap[7:0], bitpos, wcount[18:0]}`, with the live word and error
+counts mirrored into the last two diag slots so a dump stands alone.
+
+<<sport_rx_chan: DIAG_GAPAUDIT auditor>>=
+`ifdef DIAG_GAPAUDIT
+      if (afs_r && !afs_d) begin
+         if (started && !gap_lock) begin
+            gap_nominal <= gap_audit + 16'd1;
+            gap_lock <= 1'b1;
+         end else if (fsbit_lock == 1'b0 && gap_lock) begin
+            fsbit_nominal <= bitpos;
+            fsbit_lock <= 1'b1;
+         end else if (gap_lock && fsbit_lock
+                      && ((gap_audit + 16'd1) != gap_nominal
+                          || bitpos != fsbit_nominal)
+                      && diag_count < 4'd8) begin
+            case (diag_count)
+               4'd0: diag_word0 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd1: diag_word1 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd2: diag_word2 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd3: diag_word3 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd4: diag_word4 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd5: diag_word5 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd6: diag_word6 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd7: diag_word7 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd8: diag_word8 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               4'd9: diag_word9 <= {gap_audit[7:0] + 8'd1, bitpos, wcount[18:0]};
+               default: begin end
+            endcase
+            diag_count <= diag_count + 4'd1;
+         end
+         gap_audit <= 16'd0;
+      end else begin
+         gap_audit <= gap_audit + 16'd1;
+      end
+      diag_word8 <= wcount;
+      diag_word9 <= ecount;
+`endif
+@
+
+`DIAG_STATE` mirrors the acquire flags into `fe_idx_r` for inspection:
+
+<<sport_rx_chan: DIAG_STATE probe>>=
+`ifdef DIAG_STATE
+      fe_idx_r <= {28'd0, fs_seen, armed, started, pass_ready};
+`endif
+@
+
+`DIAG_FSPHASE` records the gap between frame-sync rises and the bit
+position at each rise into the diag slots and the progress fields, then
+arms `done` after ten captures so the snapshot is reported:
+
+<<sport_rx_chan: DIAG_FSPHASE probe>>=
+`ifdef DIAG_FSPHASE
+      fs_gap <= fs_gap + 16'd1;
+      if (run && afs_r && !afs_d) begin
+         fs_gap <= 16'd0;
+         prog_w_r <= {16'd0, fs_gap};
+         prog_e_r <= {prog_e_r[31:16] + 16'd1, 5'd0, started, 5'd0, bitpos};
+         if (diag_count < 4'd10) begin
+            case (diag_count)
+               4'd0: diag_word0 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               4'd1: diag_word1 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               4'd2: diag_word2 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               4'd3: diag_word3 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               4'd4: diag_word4 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               4'd5: diag_word5 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               4'd6: diag_word6 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               4'd7: diag_word7 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               4'd8: diag_word8 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               4'd9: diag_word9 <= {fs_gap, 5'd0, started, 5'd0, bitpos};
+               default: begin end
+            endcase
+            diag_count <= diag_count + 4'd1;
+            if (!done_aclk) begin
+               done_aclk <= 1'b1;
+               done_toggle <= ~done_toggle;
+            end
+         end
+      end
+`endif
+@
+
+`DIAG_FIRST` latches the first received/expected word and its index ---
+under `DIAG_MISMATCH` only on the first mismatching word:
+
+<<sport_rx_chan: DIAG_FIRST capture>>=
+`ifdef DIAG_FIRST
+`ifdef DIAG_MISMATCH
+               if (!first_seen && next_word_bad) begin
+`else
+               if (!first_seen) begin
+`endif
+                  first_rx_r <= next_word;
+                  first_exp_r <= next_exp_word;
+                  first_idx_r <= wcount;
+                  first_seen <= 1'b1;
+               end
+`endif
+@
+
+`DIAG_WORDS` captures the first ten checked words (past `DIAG_BASE`) into
+the diag slots, disabled when the FS-phase or gap auditors own those slots:
+
+<<sport_rx_chan: DIAG_WORDS capture>>=
+`ifdef DIAG_WORDS
+`ifndef DIAG_FSPHASE
+`ifndef DIAG_GAPAUDIT
+               if (wcount >= DIAG_BASE && diag_count < 4'd10) begin
+                  case (diag_count)
+                     4'd0: diag_word0 <= next_word;
+                     4'd1: diag_word1 <= next_word;
+                     4'd2: diag_word2 <= next_word;
+                     4'd3: diag_word3 <= next_word;
+                     4'd4: diag_word4 <= next_word;
+                     4'd5: diag_word5 <= next_word;
+                     4'd6: diag_word6 <= next_word;
+                     4'd7: diag_word7 <= next_word;
+                     4'd8: diag_word8 <= next_word;
+                     4'd9: diag_word9 <= next_word;
+                     default: begin end
+                  endcase
+                  diag_count <= diag_count + 4'd1;
+               end
+`endif
+`endif
+`endif
+@
+
+The aclk-domain `done_toggle` and a free-running `aclk_toggle` are carried
+into the `clk12` domain through three-stage synchronizers. `aclk_active` is
+true while the forwarded clock is toggling; when it stops for `IDLE_THRESH`
+the link is considered idle. The completed report crosses on a
+`done_pending`/`done_wait` handshake: when `done_toggle` flips, wait
+`8'hff` `clk12` ticks for the aclk-domain count registers to be stable, then
+latch `report_words`/`report_errors` and raise `done_r`. `DIAG_RAW` and
+`DIAG_FORCE_REPORT` are alternative report triggers --- a raw edge count, or
+a forced report after about 10 s --- used during bring-up.
+
+<<sport_rx_chan: cross to clk12 and detect idle>>=
+   reg aclk_toggle = 1'b0;
+   always @(posedge aclk_global) aclk_toggle <= ~aclk_toggle;
+
+`ifdef DIAG_RAW
+   reg [31:0] raw_edges = 32'd0;
+   always @(posedge aclk_global) raw_edges <= raw_edges + 32'd1;
+`endif
+
+   reg [2:0] tog_sync = 3'b000;
+   always @(posedge clk12) tog_sync <= {tog_sync[1:0], aclk_toggle};
+   wire aclk_active = (tog_sync[2] ^ tog_sync[1]);
+
+   reg [16:0] idle_cnt = 17'd0;
+   localparam IDLE_THRESH = 17'd60000;
+   reg done_r = 1'b0;
+
+   reg [31:0] report_words = 32'd0;
+   reg [31:0] report_errors = 32'd0;
+   reg [2:0] done_sync = 3'b000;
+   reg        done_pending = 1'b0;
+   reg [7:0]  done_wait = 8'd0;
+`ifdef DIAG_RAW
+ `define DIAG_FORCE_CNT
+`elsif DIAG_FORCE_REPORT
+ `define DIAG_FORCE_CNT
+`endif
+`ifdef DIAG_FORCE_CNT
+   reg [31:0] force_cnt = 32'd0;
+`endif
+   always @(posedge clk12) begin
+      done_sync <= {done_sync[1:0], done_toggle};
+`ifdef DIAG_RAW
+      report_words <= raw_edges;
+      report_errors <= 32'd0;
+`elsif DIAG_FORCE_REPORT
+      if (force_cnt < 32'd120000000) force_cnt <= force_cnt + 32'd1;
+      if (!done_r && force_cnt == 32'd119999999) begin
+         report_words <= report_words_aclk;
+         report_errors <= report_errors_aclk;
+         done_r <= 1'b1;
+      end
+`endif
+      if (aclk_active) begin
+         idle_cnt <= 17'd0;
+      end else if (idle_cnt < IDLE_THRESH) begin
+         idle_cnt <= idle_cnt + 17'd1;
+      end
+`ifdef DIAG_RAW
+      if (force_cnt < 32'd120000000) force_cnt <= force_cnt + 32'd1;
+      if (!done_r && force_cnt == 32'd119999999) done_r <= 1'b1;
+`elsif DIAG_FORCE_REPORT
+`else
+      if (!done_r && !done_pending && (done_sync[2] ^ done_sync[1])) begin
+         done_pending <= 1'b1;
+         done_wait <= 8'd0;
+      end else if (done_pending) begin
+         done_wait <= done_wait + 8'd1;
+         if (done_wait == 8'hff) begin
+            report_words <= report_words_aclk;
+            report_errors <= report_errors_aclk;
+            done_r <= 1'b1;
+            done_pending <= 1'b0;
+         end
+      end
+`endif
+   end
+@
+
+The outputs expose the latched report and, when their diagnostics are
+enabled, the first-word and diag captures; otherwise those tie off to zero.
+
+<<sport_rx_chan: drive the outputs>>=
+   assign words = report_words;
+   assign errors = report_errors;
+`ifdef DIAG_FIRST
+   assign first_rx = first_rx_r;
+   assign first_exp = first_exp_r;
+   assign first_idx = first_idx_r;
+`else
+   assign first_rx = 32'd0;
+   assign first_exp = 32'd0;
+   assign first_idx = 32'd0;
+`endif
+`ifdef DIAG_WORDS
+   assign diag0 = diag_word0;
+   assign diag1 = diag_word1;
+   assign diag2 = diag_word2;
+   assign diag3 = diag_word3;
+   assign diag4 = diag_word4;
+   assign diag5 = diag_word5;
+   assign diag6 = diag_word6;
+   assign diag7 = diag_word7;
+   assign diag8 = diag_word8;
+   assign diag9 = diag_word9;
+`else
+   assign diag0 = 32'd0;
+   assign diag1 = 32'd0;
+   assign diag2 = 32'd0;
+   assign diag3 = 32'd0;
+   assign diag4 = 32'd0;
+   assign diag5 = 32'd0;
+   assign diag6 = 32'd0;
+   assign diag7 = 32'd0;
+   assign diag8 = 32'd0;
+   assign diag9 = 32'd0;
+`endif
+   assign done = done_r;
+@
+
+==== The N-lane wrapper
+
+`sport_rx` instantiates `N` channels, gates `run`, registers the lane pins
+in the IO cells, aggregates the per-lane results, and drives the UART
+report on the `tx` pad. The parameters select the verification policy:
+`N` is the lane count; `MIN_DONE_WORDS` how many good words make a
+completed transfer; `RESYNC` is passed down to each channel to enable the
+re-acquiring frame state machine. `REPORT_LANE0` together with
+`REPORT_IDX` narrow the done gate and the report to one lane (`REPORT_IDX`)
+instead of folding all `N` --- the single-lane proof --- and `REPORT_IDX`
+also picks which lane the progress/first-error lines watch. `led` toggles
+once per heartbeat line, so it blinks at about 0.5 Hz while data flows and
+holds steady when idle.
+
+<<sport_rx: the N-lane wrapper>>=
+module sport_rx #(
+      parameter N = 2,
+      parameter MIN_DONE_WORDS = 32'h00b00000,
+      parameter REPORT_LANE0 = 0,
+      parameter REPORT_IDX = 0,
+      parameter RESYNC = 0
+   )(
+      input        clk12,
+      input  [N-1:0] aclk_in,
+      input  [N-1:0] ad0_in,
+      input  [N-1:0] afs_in,
+      input        run,
+      inout        tx,
+      output reg   led
+   );
+
+   initial led = 1'b0;
+
+   <<sport_rx: per-lane result bus>>
+   <<sport_rx: the run-seen-low gate>>
+   <<sport_rx: register the lane pins in the IO cells>>
+   <<sport_rx: instantiate the lanes>>
+   <<sport_rx: hex and diag helper functions>>
+   <<sport_rx: progress and first-error report plumbing>>
+   <<sport_rx: the live progress and error character emitters>>
+   <<sport_rx: loop-free lane aggregation>>
+   <<sport_rx: the final report character emitter>>
+   <<sport_rx: the send FSM>>
+   <<sport_rx: the UART and tx pad>>
+endmodule
+@
+
+Each per-lane output is an `N`-wide unpacked array tapped by the lanes:
+
+<<sport_rx: per-lane result bus>>=
+   wire [31:0] words [0:N-1];
+   wire [31:0] errors [0:N-1];
+   wire [31:0] first_rx [0:N-1];
+   wire [31:0] first_exp [0:N-1];
+   wire [31:0] first_idx [0:N-1];
+   wire [31:0] diag0 [0:N-1];
+   wire [31:0] diag1 [0:N-1];
+   wire [31:0] diag2 [0:N-1];
+   wire [31:0] diag3 [0:N-1];
+   wire [31:0] diag4 [0:N-1];
+   wire [31:0] diag5 [0:N-1];
+   wire [31:0] diag6 [0:N-1];
+   wire [31:0] diag7 [0:N-1];
+   wire [31:0] diag8 [0:N-1];
+   wire [31:0] diag9 [0:N-1];
+   wire        done [0:N-1];
+   wire [31:0] prog_w [0:N-1];
+   wire [31:0] prog_e [0:N-1];
+   wire        prog_t [0:N-1];
+   wire [31:0] fe_idx [0:N-1];
+   wire [31:0] fe_got [0:N-1];
+   wire [31:0] fe_exp [0:N-1];
+   wire        fe_t [0:N-1];
+@
+
+Between FPGA configuration and DSP firmware start, `run` (R10) floats high
+while the DSP's SPI boot clocks MHz-rate noise into the lanes. A
+floating-armed receiver could cross a small `MIN_DONE` during boot and fire
+its one-shot report into the boot bus. So `run` is honoured only after it
+has genuinely been seen low (the firmware holds it low 60 ms at start);
+zero-init means "not yet seen low", which iCE40 silicon honours. The
+`run_gated` signal carries that to the lanes.
+
+<<sport_rx: the run-seen-low gate>>=
+   reg [2:0] run_sync = 3'b000;
+   reg       run_seen_low = 1'b0;
+   always @(posedge clk12) begin
+      run_sync <= {run_sync[1:0], run};
+      if (run_sync[2:1] == 2'b00)
+         run_seen_low <= 1'b1;
+   end
+   wire run_gated = run & run_seen_low;
+@
+
+Each lane's `ad0`/`afs` are registered in the IO cells, clocked by the
+lane's own forwarded clock, so the pin-to-flop timing is fixed in silicon
+rather than varying with placement and routing (a fabric-routed input flop
+can sit marginally close to the sample edge and silently corrupt the
+stream). `NO_IOREG` bypasses the registers; `SAMPLE_NEG` flips the IO flop
+to the negative edge; and `EYE_DELAY` routes the IO-FF clock through a kept
+LUT (taking fabric routing, +2..4 ns) to slide the sample point into the
+data eye.
+
+<<sport_rx: register the lane pins in the IO cells>>=
+   wire [N-1:0] ad0_reg, afs_reg;
+`ifdef NO_IOREG
+   assign ad0_reg = ad0_in;
+   assign afs_reg = afs_in;
+`else
+`ifdef SAMPLE_NEG
+   localparam IO_NEG_TRIGGER = 1'b1;
+`else
+   localparam IO_NEG_TRIGGER = 1'b0;
+`endif
+   genvar io_i;
+   generate
+      for (io_i = 0; io_i < N; io_i = io_i + 1) begin : ioregs
+`ifdef EYE_DELAY
+         <<sport_rx: input flops on the eye-delayed clock>>
+`else
+         <<sport_rx: input flops on the direct clock>>
+`endif
+      end
+   endgenerate
+`endif
+@
+
+The two arms are the same pair of `SB_IO` input flops; the only
+difference is which net feeds `.INPUT_CLK`. The default arm clocks each
+flop straight off the lane's forwarded clock `aclk_in[io_i]`:
+
+<<sport_rx: input flops on the direct clock>>=
+SB_IO #(.PIN_TYPE(6'b000000), .NEG_TRIGGER(IO_NEG_TRIGGER)) ad0_iob (
+   .PACKAGE_PIN(ad0_in[io_i]),
+   .INPUT_CLK(aclk_in[io_i]),
+   .D_IN_0(ad0_reg[io_i]));
+SB_IO #(.PIN_TYPE(6'b000000), .NEG_TRIGGER(IO_NEG_TRIGGER)) afs_iob (
+   .PACKAGE_PIN(afs_in[io_i]),
+   .INPUT_CLK(aclk_in[io_i]),
+   .D_IN_0(afs_reg[io_i]));
+@
+
+The `EYE_DELAY` arm is identical except the flops are clocked by
+`aclk_dly` --- the forwarded clock routed through a kept `SB_LUT4`. The
+LUT is configured `LUT_INIT=16'haaaa`, which is the truth table of "copy
+`I0`": a pure pass-through whose only purpose is the +2..4 ns of fabric
+routing delay it forces in, sliding the sample point deeper into the
+data eye. The `(* keep *)` attribute stops synthesis from optimizing the
+pass-through LUT away.
+
+<<sport_rx: input flops on the eye-delayed clock>>=
+(* keep *) wire aclk_dly;
+SB_LUT4 #(.LUT_INIT(16'haaaa)) eye_dly (
+   .O(aclk_dly), .I0(aclk_in[io_i]),
+   .I1(1'b0), .I2(1'b0), .I3(1'b0));
+SB_IO #(.PIN_TYPE(6'b000000), .NEG_TRIGGER(IO_NEG_TRIGGER)) ad0_iob (
+   .PACKAGE_PIN(ad0_in[io_i]),
+   .INPUT_CLK(aclk_dly),
+   .D_IN_0(ad0_reg[io_i]));
+SB_IO #(.PIN_TYPE(6'b000000), .NEG_TRIGGER(IO_NEG_TRIGGER)) afs_iob (
+   .PACKAGE_PIN(afs_in[io_i]),
+   .INPUT_CLK(aclk_dly),
+   .D_IN_0(afs_reg[io_i]));
+@
+
+The lane `generate` instantiates one `sport_rx_chan` per lane, fed the
+registered pins and `run_gated`, and fans its results back onto the result
+bus.
+
+<<sport_rx: instantiate the lanes>>=
+   genvar lane_i;
+   generate
+      for (lane_i = 0; lane_i < N; lane_i = lane_i + 1) begin : lanes
+         sport_rx_chan #(.MIN_DONE_WORDS(MIN_DONE_WORDS), .RESYNC(RESYNC)) lane (
+            .clk12(clk12),
+            .run(run_gated),
+            .aclk_in(aclk_in[lane_i]),
+            .ad0_in(ad0_reg[lane_i]),
+            .afs_in(afs_reg[lane_i]),
+            .words(words[lane_i]),
+            .errors(errors[lane_i]),
+            .first_rx(first_rx[lane_i]),
+            .first_exp(first_exp[lane_i]),
+            .first_idx(first_idx[lane_i]),
+            .diag0(diag0[lane_i]),
+            .diag1(diag1[lane_i]),
+            .diag2(diag2[lane_i]),
+            .diag3(diag3[lane_i]),
+            .diag4(diag4[lane_i]),
+            .diag5(diag5[lane_i]),
+            .diag6(diag6[lane_i]),
+            .diag7(diag7[lane_i]),
+            .diag8(diag8[lane_i]),
+            .diag9(diag9[lane_i]),
+            .done(done[lane_i]),
+            .prog_w(prog_w[lane_i]),
+            .prog_e(prog_e[lane_i]),
+            .prog_t(prog_t[lane_i]),
+            .fe_idx_o(fe_idx[lane_i]),
+            .fe_got_o(fe_got[lane_i]),
+            .fe_exp_o(fe_exp[lane_i]),
+            .fe_t(fe_t[lane_i])
+         );
+      end
+   endgenerate
+@
+
+The UART message is assembled character by character by a set of pure
+functions over the latched snapshots. `hex_digit` and `hex_word_digit`
+render a nibble and a chosen nibble of a 32-bit word; `diag_word` and
+`diag_prefix_char` serve the `DIAG_WORDS` dump (the prefix spells
+`sport_rx_words`).
+
+<<sport_rx: hex and diag helper functions>>=
+   function [7:0] hex_digit(input [3:0] nibble);
+      begin
+         hex_digit = (nibble < 4'd10) ? ("0" + nibble) : ("a" + (nibble - 4'd10));
+      end
+   endfunction
+
+   function [31:0] diag_word(input [3:0] which);
+      begin
+         case (which)
+            4'd0: diag_word = diag0[REPORT_IDX];
+            4'd1: diag_word = diag1[REPORT_IDX];
+            4'd2: diag_word = diag2[REPORT_IDX];
+            4'd3: diag_word = diag3[REPORT_IDX];
+            4'd4: diag_word = diag4[REPORT_IDX];
+            4'd5: diag_word = diag5[REPORT_IDX];
+            4'd6: diag_word = diag6[REPORT_IDX];
+            4'd7: diag_word = diag7[REPORT_IDX];
+            4'd8: diag_word = diag8[REPORT_IDX];
+            default: diag_word = diag9[REPORT_IDX];
+         endcase
+      end
+   endfunction
+
+   function [7:0] diag_prefix_char(input [3:0] idx);
+      begin
+         case (idx)
+            4'd0: diag_prefix_char = "s"; 4'd1: diag_prefix_char = "p";
+            4'd2: diag_prefix_char = "o"; 4'd3: diag_prefix_char = "r";
+            4'd4: diag_prefix_char = "t"; 4'd5: diag_prefix_char = "_";
+            4'd6: diag_prefix_char = "r"; 4'd7: diag_prefix_char = "x";
+            4'd8: diag_prefix_char = "_"; 4'd9: diag_prefix_char = "w";
+            4'd10: diag_prefix_char = "o"; 4'd11: diag_prefix_char = "r";
+            4'd12: diag_prefix_char = "d"; 4'd13: diag_prefix_char = "s";
+            default: diag_prefix_char = " ";
+         endcase
+      end
+   endfunction
+
+   function [7:0] hex_word_digit(input [31:0] word, input [2:0] digit);
+      begin
+         case (digit)
+            3'd0: hex_word_digit = hex_digit(word[31:28]);
+            3'd1: hex_word_digit = hex_digit(word[27:24]);
+            3'd2: hex_word_digit = hex_digit(word[23:20]);
+            3'd3: hex_word_digit = hex_digit(word[19:16]);
+            3'd4: hex_word_digit = hex_digit(word[15:12]);
+            3'd5: hex_word_digit = hex_digit(word[11:8]);
+            3'd6: hex_word_digit = hex_digit(word[7:4]);
+            default: hex_word_digit = hex_digit(word[3:0]);
+         endcase
+      end
+   endfunction
+@
+
+Two extra lines can be emitted besides the final report: a live progress
+line `rx w=<hex> e=<hex>` roughly once per second, and a one-shot first-error
+line `ERR w=<idx> got=<hex> exp=<hex>`, both built from the `REPORT_IDX`
+lane's aclk-domain snapshots. The progress/first-error toggles are
+synchronized into `clk12` (`pt_sync`/`fet_sync`) and set the `prog_pend` and
+`fe_pend` flags; `msg_kind` selects which message the send FSM is emitting.
+`DIAG_STATE` repurposes this path to print a deferred state dump and a
+periodic probe instead.
+
+<<sport_rx: progress and first-error report plumbing>>=
+`ifdef DIAG_WORDS
+   localparam PROG_EN = 1'b0;
+`else
+   localparam PROG_EN = 1'b1;
+`endif
+   reg [2:0]  pt_sync = 3'b000;
+   reg [2:0]  fet_sync = 3'b000;
+   reg        prog_pend = 1'b0;
+   reg        fe_pend = 1'b0;
+   reg [31:0] pw_latch = 32'd0;
+   reg [31:0] pe_latch = 32'd0;
+   reg [31:0] fi_latch = 32'd0;
+   reg [31:0] fg_latch = 32'd0;
+   reg [31:0] fx_latch = 32'd0;
+   reg [1:0]  msg_kind = 2'd0;
+`ifdef DIAG_STATE
+   reg [25:0] diag_timer = 26'd0;
+   reg        diag_go = 1'b0;
+   wire [31:0] fe_probe = fe_idx[REPORT_IDX];
+`endif
+@
+
+`prog_char` renders the progress line and `err_char` the first-error line,
+each placing the hex fields at fixed column ranges and the literal label
+characters elsewhere. The column arithmetic is the same trick in every
+emitter: a character index that falls inside a hex field is mapped to a
+nibble by subtracting the field's start column and feeding the remainder
+(masked to three bits) to `hex_word_digit`, while indices outside any
+field select a literal byte from a `case`. The per-field offsets (the
+`- 3'd5`, `- 3'd6`, `- 3'd2` constants and the like) are just each
+field's start column modulo eight, chosen so digit 0 is the most
+significant nibble.
+
+<<sport_rx: the live progress and error character emitters>>=
+   function [7:0] prog_char(input [7:0] idx);
+      begin
+         if (idx >= 8'd5 && idx <= 8'd12) begin
+            prog_char = hex_word_digit(pw_latch, idx[2:0] - 3'd5);
+         end else if (idx >= 8'd16 && idx <= 8'd23) begin
+            prog_char = hex_word_digit(pe_latch, idx[2:0]);
+         end else begin
+            case (idx)
+               8'd0: prog_char = "r"; 8'd1: prog_char = "x";
+               8'd2: prog_char = " "; 8'd3: prog_char = "w";
+               8'd4: prog_char = "="; 8'd13: prog_char = " ";
+               8'd14: prog_char = "e"; 8'd15: prog_char = "=";
+               8'd24: prog_char = "\r";
+               default: prog_char = "\n";
+            endcase
+         end
+      end
+   endfunction
+
+   function [7:0] err_char(input [7:0] idx);
+      begin
+         if (idx >= 8'd6 && idx <= 8'd13) begin
+            err_char = hex_word_digit(fi_latch, idx[2:0] - 3'd6);
+         end else if (idx >= 8'd19 && idx <= 8'd26) begin
+            err_char = hex_word_digit(fg_latch, idx[2:0] - 3'd3);
+         end else if (idx >= 8'd32 && idx <= 8'd39) begin
+            err_char = hex_word_digit(fx_latch, idx[2:0]);
+         end else begin
+            case (idx)
+               8'd0: err_char = "E"; 8'd1: err_char = "R";
+               8'd2: err_char = "R"; 8'd3: err_char = " ";
+               8'd4: err_char = "w"; 8'd5: err_char = "=";
+               8'd14: err_char = " "; 8'd15: err_char = "g";
+               8'd16: err_char = "o"; 8'd17: err_char = "t";
+               8'd18: err_char = "="; 8'd27: err_char = " ";
+               8'd28: err_char = "e"; 8'd29: err_char = "x";
+               8'd30: err_char = "p"; 8'd31: err_char = "=";
+               8'd40: err_char = "\r";
+               default: err_char = "\n";
+            endcase
+         end
+      end
+   endfunction
+@
+
+The final report needs the minimum word count across all lanes and the
+total error count. Since iCE40 has no good way to fold an unpacked array in
+one expression, the fold is unrolled into a chain of continuous assigns:
+`minw_ch[i]` is the running minimum and `tote_ch[i]` the running error sum,
+with `min_words_c`/`tot_err_c` the last links. `all_done_w` is the global
+done --- a single lane under `REPORT_LANE0`, otherwise the AND of all lanes.
+
+<<sport_rx: loop-free lane aggregation>>=
+   reg tx_oe = 1'b0;
+   reg reported = 1'b0;
+   reg sending = 1'b0;
+   reg pre_wait = 1'b0;
+   reg [14:0] pre_cnt = 15'd0;
+   reg [7:0] send_idx = 8'd0;
+   reg [3:0] diag_send_word = 4'd0;
+   reg [3:0] diag_send_digit = 4'd0;
+   reg send_start = 1'b0;
+   reg [7:0] send_data = 8'd0;
+   wire uart_busy;
+   wire uart_tx_line;
+
+   wire [N-1:0]  done_vec;
+   wire [31:0]   minw_ch [0:N-1];
+   wire [31:0]   tote_ch [0:N-1];
+   assign done_vec[0] = done[0];
+   assign minw_ch[0] = words[0];
+   assign tote_ch[0] = errors[0];
+   genvar agg_i;
+   generate
+      for (agg_i = 1; agg_i < N; agg_i = agg_i + 1) begin : agg
+         assign done_vec[agg_i] = done[agg_i];
+         assign minw_ch[agg_i] = (words[agg_i] < minw_ch[agg_i-1])
+                                 ? words[agg_i] : minw_ch[agg_i-1];
+         assign tote_ch[agg_i] = tote_ch[agg_i-1] + errors[agg_i];
+      end
+   endgenerate
+   wire [31:0] min_words_c = minw_ch[N-1];
+   wire [31:0] tot_err_c  = tote_ch[N-1];
+   wire        all_done_w = REPORT_LANE0 ? done[REPORT_IDX] : (&done_vec);
+
+   reg [31:0] w0_latch = 32'd0;
+   reg [31:0] et_latch = 32'd0;
+@
+
+`report_char` renders the full report line --- the `sport_rx
+lanes=<N> per_ch_words_hex=<hex> errors_hex=<hex>` prefix followed by
+`PASS` when the latched error count is zero and the word count reached
+`MIN_DONE_WORDS`, else `FAIL`.
+
+<<sport_rx: the final report character emitter>>=
+   function [7:0] report_char(input [7:0] idx);
+      begin
+         if (idx >= 8'd34 && idx <= 8'd41) begin
+            report_char = hex_word_digit(w0_latch, idx[2:0] - 3'd2);
+         end else if (idx >= 8'd54 && idx <= 8'd61) begin
+            report_char = hex_word_digit(et_latch, idx[2:0] - 3'd6);
+         end else if (idx >= 8'd63 && idx <= 8'd66) begin
+            if (et_latch == 32'd0 && w0_latch >= MIN_DONE_WORDS) begin
+               case (idx)
+                  8'd63: report_char = "P";
+                  8'd64: report_char = "A";
+                  8'd65: report_char = "S";
+                  default: report_char = "S";
+               endcase
+            end else begin
+               case (idx)
+                  8'd63: report_char = "F";
+                  8'd64: report_char = "A";
+                  8'd65: report_char = "I";
+                  default: report_char = "L";
+               endcase
+            end
+         end else begin
+            case (idx)
+               8'd0: report_char = "s"; 8'd1: report_char = "p";
+               8'd2: report_char = "o"; 8'd3: report_char = "r";
+               8'd4: report_char = "t"; 8'd5: report_char = "_";
+               8'd6: report_char = "r"; 8'd7: report_char = "x";
+               8'd8: report_char = " "; 8'd9: report_char = "l";
+               8'd10: report_char = "a"; 8'd11: report_char = "n";
+               8'd12: report_char = "e"; 8'd13: report_char = "s";
+               8'd14: report_char = "="; 8'd15: report_char = "0" + N;
+               8'd16: report_char = " "; 8'd17: report_char = "p";
+               8'd18: report_char = "e"; 8'd19: report_char = "r";
+               8'd20: report_char = "_"; 8'd21: report_char = "c";
+               8'd22: report_char = "h"; 8'd23: report_char = "_";
+               8'd24: report_char = "w"; 8'd25: report_char = "o";
+               8'd26: report_char = "r"; 8'd27: report_char = "d";
+               8'd28: report_char = "s"; 8'd29: report_char = "_";
+               8'd30: report_char = "h"; 8'd31: report_char = "e";
+               8'd32: report_char = "x"; 8'd33: report_char = "=";
+               8'd42: report_char = " "; 8'd43: report_char = "e";
+               8'd44: report_char = "r"; 8'd45: report_char = "r";
+               8'd46: report_char = "o"; 8'd47: report_char = "r";
+               8'd48: report_char = "s"; 8'd49: report_char = "_";
+               8'd50: report_char = "h"; 8'd51: report_char = "e";
+               8'd52: report_char = "x"; 8'd53: report_char = "=";
+               8'd62: report_char = " "; 8'd67: report_char = "\r";
+               default: report_char = "\n";
+            endcase
+         end
+      end
+   endfunction
+@
+
+The send FSM is one `clk12` block. It pulses `send_start` low each cycle,
+synchronizes the progress and first-error toggles, and then, in priority
+order, kicks off whichever message is due: a first-error line, a progress
+line (only while data still flows --- `!all_done_w`), or the final report
+once `all_done_w` (single-lane or all-lane). Each kick raises `tx_oe`,
+arms a `pre_wait` settling delay, and selects `msg_kind`; the progress kick
+also toggles `led`. After `pre_wait` the FSM walks `send_idx` through the
+chosen character emitter, handing each byte to the UART when it is not busy.
+(Under `DIAG_STATE` the first-error arm is compiled out --- its guard
+becomes `if (1'b0)` --- because that diagnostic build repurposes the
+progress line for a state dump and never emits the normal first-error
+line.) The UART pad is driven only once there is something to say:
+B12 shares a net with the DSP boot bus, so driving it from configuration
+would corrupt the SPI boot (SYS_FAULT) --- the first print happens long
+after boot.
+
+<<sport_rx: the send FSM>>=
+   always @(posedge clk12) begin
+<<sport_rx send: synchronize the toggles and set the pending flags>>
+`ifdef DIAG_STATE
+      if (1'b0) begin
+`else
+      if (PROG_EN && !sending && !pre_wait && fe_pend && !reported) begin
+`endif
+<<sport_rx send: kick the first-error line>>
+      end else if (PROG_EN && !sending && !pre_wait && prog_pend
+`ifdef DIAG_STATE
+                   ) begin
+`else
+                   && !reported && !all_done_w) begin
+`endif
+<<sport_rx send: kick the progress line>>
+      end else if (REPORT_LANE0 && !reported && all_done_w
+                   && !sending && !pre_wait) begin
+<<sport_rx send: kick the single-lane final report>>
+      end else if (!REPORT_LANE0 && !reported && all_done_w
+                   && !sending && !pre_wait) begin
+<<sport_rx send: kick the all-lane final report>>
+      end else if (pre_wait) begin
+<<sport_rx send: the pre-wait settling delay>>
+      end else if (sending && !uart_busy && !send_start) begin
+<<sport_rx send: walk the chosen message out byte by byte>>
+      end
+   end
+@
+
+Each cycle the FSM clears the one-shot `send_start`, advances the
+progress and first-error toggle synchronizers, and raises `prog_pend` /
+`fe_pend` when a toggle is seen. (Under `DIAG_STATE` a periodic timer
+also raises `prog_pend` so the state dump reprints on its own.)
+
+<<sport_rx send: synchronize the toggles and set the pending flags>>=
+      send_start <= 1'b0;
+      pt_sync <= {pt_sync[1:0], prog_t[REPORT_IDX]};
+      fet_sync <= {fet_sync[1:0], fe_t[REPORT_IDX]};
+      if (pt_sync[2] ^ pt_sync[1])
+         prog_pend <= 1'b1;
+`ifdef DIAG_STATE
+      diag_timer <= diag_timer + 26'd1;
+      if (diag_timer == 26'd0)
+         diag_go <= 1'b1;
+      if (diag_go && diag_timer[22:0] == 23'd0)
+         prog_pend <= 1'b1;
+`endif
+      if (fet_sync[2] ^ fet_sync[1])
+         fe_pend <= 1'b1;
+@
+
+Highest priority: a pending first error. Latch its three fields, select
+the `ERR` message (`msg_kind` 2), and arm the pre-wait.
+
+<<sport_rx send: kick the first-error line>>=
+         fi_latch <= fe_idx[REPORT_IDX];
+         fg_latch <= fe_got[REPORT_IDX];
+         fx_latch <= fe_exp[REPORT_IDX];
+         msg_kind <= 2'd2;
+         send_idx <= 8'd0;
+         pre_wait <= 1'b1;
+         pre_cnt <= 15'd0;
+         tx_oe <= 1'b1;
+         fe_pend <= 1'b0;
+@
+
+Next: a pending progress tick, but only while data still flows
+(`!all_done_w`). Latch the live word/error counts, select the progress
+message (`msg_kind` 1), and toggle `led`. (`DIAG_STATE` reroutes this
+arm to dump acquire state instead of counts: the latched word packs a
+`0x6a` (`'j'`) tag in the high byte, then `run`, the per-lane `done`
+bits, and the `all_done_w`/`reported`/`sending`/`pre_wait`/`prog_pend`/
+`fe_pend` flags in the low bits, so a single hex line shows where the
+send FSM is stuck.)
+
+<<sport_rx send: kick the progress line>>=
+`ifdef DIAG_STATE
+`ifdef DIAG_FSPHASE
+         pw_latch <= prog_w[REPORT_IDX];
+`else
+         pw_latch <= words[REPORT_IDX];
+`endif
+`ifdef DIAG_FSPHASE
+         pe_latch <= prog_e[REPORT_IDX];
+`else
+         pe_latch <= {8'h6a, 3'd0, run, 2'd0, done[0],
+                      done[N > 1 ? 1 : 0], 6'd0, all_done_w, reported,
+                      sending, pre_wait, prog_pend, fe_pend, 1'b0,
+                      1'b0};
+`endif
+`else
+         pw_latch <= prog_w[REPORT_IDX];
+         pe_latch <= prog_e[REPORT_IDX];
+`endif
+         msg_kind <= 2'd1;
+         send_idx <= 8'd0;
+         pre_wait <= 1'b1;
+         pre_cnt <= 15'd0;
+         tx_oe <= 1'b1;
+         prog_pend <= 1'b0;
+         led <= ~led;
+@
+
+The single-lane (`REPORT_LANE0`) final report, fired once `all_done_w`:
+latch lane `REPORT_IDX`'s word/error counts (or, under `DIAG_FIRST`, the
+first-word capture), select the report message (`msg_kind` 0), and mark
+`reported`.
+
+<<sport_rx send: kick the single-lane final report>>=
+`ifdef DIAG_FIRST
+`ifdef DIAG_INDEX
+         w0_latch <= first_idx[REPORT_IDX];
+         et_latch <= first_rx[REPORT_IDX];
+`else
+         w0_latch <= first_exp[REPORT_IDX];
+         et_latch <= first_rx[REPORT_IDX];
+`endif
+`else
+         w0_latch <= words[REPORT_IDX];
+         et_latch <= errors[REPORT_IDX];
+`endif
+         pre_wait <= 1'b1;
+         pre_cnt <= 15'd0;
+         send_idx <= 8'd0;
+         msg_kind <= 2'd0;
+         tx_oe <= 1'b1;
+         diag_send_word <= 4'd0;
+         diag_send_digit <= 4'd0;
+         reported <= 1'b1;
+@
+
+The all-lane final report is the same kick but latches the folded
+minimum word count and total error count from the aggregation chain.
+
+<<sport_rx send: kick the all-lane final report>>=
+         w0_latch <= min_words_c;
+         et_latch <= tot_err_c;
+         pre_wait <= 1'b1;
+         pre_cnt <= 15'd0;
+         send_idx <= 8'd0;
+         msg_kind <= 2'd0;
+         tx_oe <= 1'b1;
+         diag_send_word <= 4'd0;
+         diag_send_digit <= 4'd0;
+         reported <= 1'b1;
+@
+
+After a kick, `pre_wait` holds 12000 `clk12` ticks (about 1 ms) so the
+`tx` pad and the aclk-domain snapshots settle before the first byte goes
+out; then it hands off to `sending`.
+
+<<sport_rx send: the pre-wait settling delay>>=
+         if (pre_cnt < 15'd12000) begin
+            pre_cnt <= pre_cnt + 15'd1;
+         end else begin
+            pre_wait <= 1'b0;
+            sending <= 1'b1;
+            tx_oe <= 1'b1;
+         end
+@
+
+While sending, each idle UART cycle emits the next character of the
+selected message from its emitter function, advancing `send_idx` until
+the message is done. (The `DIAG_WORDS` build emits the ten-word diag dump
+instead of the normal three message kinds.)
+
+<<sport_rx send: walk the chosen message out byte by byte>>=
+`ifdef DIAG_WORDS
+         if (send_idx < 8'd15) begin
+            send_data <= diag_prefix_char(send_idx[3:0]);
+            send_start <= 1'b1;
+            send_idx <= send_idx + 8'd1;
+         end else if (diag_send_word < 4'd10) begin
+            if (diag_send_digit < 4'd8) begin
+               send_data <= hex_word_digit(diag_word(diag_send_word),
+                                           diag_send_digit[2:0]);
+               diag_send_digit <= diag_send_digit + 4'd1;
+            end else begin
+               send_data <= " ";
+               diag_send_digit <= 4'd0;
+               diag_send_word <= diag_send_word + 4'd1;
+            end
+            send_start <= 1'b1;
+         end else if (send_idx == 8'd15) begin
+            send_data <= "\r";
+            send_start <= 1'b1;
+            send_idx <= 8'd16;
+         end else if (send_idx == 8'd16) begin
+            send_data <= "\n";
+            send_start <= 1'b1;
+            send_idx <= 8'd17;
+         end else begin
+            sending <= 1'b0;
+         end
+`else
+         if (msg_kind == 2'd1) begin
+            if (send_idx < 8'd26) begin
+               send_data <= prog_char(send_idx);
+               send_start <= 1'b1;
+               send_idx <= send_idx + 8'd1;
+            end else begin
+               sending <= 1'b0;
+            end
+         end else if (msg_kind == 2'd2) begin
+            if (send_idx < 8'd42) begin
+               send_data <= err_char(send_idx);
+               send_start <= 1'b1;
+               send_idx <= send_idx + 8'd1;
+            end else begin
+               sending <= 1'b0;
+            end
+         end else if (send_idx < 8'd69) begin
+            send_data <= report_char(send_idx);
+            send_start <= 1'b1;
+            send_idx <= send_idx + 8'd1;
+         end else begin
+            sending <= 1'b0;
+         end
+`endif
+@
+
+Finally the byte stream feeds a `uart_tx` (115200 baud at 12 MHz is 104
+clocks per bit), whose line drives the `tx` pad through an `SB_IO` whose
+output enable is `tx_oe` --- tri-stating the pad until the first report.
+
+<<sport_rx: the UART and tx pad>>=
+   uart_tx #(.CLKS_PER_BIT(104)) u_tx (
+      .clk(clk12),
+      .start(send_start),
+      .data(send_data),
+      .tx(uart_tx_line),
+      .busy(uart_busy)
+   );
+
+   SB_IO #(
+      .PIN_TYPE(6'b101001)
+   ) tx_iob (
+      .PACKAGE_PIN(tx),
+      .OUTPUT_ENABLE(tx_oe),
+      .D_OUT_0(uart_tx_line),
+      .D_IN_0()
+   );
+@
+
+=== The bidirectional top
+
+`sport_bidir` is the one top the missions synthesize. It instantiates
+`TX_TO_DSP_N` transmit lanes (F2D) and an `RX_FROM_DSP_N`-lane receiver
+(D2F), so a build is a pure transmitter (`RX_FROM_DSP_N` used only as
+unverified clock scaffolding), a pure receiver, or a bidirectional mix,
+purely by parameter. `FROM_DSP_EN` gates the receiver: when zero the
+D2F lanes exist only to carry the DSP's forwarded clock and the
+receiver is held in reset, printing and claiming nothing. `SYNC_TX`
+chooses the transmitter strategy --- the no-PLL source-synchronous
+streamer when set (with `NOPLL`), the free-running PLL serializer when
+clear --- and `SHARE_PAIRS` selects 4-lane pad sharing.
+
+The eight shipped configurations and the parameter settings that select
+each (every shipping build uses `SYNC_TX`=`NOPLL`=1, the no-PLL
+transmitter):
+
+[cols="<,^,^,^,^,^,^,^",options="header"]
+|===
+| config | TX_TO_DSP_N | RX_FROM_DSP_N | FROM_DSP_EN | SYNC_TX | NOPLL | SHARE_PAIRS | SHARE_COPIES
+| D2F 1-lane    | 1 | 1 | 1 | 1 | 1 | 0 | 0
+| D2F 2-lane    | 1 | 2 | 1 | 1 | 1 | 0 | 0
+| D2F 4-lane    | 1 | 4 | 1 | 1 | 1 | 0 | 0
+| F2D 1-lane    | 1 | 1 | 0 | 1 | 1 | 0 | 0
+| F2D 2-lane    | 2 | 2 | 0 | 1 | 1 | 0 | 0
+| F2D 4-lane    | 4 | 2 | 0 | 1 | 1 | 1 | 1
+| bidir 1x1     | 1 | 1 | 1 | 1 | 1 | 0 | 0
+| bidir 2x2     | 2 | 2 | 1 | 1 | 1 | 0 | 0
+|===
+
+(`SHARE_COPIES` is a `define`, not a parameter --- it adds the two SRU
+clock-copy input pads the 4-lane F2D build launches its forwarders
+from.)
+
+<<sport_bidir.v>>=
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Jakob Kastelic
+module sport_bidir #(
+      parameter TX_TO_DSP_N = 1,
+      parameter RX_FROM_DSP_N = 1,
+      parameter MIN_DONE_WORDS = 32'h00b00000,
+      parameter REPORT_LANE0 = 0,
+      parameter REPORT_IDX = 0,
+      parameter TX_QUIET = 0,
+      parameter SYNC_TX = 0,
+      parameter NOPLL = 0,
+      parameter NOPLL_DATA_NEG = 1,
+      parameter NOPLL_CLK_POS = 1,
+      parameter SHARE_PAIRS = 0,
+      parameter FROM_DSP_EN = 1
+   )(
+      input clk12,
+      input run,
+      output [TX_TO_DSP_N-1:0] fpga_ad0_out,
+      output [(SHARE_PAIRS ? TX_TO_DSP_N/2 : TX_TO_DSP_N)-1:0] fpga_aclk_out,
+      output [(SHARE_PAIRS ? TX_TO_DSP_N/2 : TX_TO_DSP_N)-1:0] fpga_afs_out,
+      output led,
+      input  [RX_FROM_DSP_N-1:0] dsp_ad0_in,
+      input  [RX_FROM_DSP_N-1:0] dsp_aclk_in,
+`ifdef SHARE_COPIES
+      input  dsp_aclk2_in,
+      input  dsp_aclk3_in,
+`endif
+      input  [RX_FROM_DSP_N-1:0] dsp_afs_in,
+      inout tx
+   );
+   wire [TX_TO_DSP_N-1:0] tx_ad0_w;
+   wire [TX_TO_DSP_N-1:0] tx_aclk_w;
+   wire [TX_TO_DSP_N-1:0] tx_afs_w;
+
+   // Only consumed on the free-running (SYNC_TX==0) transmitter path; every
+   // shipping config sets SYNC_TX=1, so this is inert in practice.
+   localparam START_DELAY_CYCLES = 24000000;
+
+   <<sport_bidir: generate the transmit lanes>>
+   <<sport_bidir: map lanes to output pads>>
+   <<sport_bidir: instantiate the from_dsp receiver>>
+endmodule
+@
+
+The transmit side is one `generate`. With `SYNC_TX` and `NOPLL` set,
+each lane gets its own `sport_tx_sync_nopll` clocked off a forwarded
+DSP clock. Which forwarded clock matters for the 4-lane builds: each
+forwarder must launch from the same physical clock net that feeds the
+`from_dsp` capture registers for its lane, because mixing clock loads
+shifts the per-netlist launch/capture phase. The plain case takes each
+lane's primary `dsp_aclk_in[tx_i]`; under `SHARE_COPIES` both 4-lane
+pairs launch from the single clean SRU copy `dsp_aclk3_in` (T8). The
+other copy `dsp_aclk2_in` (P10) is the SPT4A "shield" tap on DAI1_04
+(adjacent to RUN/R10) and is NOT a usable forwarding clock: a forwarder
+launched off P10 mis-samples ~100% on both of its lanes at every bit
+rate (45-59 MHz) -- the FFFF-DDDD lanes-0,2 failure -- while T8 is clean
+for both DAI groups (bench-confirmed by swapping the copies, which flips
+the failure to the T8->P10 pair). P10 stays DSP-driven as a shield, but
+the FPGA no longer reads it. With `SYNC_TX` clear, a single
+free-running `sport_tx_prbs_ser` drives all lanes.
+
+<<sport_bidir: generate the transmit lanes>>=
+generate
+   if (SYNC_TX != 0) begin : sync_tx
+      if (NOPLL != 0) begin : nopll
+         genvar tx_i;
+         for (tx_i = 0; tx_i < TX_TO_DSP_N; tx_i = tx_i + 1) begin : lanes
+            sport_tx_sync_nopll #(
+               .DATA_NEG(NOPLL_DATA_NEG),
+               .CLK_POS(NOPLL_CLK_POS)
+            ) to_dsp (
+               .fwd_aclk(
+`ifdef SHARE_COPIES
+                         SHARE_PAIRS != 0
+                         ? dsp_aclk3_in :
+`endif
+                         dsp_aclk_in[tx_i]),
+               .run(run),
+               .ad0_out(tx_ad0_w[tx_i]),
+               .aclk_out(tx_aclk_w[tx_i]),
+               .afs_out(tx_afs_w[tx_i])
+            );
+         end
+      end
+   end else begin : free_tx
+      sport_tx_prbs_ser #(
+         .N(TX_TO_DSP_N),
+         .START_DELAY_CYCLES(START_DELAY_CYCLES),
+         .TX_QUIET(TX_QUIET)
+      ) to_dsp (
+         .clk12(clk12),
+         .ad0_out(tx_ad0_w),
+         .aclk_out(tx_aclk_w),
+         .afs_out(tx_afs_w)
+      );
+   end
+endgenerate
+@
+
+Data goes out one pad per lane. The clock and frame-sync pads are
+per-lane in the flat case, but under `SHARE_PAIRS` a lane pair shares
+one clk/fs pad, driven by the even lane of the pair --- this is the
+4-lane layout where two lanes ride a common forwarded clock/frame.
+
+<<sport_bidir: map lanes to output pads>>=
+assign fpga_ad0_out  = tx_ad0_w;
+generate
+   if (SHARE_PAIRS != 0) begin : pairpads
+      genvar pp;
+      for (pp = 0; pp < TX_TO_DSP_N/2; pp = pp + 1) begin : pairs
+         assign fpga_aclk_out[pp] = tx_aclk_w[2*pp];
+         assign fpga_afs_out[pp]  = tx_afs_w[2*pp];
+      end
+   end else begin : flatpads
+      assign fpga_aclk_out = tx_aclk_w;
+      assign fpga_afs_out  = tx_afs_w;
+   end
+endgenerate
+@
+
+The receiver is the previous section's `sport_rx`, wired to the D2F
+input pads. It always runs in re-acquire mode (`RESYNC`). The run-seen-low
+gate inside `sport_rx` is always active --- it self-arms once `run` has
+genuinely been seen low --- and is harmless here because the on-chip
+`run` is driven low at start rather than floating up from a boot bus.
+`FROM_DSP_EN` masks `run` off when the D2F lanes are only scaffolding.
+
+<<sport_bidir: instantiate the from_dsp receiver>>=
+sport_rx #(.N(RX_FROM_DSP_N), .MIN_DONE_WORDS(MIN_DONE_WORDS),
+           .REPORT_LANE0(REPORT_LANE0), .REPORT_IDX(REPORT_IDX),
+           .RESYNC(1)) from_dsp (
+   .led(led),
+   .clk12(clk12),
+   .aclk_in(dsp_aclk_in),
+   .ad0_in(dsp_ad0_in),
+   .afs_in(dsp_afs_in),
+   .run(FROM_DSP_EN ? run : 1'b0),
+   .tx(tx)
+);
+@
+
+=== Test bench
+
+The bench drives behavioural models of the DSP's SPORT transmit waveform
+into the receiver and self-checks. It runs four sub-tests under
+Verilator the same way every other chapter's bench does:
+
+  1. *`RESYNC=0` lane.* The non-re-syncing per-lane checker locks on a
+     single arming pulse and reports zero word errors --- the original
+     coverage.
+
+  2. *`RESYNC=1` lane.* The re-acquiring checker (the configuration the
+     bidirectional builds actually ship) locks on a held frame-sync and
+     reports zero errors.
+
+  3. *Negative control.* A `RESYNC=1` lane fed a stream with one flipped
+     bit must report `errors > 0`, proving the checker can *detect*
+     errors, not merely avoid false positives.
+
+  4. *Two-lane wrapper.* A full `sport_rx` with `N=2` is driven on both
+     lanes; the bench decodes its UART output and asserts the report
+     line ends in `PASS`, exercising the loop-free lane aggregation and
+     the character-by-character report formatter.
+
+Two timing facts shape the per-bit stimulus. First, each bit is launched
+on the rising edge of `aclk` so it is stable across the receiver's
+falling-edge sample --- there is no setup/hold race, and exactly one bit
+advances per `aclk` period. Second, the frame-sync convention differs
+between the two checker modes, which sets how each test frames its words
+(below).
+
+The `RESYNC=0` checker does not frame-lock precisely to `afs`: it arms on
+the first frame-sync, waits a fixed three-edge internal latency, then
+consumes one whole word to seed its PRBS engine before it begins
+checking, and never re-syncs after that. So that test sends one arming
+`afs` pulse, then `ARM_FILL` idle bits, where `ARM_FILL = 35 = 32 + 3`
+--- one full word plus the three-bit arm-pipeline phase --- so the
+receiver's first *checked* word lands exactly on the seed word of the
+PRBS-31 stream. The `RESYNC=1` checker instead arms on any frame-sync
+rise and aborts mid-word if frame-sync drops before bit 31, so its tests
+hold `afs` high for the whole stream: the checker arms on the first rise
+and then stays locked, dropping no startup word, so the PRBS stream runs
+straight from the seed with no filler.
+
+The bench is a logic check only. It runs with ideal, glitch-free timing
+and a short `MIN_DONE`, so it proves the lockstep comparator, the
+re-acquire state machine, the aggregation fold, and the report formatter
+are correct --- but it says nothing about the analog eye, the
+source-synchronous launch phase, or sustained behaviour over a real
+transfer. Those are the bench deliverable: a 2 GiB-per-lane,
+zero-error run in each direction on the hardware (see the Summary).
+
+<<tb_sport.sv>>=
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Jakob Kastelic
+`timescale 1ns/1ps
+
+module tb_sport;
+   <<tb_sport: parameters and clocks>>
+   <<tb_sport: instantiate the receivers under test>>
+   <<tb_sport: a PRBS-31 reference generator>>
+   <<tb_sport: drive the modeled SPORT waveform>>
+   <<tb_sport: a UART receive decoder>>
+   <<tb_sport: the stimulus and self-checks>>
+endmodule
+@
+
+The lanes sample on `aclk`'s falling edge and the data we launch lives
+in `ad0`/`afs`; `clk12` is the slow domain the receivers report into. The
+`RESYNC=1` tests drive a second pair `ad0b`/`afsb`, and the two-lane
+wrapper its own `ad0w`/`afsw`, so each sub-test owns its stimulus.
+
+<<tb_sport: parameters and clocks>>=
+localparam [30:0] PRBS31_SEED = 31'h7fffffff;
+localparam WORDS    = 600;
+localparam MIN_DONE = 32'd512;
+localparam ARM_FILL = 35;          // 32 (one word) + 3 (arm-pipeline phase)
+localparam UART_CPB = 104;         // clk12 cycles per UART bit (115200 @ 12 MHz)
+
+reg aclk = 1'b0;
+always #8 aclk <= ~aclk;
+reg clk12 = 1'b0;
+always #40 clk12 <= ~clk12;
+
+reg ad0 = 1'b0;        // RESYNC=0 lane stimulus
+reg afs = 1'b0;
+reg ad0b = 1'b0;       // RESYNC=1 lane / negative-control stimulus
+reg afsb = 1'b0;
+reg [1:0] ad0w = 2'b00; // two-lane wrapper stimulus
+reg [1:0] afsw = 2'b00;
+reg run = 1'b0;
+@
+
+We instantiate the `RESYNC=0` lane, the `RESYNC=1` lane, and a full
+two-lane `sport_rx` wrapper. The wrapper's input IO registers use an
+`SB_IO` primitive port the simulation `SB_IO` model does not carry, so
+the bench compiles the wrapper with `NO_IOREG` (set on the Verilator
+command line) to bypass them; the checker logic under test is unchanged.
+
+<<tb_sport: instantiate the receivers under test>>=
+wire [31:0] words;
+wire [31:0] errors;
+wire        done;
+sport_rx_chan #(.MIN_DONE_WORDS(MIN_DONE)) dut (
+   .clk12(clk12), .run(run), .aclk_in(aclk), .ad0_in(ad0),
+   .afs_in(afs), .words(words), .errors(errors), .done(done));
+
+wire [31:0] words_r;
+wire [31:0] errors_r;
+wire        done_r;
+sport_rx_chan #(.MIN_DONE_WORDS(MIN_DONE), .RESYNC(1)) dut_r (
+   .clk12(clk12), .run(run), .aclk_in(aclk), .ad0_in(ad0b),
+   .afs_in(afsb), .words(words_r), .errors(errors_r), .done(done_r));
+
+wire [31:0] words_n;
+wire [31:0] errors_n;
+wire        done_n;
+reg         ad0n = 1'b0;
+reg         afsn = 1'b0;
+sport_rx_chan #(.MIN_DONE_WORDS(MIN_DONE), .RESYNC(1)) dut_n (
+   .clk12(clk12), .run(run), .aclk_in(aclk), .ad0_in(ad0n),
+   .afs_in(afsn), .words(words_n), .errors(errors_n), .done(done_n));
+
+wire tx_w;
+wire led_w;
+pullup(tx_w);
+sport_rx #(.N(2), .MIN_DONE_WORDS(MIN_DONE), .RESYNC(1)) dut_w (
+   .clk12(clk12), .aclk_in({aclk, aclk}), .ad0_in(ad0w), .afs_in(afsw),
+   .run(run), .tx(tx_w), .led(led_w));
+
+integer wi, bi;
+reg [31:0] cur;
+reg [30:0] prbs_state;
+@
+
+`prbs31_word` expands a 31-bit state into the next 32 MSB-first PRBS-31
+bits; `prbs31_advance` returns the state 32 bits later. Both use the
+same `x^31 + x^28 + 1` recurrence as the receiver.
+
+<<tb_sport: a PRBS-31 reference generator>>=
+function [31:0] prbs31_word(input [30:0] s_in);
+   integer i; reg [30:0] s; reg [31:0] w; reg nb;
+   begin
+      s = s_in; w = 32'd0;
+      for (i = 0; i < 32; i = i + 1) begin
+         nb = s[30] ^ s[27];
+         s = {s[29:0], nb};
+         w = {w[30:0], nb};
+      end
+      prbs31_word = w;
+   end
+endfunction
+
+function [30:0] prbs31_advance(input [30:0] s_in);
+   integer i; reg [30:0] s; reg nb;
+   begin
+      s = s_in;
+      for (i = 0; i < 32; i = i + 1) begin
+         nb = s[30] ^ s[27];
+         s = {s[29:0], nb};
+      end
+      prbs31_advance = s;
+   end
+endfunction
+@
+
+Each test has its own bit/word drivers. The `_a` tasks drive the
+`RESYNC=0` lane (`afs` pulsed on bit 0). The `_b` tasks drive the
+`RESYNC=1` lane with `afs` held high. The `_n` tasks drive a separate
+`RESYNC=1` lane (`ad0n`/`afsn`) for the negative control, where
+`send_word_flip_n` corrupts one bit. The `_w` task drives both wrapper
+lanes identically with `afs` held high. Tasks use local loop variables
+so concurrent drivers do not share counters.
+
+<<tb_sport: drive the modeled SPORT waveform>>=
+task send_bit_a(input val, input fsv);
+   begin @(posedge aclk); ad0 = val; afs = fsv; end
+endtask
+task send_word_a(input [31:0] w);
+   integer k;
+   begin
+      for (k = 0; k < 32; k = k + 1)
+         send_bit_a(w[31-k], (k == 0) ? 1'b1 : 1'b0);
+   end
+endtask
+
+task send_word_b(input [31:0] w);
+   integer k;
+   begin
+      for (k = 0; k < 32; k = k + 1) begin
+         @(posedge aclk); ad0b = w[31-k]; afsb = 1'b1;
+      end
+   end
+endtask
+
+task send_word_n(input [31:0] w);
+   integer k;
+   begin
+      for (k = 0; k < 32; k = k + 1) begin
+         @(posedge aclk); ad0n = w[31-k]; afsn = 1'b1;
+      end
+   end
+endtask
+task send_word_flip_n(input [31:0] w);
+   integer k;
+   begin
+      for (k = 0; k < 32; k = k + 1) begin
+         @(posedge aclk); ad0n = (k == 5) ? ~w[31-k] : w[31-k]; afsn = 1'b1;
+      end
+   end
+endtask
+
+task send_word_w(input [31:0] w);
+   integer k;
+   begin
+      for (k = 0; k < 32; k = k + 1) begin
+         @(posedge aclk); ad0w = {w[31-k], w[31-k]}; afsw = 2'b11;
+      end
+   end
+endtask
+@
+
+The wrapper drives its report on the `tx` pad as 115200-baud UART. This
+monitor decodes `tx` byte by byte (sampling the middle of each bit,
+`UART_CPB` `clk12` ticks apart) and sets `wrapper_pass` once it sees the
+four-byte `PASS` sequence that ends a passing report line.
+
+<<tb_sport: a UART receive decoder>>=
+reg        wrapper_pass = 1'b0;
+reg [7:0]  uart_byte;
+reg [1:0]  pass_match = 2'd0;
+integer    ub;
+initial begin
+   forever begin
+      @(negedge tx_w);                         // start bit
+      repeat (UART_CPB + UART_CPB/2) @(posedge clk12);
+      for (ub = 0; ub < 8; ub = ub + 1) begin  // 8 data bits, LSB first
+         uart_byte[ub] = tx_w;
+         repeat (UART_CPB) @(posedge clk12);
+      end
+      if (uart_byte == "P") pass_match = 2'd1;
+      else if (uart_byte == "A" && pass_match == 2'd1) pass_match = 2'd2;
+      else if (uart_byte == "S" && pass_match == 2'd2) pass_match = 2'd3;
+      else if (uart_byte == "S" && pass_match == 2'd3) begin
+         wrapper_pass = 1'b1; pass_match = 2'd0;
+      end else pass_match = 2'd0;
+   end
+end
+@
+
+The stimulus runs the four sub-tests in sequence and ends with
+`tb_sport: PASS` only if all four hold. A small `settle` helper drains
+the report for a bounded number of `clk12` ticks; each test then checks
+its own lane's `done` and word/error counts and `$fatal`s if the lane
+never finished, so a hang fails loudly instead of passing silently.
+
+<<tb_sport: the stimulus and self-checks>>=
+<<tb_sport: settle helper>>
+initial begin
+   ad0 = 1'b0; afs = 1'b0; ad0b = 1'b0; afsb = 1'b0;
+   ad0n = 1'b0; afsn = 1'b0; ad0w = 2'b00; afsw = 2'b00; run = 1'b0;
+   repeat (4) @(posedge aclk);
+   run = 1'b1;
+
+   <<tb_sport: test 1 --- RESYNC=0 lane>>
+   <<tb_sport: test 2 --- RESYNC=1 lane>>
+   <<tb_sport: test 3 --- negative control>>
+   <<tb_sport: test 4 --- two-lane wrapper>>
+
+   $display("tb_sport: PASS");
+   $finish;
+end
+@
+
+`settle` simply advances `clk12` for a bounded number of ticks so the
+lane's report can drain into the count registers; the per-test
+`done`/error checks below turn a hang into a clear failure rather than a
+silent zero-word pass.
+
+<<tb_sport: settle helper>>=
+task settle(input integer max_ticks);
+   integer t;
+   begin
+      t = 0;
+      while (t < max_ticks) begin
+         @(posedge clk12);
+         t = t + 1;
+      end
+   end
+endtask
+@
+
+Test 1: the `RESYNC=0` lane. Arming pulse, `ARM_FILL` filler, then PRBS
+from the seed; expect `done` with zero errors.
+
+<<tb_sport: test 1 --- RESYNC=0 lane>>=
+   send_bit_a(1'b0, 1'b1);
+   for (bi = 0; bi < ARM_FILL; bi = bi + 1) send_bit_a(1'b0, 1'b0);
+   prbs_state = PRBS31_SEED;
+   for (wi = 0; wi < WORDS; wi = wi + 1) begin
+      cur = prbs31_word(prbs_state);
+      prbs_state = prbs31_advance(prbs_state);
+      send_word_a(cur);
+   end
+   @(posedge aclk); ad0 = 1'b0; afs = 1'b0;
+   settle(2000);
+   $display("RESULT r0 words=%0d errors=%0d done=%0d", words, errors, done);
+   if (!done || words < MIN_DONE)
+      $fatal(1, "tb_sport t1: receiver did not finish (%0d/%0d words)", words, MIN_DONE);
+   if (errors != 32'd0)
+      $fatal(1, "tb_sport t1: %0d word errors", errors);
+@
+
+Test 2: the `RESYNC=1` lane. Frame-sync held high, PRBS from the seed
+with no filler; expect `done` with zero errors.
+
+<<tb_sport: test 2 --- RESYNC=1 lane>>=
+   prbs_state = PRBS31_SEED;
+   for (wi = 0; wi < WORDS; wi = wi + 1) begin
+      cur = prbs31_word(prbs_state);
+      prbs_state = prbs31_advance(prbs_state);
+      send_word_b(cur);
+   end
+   @(posedge aclk); ad0b = 1'b0; afsb = 1'b0;
+   settle(2000);
+   $display("RESULT r1 words=%0d errors=%0d done=%0d", words_r, errors_r, done_r);
+   if (!done_r || words_r < MIN_DONE)
+      $fatal(1, "tb_sport t2: RESYNC lane did not finish (%0d/%0d words)", words_r, MIN_DONE);
+   if (errors_r != 32'd0)
+      $fatal(1, "tb_sport t2: %0d word errors", errors_r);
+@
+
+Test 3: the negative control drives a dedicated third `RESYNC=1` lane
+(`dut_n`) with the same PRBS but one flipped bit mid-run. The lane must
+still finish but report at least one error.
+
+<<tb_sport: test 3 --- negative control>>=
+   prbs_state = PRBS31_SEED;
+   for (wi = 0; wi < WORDS; wi = wi + 1) begin
+      cur = prbs31_word(prbs_state);
+      prbs_state = prbs31_advance(prbs_state);
+      if (wi == 100) send_word_flip_n(cur);
+      else           send_word_n(cur);
+   end
+   @(posedge aclk); ad0n = 1'b0; afsn = 1'b0;
+   settle(2000);
+   $display("RESULT neg words=%0d errors=%0d done=%0d", words_n, errors_n, done_n);
+   if (!done_n)
+      $fatal(1, "tb_sport t3: negative control did not finish");
+   if (errors_n == 32'd0)
+      $fatal(1, "tb_sport t3: injected error went undetected");
+@
+
+Test 4: the two-lane wrapper. Both lanes carry the same valid PRBS with
+frame-sync held high; after both lock and the aggregated report goes out,
+the UART monitor must have seen `PASS`.
+
+<<tb_sport: test 4 --- two-lane wrapper>>=
+   prbs_state = PRBS31_SEED;
+   for (wi = 0; wi < WORDS; wi = wi + 1) begin
+      cur = prbs31_word(prbs_state);
+      prbs_state = prbs31_advance(prbs_state);
+      send_word_w(cur);
+   end
+   @(posedge aclk); ad0w = 2'b00; afsw = 2'b00;
+   settle(300000);
+   $display("RESULT wrapper pass_seen=%0d", wrapper_pass);
+   if (!wrapper_pass)
+      $fatal(1, "tb_sport t4: two-lane wrapper never reported PASS");
+@
+
+=== Pin maps
+
+`sport_bidir` is one module, but the missions wire it to the board in a
+few fixed ways, one constraint file per lane count and direction. Four
+balls are common to all of them: the 12 MHz reference `clk12` on J3,
+`run` on R10, the UART `tx` on B12 (which shares a net with the DSP
+boot bus, the reason the receiver only ever drives it once it has
+something to report), and `led` on B5. The lane balls follow one rule:
+a D2F lane carries the DSP's SPORT A-half transmit out to a `from_dsp`
+input (`dsp_*_in`), and an F2D lane carries a `to_dsp` output
+(`fpga_*_out`) to the ball wired to a DSP SPORT B-half receive pin.
+
+The 1x1 bidirectional map has one lane each way. The F2D lane drives
+the DSP's SPORT5B receiver via DAI1 9/10/11 on T14/T15/T16; the D2F
+lane is the DSP's SPORT4A transmit arriving on DAI1 5/7/8 at
+N10/T11/T13.
+
+<<sport_bidir_1x1_hx8k.pcf>>=
+set_io clk12 J3
+set_io fpga_ad0_out  T14
+set_io fpga_aclk_out T15
+set_io fpga_afs_out  T16
+set_io dsp_ad0_in    N10
+set_io dsp_aclk_in   T11
+set_io dsp_afs_in    T13
+set_io tx            B12
+set_io run     R10
+set_io led B5
+@
+
+The 2x2 map doubles that: lane 1 adds an F2D output to SPORT1B on DAI0
+10/12/20 (P8/P9/T8) and a D2F input from SPORT0A on DAI0 5/7/8
+(R5/T5/R9).
+
+<<sport_bidir_2x2_hx8k.pcf>>=
+set_io clk12 J3
+set_io fpga_ad0_out[0]  T14
+set_io fpga_aclk_out[0] T15
+set_io fpga_afs_out[0]  T16
+set_io fpga_ad0_out[1]  P8
+set_io fpga_aclk_out[1] P9
+set_io fpga_afs_out[1]  T8
+set_io dsp_ad0_in[0]    N10
+set_io dsp_aclk_in[0]   T11
+set_io dsp_afs_in[0]    T13
+set_io dsp_ad0_in[1]    R5
+set_io dsp_aclk_in[1]   T5
+set_io dsp_afs_in[1]    R9
+set_io tx               B12
+set_io run     R10
+set_io led B5
+@
+
+The 4-lane F2D map is the `SHARE_PAIRS` layout: two lanes per DAI share
+one clock/frame pad and ride separate data wires. Pair 0 (DAI1) clocks
+on T15/T16 with data on T14 and R16; pair 1 (DAI0) clocks on P9/T10
+with data on P8 and R4. The DSP's two forwarded transmit clocks arrive
+on T11 and T5, and their SRU copies (the `SHARE_COPIES` inputs) on P10
+and T8; the `from_dsp` data/fs balls are stubs here because the
+receiver is scaffolding-only in this direction.
+
+<<sport_bidir_4x_hx8k.pcf>>=
+set_io clk12 J3
+set_io fpga_aclk_out[0] T15
+set_io fpga_afs_out[0]  T16
+set_io fpga_ad0_out[0]  T14
+set_io fpga_ad0_out[1]  R16
+set_io fpga_aclk_out[1] P9
+set_io fpga_afs_out[1]  T10
+set_io fpga_ad0_out[2]  P8
+set_io fpga_ad0_out[3]  R4
+set_io dsp_aclk_in[0]  T11
+set_io dsp_aclk_in[1]  T5
+set_io dsp_ad0_in[0]   N10
+set_io dsp_afs_in[0]   T13
+set_io dsp_ad0_in[1]   R5
+set_io dsp_afs_in[1]   R9
+set_io tx            B12
+set_io run     R10
+set_io led B5
+set_io dsp_aclk2_in P10
+set_io dsp_aclk3_in T8
+@
+
+The 4-lane D2F map is the mirror: a full four-lane `from_dsp` receiver.
+Its four input lanes land on the same balls the standalone four-lane
+receiver used (N10/T11/T13, R5/T5/R9, T14/T15/T16, P8/P9/T10), so the
+DSP's four transmit lanes (SPORT 4A/0A/5A/1A) reach the proven pins.
+The lone dummy `to_dsp` output is left unconstrained --- the DSP does
+not receive in this direction, so `--pcf-allow-unconstrained` places it
+on a free ball and nothing reads it.
+
+<<sport_bidir_4xrx_hx8k.pcf>>=
+set_io clk12          J3
+set_io dsp_ad0_in[0]  N10
+set_io dsp_aclk_in[0] T11
+set_io dsp_afs_in[0]  T13
+set_io dsp_ad0_in[1]  R5
+set_io dsp_aclk_in[1] T5
+set_io dsp_afs_in[1]  R9
+set_io dsp_ad0_in[2]  T14
+set_io dsp_aclk_in[2] T15
+set_io dsp_afs_in[2]  T16
+set_io dsp_ad0_in[3]  P8
+set_io dsp_aclk_in[3] P9
+set_io dsp_afs_in[3]  T10
+set_io run            R10
+set_io tx             B12
+set_io led            B5
+@
+
+=== Build fragment
+
+Every Verilog module and pin map above is tangled from this one chapter.
+The top Makefile's generic rule only fires when an output's basename
+equals the chapter name, which is true for none of them, so this
+fragment supplies explicit rules. Two static pattern rules tangle each
+Verilog file and each pcf from `src/sport.nw`, and the phony
+`sport-verilog` collects them. A SPORT mission refreshes all of them
+from the chapter with a single `make -C fpga sport-verilog` before it
+synthesizes, so the bitstreams are always built from the literate source
+rather than from stale checked-in copies.
+
+The test bench (`tb/tb_sport.sv`) does match the chapter name, so the
+Makefile's generic `tb/tb_%.sv` rule already tangles it; the `sim`
+target compiles it against the receiver, the `uart_tx` the two-lane
+wrapper instantiates, and the shared `SB_IO` pad model. The bench's
+two-lane sub-test elaborates the full `sport_rx` wrapper, whose input IO
+registers use the `SB_IO` `.INPUT_CLK` port the simulation model omits,
+so the compile passes `+define+NO_IOREG` to bypass those registers in
+simulation only (synthesis never sees the define, so the bitstreams keep
+their IO flops). The receiver is a large multi-configuration module, so
+the Verilator pass waives a handful of lint classes that are noise here:
+`PINMISSING` (the behavioural `SB_IO` model exposes optional DDR pins
+that single-rate instantiations leave open), plus `UNUSEDSIGNAL`,
+`DECLFILENAME`, `PINCONNECTEMPTY`, `WIDTH`, `CASEINCOMPLETE`,
+`UNOPTFLAT`, and `MULTIDRIVEN` from `sport_rx.v` and the bench.
+
+<<sport.mk>>=
+SPORT_V := verilog/sport_tx_sync_nopll.v verilog/sport_tx_prbs_ser.v \
+           verilog/sport_rx.v verilog/sport_bidir.v
+SPORT_PCF := verilog/sport_bidir_1x1_hx8k.pcf verilog/sport_bidir_2x2_hx8k.pcf \
+             verilog/sport_bidir_4x_hx8k.pcf verilog/sport_bidir_4xrx_hx8k.pcf
+
+$(SPORT_V): verilog/%.v: src/sport.nw | verilog
+	cd verilog && tangle $*.v < ../$<
+
+$(SPORT_PCF): verilog/%.pcf: src/sport.nw | verilog
+	cd verilog && tangle $*.pcf < ../$<
+
+.PHONY: sport-verilog
+sport-verilog: $(SPORT_V) $(SPORT_PCF)
+
+build/sport/sim: tb/tb_sport.sv verilog/sport_rx.v verilog/uart_tx.v verilog/SB_IO.v | build/sport
+	cd build/sport && verilator --Mdir obj_dir -Wall -Wno-PINMISSING \
+		-Wno-UNUSEDSIGNAL -Wno-DECLFILENAME -Wno-PINCONNECTEMPTY \
+		-Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-UNOPTFLAT -Wno-MULTIDRIVEN \
+		+define+NO_IOREG --binary \
+		--top-module tb_sport ../../tb/tb_sport.sv ../../verilog/sport_rx.v \
+		../../verilog/uart_tx.v ../../verilog/SB_IO.v
+	cd build/sport && obj_dir/Vtb_sport
+	@touch $@
+
+sim: build/sport/sim
+@
+
+=== Summary
+
+The whole link is three building blocks and one top that wires them up
+by parameter:
+
+  - `sport_tx_sync_nopll` --- the *no-PLL source-synchronous*
+    transmitter. Generates an F2D PRBS-31 lane clocked entirely off the
+    DSP's forwarded clock, so it stays in lockstep with the DSP's
+    receiver with no clock of its own. Every shipping mission uses this.
+
+  - `sport_tx_prbs_ser` --- the older *free-running* transmitter that
+    makes its own bit clock with a PLL. No mission selects it any more;
+    it survives as the alternate clocking strategy (`SYNC_TX` 0).
+
+  - `sport_rx` --- the D2F *receiver/verifier*. Samples a DSP-driven
+    PRBS-31 lane on the forwarded clock, reassembles 32-bit words,
+    compares each against a locally stepped LFSR, and prints one
+    PASS/FAIL line over UART once the link goes idle.
+
+`sport_bidir` selects a direction and lane count purely through
+parameters --- the same eight shipped configurations the missions
+synthesize:
+
+[cols="<,^,^,^,^,^,^,^",options="header"]
+|===
+| config | TX_TO_DSP_N | RX_FROM_DSP_N | FROM_DSP_EN | SYNC_TX | NOPLL | SHARE_PAIRS | SHARE_COPIES
+| D2F 1-lane    | 1 | 1 | 1 | 1 | 1 | 0 | 0
+| D2F 2-lane    | 1 | 2 | 1 | 1 | 1 | 0 | 0
+| D2F 4-lane    | 1 | 4 | 1 | 1 | 1 | 0 | 0
+| F2D 1-lane    | 1 | 1 | 0 | 1 | 1 | 0 | 0
+| F2D 2-lane    | 2 | 2 | 0 | 1 | 1 | 0 | 0
+| F2D 4-lane    | 4 | 2 | 0 | 1 | 1 | 1 | 1
+| bidir 1x1     | 1 | 1 | 1 | 1 | 1 | 0 | 0
+| bidir 2x2     | 2 | 2 | 1 | 1 | 1 | 0 | 0
+|===
+
+For an F2D build the receiver is present only as clock scaffolding
+(`FROM_DSP_EN` 0 holds it in reset); for a D2F build the lone `to_dsp`
+output is an unconstrained stub. `MIN_DONE_WORDS`, `REPORT_LANE0`, and
+`REPORT_IDX` tune how much is transferred and whether the report folds
+all lanes or just one. The `MIN_DONE_WORDS` default (`32'h00b00000`
+$\approx$ 11.5 M words / 44 MiB) is only a placeholder; every mission
+overrides it with the per-direction transfer size (e.g. 2 GiB/lane).
+
+Verification is two-tier. The `tb_sport` bench drives a single
+`sport_rx_chan` with a behavioural model of the DSP's transmit waveform
+and confirms the lane locks and counts zero errors over `MIN_DONE`
+words --- it covers one RX lane, the lockstep checker, and (with the
+RESYNC test) the re-acquire path, in pure simulation. The real
+deliverable is the bench proof: a 2 GiB-per-lane transfer in each
+direction completing with `errors=0`, measured end-to-end by the
+bench host's wall clock. The simulation guards the checker logic; the
+hardware run is what actually qualifies a configuration.

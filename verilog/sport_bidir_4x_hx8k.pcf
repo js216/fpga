@@ -1,19 +1,14 @@
 set_io clk12 J3
-# 4-lane F->D: pairs share clk/fs; data on existing wires
-# pair0 (dai1): clk T15 fs T16, data lane0 T14 (dai1_9), lane1 R16 (dai1_12)
 set_io fpga_aclk_out[0] T15
 set_io fpga_afs_out[0]  T16
 set_io fpga_ad0_out[0]  T14
 set_io fpga_ad0_out[1]  R16
-# pair1 (dai0): clk P9 fs T10, data lane2 P8 (dai0_10), lane3 R4 (dai0_19)
 set_io fpga_aclk_out[1] P9
 set_io fpga_afs_out[1]  T10
 set_io fpga_ad0_out[2]  P8
 set_io fpga_ad0_out[3]  R4
-# DSP TX master clocks in (4A on T11, 0A on T5) + SRU copies
 set_io dsp_aclk_in[0]  T11
 set_io dsp_aclk_in[1]  T5
-# from_dsp data/fs stubs (capture unused in this case but ports exist)
 set_io dsp_ad0_in[0]   N10
 set_io dsp_afs_in[0]   T13
 set_io dsp_ad0_in[1]   R5
